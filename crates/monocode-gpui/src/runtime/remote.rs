@@ -100,6 +100,7 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         turn_ready: false,
         follow_up_delivered: vec![],
         follow_up_errors: vec![],
+        follow_up_deferred: vec![],
         delivered: None,
         start: 0,
         rows: vec![],
@@ -205,7 +206,7 @@ pub(crate) fn configure_saved(store: Database, id: i64) -> Result<(), String> {
     }
     binding.outbox.push(next);
     journal(&store, &binding)?;
-    dispatch_outbox(&client, &machine.id, &store, &mut binding)
+    dispatch_outbox(&client, &machine.id, &store, &mut binding).map(|_| ())
 }
 
 fn journal(store: &Database, binding: &RemoteSession) -> Result<(), String> {
@@ -228,7 +229,8 @@ fn dispatch_outbox(
     machine: &str,
     store: &Database,
     binding: &mut RemoteSession,
-) -> Result<(), String> {
+) -> Result<Vec<Value>, String> {
+    let mut receipts = Vec::new();
     while let Some(mut next) = binding.outbox.first().cloned() {
         if next["type"] != "create" && next["sessionId"].is_null() {
             next["sessionId"] = json!(
@@ -281,9 +283,17 @@ fn dispatch_outbox(
             durable.session_id = Some(id.into());
         }
         durable.outbox.remove(0);
+        if next["type"] == "send" && receipt["deferred"] != true
+            && let Some(message) = next["followUpId"].as_str()
+        {
+            locked(store)?.save_setting(&format!("mono-delivered:{}:{message}", binding.summary.id), "1")?;
+        }
         commit(store, binding, durable)?;
+        if next["type"] == "send" && receipt["deferred"] != true {
+            receipts.push(receipt);
+        }
     }
-    Ok(())
+    Ok(receipts)
 }
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const ATTACHMENT_CHUNK_BYTES: usize = 512 * 1024;
@@ -581,6 +591,7 @@ pub(crate) fn run_with_client(
     tx: async_channel::Sender<Update>,
 ) {
     let mut latest_rows = Vec::new();
+    let mut paseo_followups = false;
     let result = (|| -> Result<(), String> {
         if tx.is_closed() {
             return Ok(());
@@ -597,6 +608,11 @@ pub(crate) fn run_with_client(
             .take()
             .unwrap_or_else(|| json!({"type":"send"}));
         let attaching = action["type"] == "attach";
+        let paseo = (crate::paseo_host::active() || action["paseoFollowUps"] == true)
+            && client.request(&binding.machine(&client)?.id, "environment.describe", json!({}))?["capabilities"]
+                .as_array().is_some_and(|caps| caps.iter().any(|c| c == "paseo.steer"));
+        paseo_followups = paseo;
+        let mut initial_deliveries = Vec::new();
         let retrying = action["type"] == "retry";
         if !attaching
             && let Some(recovery) = binding
@@ -680,6 +696,10 @@ pub(crate) fn run_with_client(
                 operation
             };
             let mut send = command(operation, binding.session_id.as_deref());
+            if paseo && operation == "send" && let Some(message) = &settings.mono_message_id {
+                send["commandId"] = json!(message);
+                send["followUpId"] = json!(message);
+            }
             if matches!(operation, "send" | "draft") {
                 send["text"] = json!(prompt);
                 let (references, uploads) = prepare_for_session(
@@ -723,7 +743,10 @@ pub(crate) fn run_with_client(
         }
         if !attaching {
             upload_pending(&client, &machine.id, &store, &mut binding)?;
-            dispatch_outbox(&client, &machine.id, &store, &mut binding)?;
+            let receipts = dispatch_outbox(&client, &machine.id, &store, &mut binding)?;
+            if paseo {
+                initial_deliveries = receipts.iter().filter_map(|r| r["commandId"].as_str().map(str::to_owned)).collect();
+            }
         }
         drop(guard);
         let id = binding
@@ -749,6 +772,10 @@ pub(crate) fn run_with_client(
             let current_question = question(&snapshot);
             let mut next = update(if running { "Working…" } else { "Ready" }, !running);
             next.start = latest_rows.len();
+            next.delivered = initial_deliveries.pop();
+            next.follow_up_delivered.append(&mut initial_deliveries);
+            next.turn_ready = paseo && running && snapshot["runId"].as_str().is_some_and(|s| !s.is_empty())
+                && current_approvals.is_empty() && current_question.is_none();
             if revision != last_revision {
                 let mut projected = snapshot.clone();
                 monocode_core::remote::attachments::qualify_snapshot(
@@ -809,6 +836,50 @@ pub(crate) fn run_with_client(
             if metadata_changed {
                 journal(&store, &binding)?;
             }
+            let mut other_controls = Vec::new();
+            while let Ok(control) = controls.try_recv() {
+                if let Decision::Steer(message) = &control.decision {
+                    if !paseo {
+                        return Err("Steering is not supported by this remote host".into());
+                    }
+                    if !running || needs_input {
+                        next.follow_up_deferred.push(message.id.clone());
+                        continue;
+                    }
+                    let mut attempted = false;
+                    let result = (|| -> Result<bool, String> {
+                        if !binding.outbox.is_empty() { return Err("A remote command needs confirmation before steering.".into()); }
+                        if !message.attachments.is_empty() || message.mode.is_some() { return Err("Paseo steering supports text only.".into()); }
+                        let run = snapshot["runId"].as_str().filter(|s| !s.is_empty()).ok_or("Running host session has no run identity")?;
+                        let mut send = command("send", Some(&id));
+                        send["commandId"] = json!(message.id);
+                        send["followUpId"] = json!(message.id);
+                        send["text"] = json!(message.prepared_prompt.as_deref().unwrap_or(&message.text));
+                        send["activeTurnBehavior"] = json!("steer");
+                        send["runId"] = json!(run);
+                        binding.outbox.push(send);
+                        journal(&store, &binding)?;
+                        attempted = true;
+                        let receipts = dispatch_outbox(&client, &machine.id, &store, &mut binding)?;
+                        Ok(receipts.iter().any(|r| r["commandId"].as_str() == Some(&message.id) && r["deferred"] != true))
+                    })();
+                    match result {
+                        Ok(true) => next.follow_up_delivered.push(message.id.clone()),
+                        Ok(false) => next.follow_up_deferred.push(message.id.clone()),
+                        Err(error) => {
+                            if attempted && !binding.outbox.is_empty() {
+                                // Keep uncertain sends for inspection, never ahead of a later Stop/approval.
+                                let mut rejected = binding.clone();
+                                rejected.rejected = Some(json!({"error":error,"commands":binding.outbox,"uploads":binding.uploads}));
+                                rejected.outbox.clear();
+                                rejected.uploads.clear();
+                                commit(&store, &mut binding, rejected)?;
+                            }
+                            next.follow_up_errors.push((message.id.clone(), error));
+                        },
+                    }
+                } else { other_controls.push(control); }
+            }
             tx.send_blocking(next).map_err(|_| "Window closed")?;
             last_revision = revision;
             if !running {
@@ -824,7 +895,7 @@ pub(crate) fn run_with_client(
                 control_commands.push(stop);
                 stopping_run = Some(run_id.into());
             }
-            while let Ok(control) = controls.try_recv() {
+            for control in other_controls {
                 let mut next = command("approve", Some(&id));
                 next["runId"] = snapshot["runId"].clone();
                 next["requestId"] = json!(
@@ -878,7 +949,10 @@ pub(crate) fn run_with_client(
         Ok(())
     })();
     if let Err(error) = result {
-        let mut next = update(error, true);
+        let mut next = update(error.clone(), true);
+        if paseo_followups && let Some(id) = &settings.mono_message_id {
+            next.follow_up_errors.push((id.clone(), error));
+        }
         // Every valid snapshot was already published. An empty error patch
         // preserves any optimistic prompt awaiting a host receipt.
         next.start = latest_rows.len();

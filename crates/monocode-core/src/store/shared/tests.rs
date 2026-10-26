@@ -1253,3 +1253,19 @@ fn desktop_steers_restore_the_original_turn_without_needing_model_metadata() {
     assert_eq!(turns[&3].joined_turn, Some(1));
     assert_eq!(turns[&5].joined_turn, None);
 }
+
+#[test]
+fn remote_queue_receipts_survive_before_the_ui_removes_the_message() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let project = store.remember_remote_project("fixture-env", &json!({"id":"paseo:/fixture","cwd":"/fixture"})).unwrap();
+    let summary = store.create("codex", &project.key).unwrap();
+    assert!(summary.id < 0);
+    let state = crate::follow_up::State { revision: 1, messages: vec![crate::follow_up::Message { id: "queued-once".into(), text: "Synthetic queued text".into(), ..Default::default() }], ..Default::default() };
+    store.save_follow_ups(summary.id, &state).unwrap();
+    assert_eq!(store.follow_ups(summary.id).unwrap().messages.len(), 1);
+    store.save_setting(&format!("mono-delivered:{}:queued-once",summary.id), "1").unwrap();
+    assert!(store.follow_ups(summary.id).unwrap().messages.is_empty());
+    // A late user-action save cannot resurrect an already accepted remote message.
+    store.save_follow_ups(summary.id, &state).unwrap();
+    assert!(store.follow_ups(summary.id).unwrap().messages.is_empty());
+}

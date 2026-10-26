@@ -897,5 +897,11 @@ mod tests {
                 .save(output.join(format!("r11b-{lang}-favorites.png")))
                 .unwrap();
         }
+        cx.update_window(window.into(), |shell, window, cx| {
+            shell.downcast::<crate::shell::Shell>().unwrap().update(cx, |shell, cx| shell.paseo_fixture_show_queue(window, cx));
+            window.refresh(); window.draw(cx).clear(cx);
+        }).unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into()).unwrap().save(output.join("r13-native-queue.png")).unwrap();
     }
 }

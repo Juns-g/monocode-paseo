@@ -606,3 +606,31 @@ test('opt-in real daemon creates one isolated idle agent and archives only its o
     host.close();
   }
 });
+
+test('steer uses exact observed turn and one stable message identity; safe deferral can queue-send later',async()=>{
+ const f=fixture(),sent=[];await f.host.directory();
+ f.client.sendAgentMessage=async(id,text,options)=>sent.push({id,text,...options});
+ const c={type:'send',sessionId:'a',commandId:'steer-once',followUpId:'steer-once',text:'Synthetic steer',activeTurnBehavior:'steer',runId:'t'};
+ f.a.activeTurn={turnId:'t'};f.a.status='running';
+ await assert.rejects(f.host.command({...c,commandId:'wrong-turn',runId:'other'}),/Turn changed/);
+ await assert.rejects(f.host.command({...c,commandId:'normal-busy',activeTurnBehavior:undefined,runId:undefined}),/busy/);
+ f.a.pendingPermissions=[{id:'p'}];
+ assert.equal((await f.host.command(c)).deferred,true);assert.equal(sent.length,0);
+ assert.equal(new Attempts(f.directory).values[c.commandId],undefined);
+ f.a.pendingPermissions=[];
+ await f.host.command(c);await f.host.command(c);
+ assert.deepEqual(sent,[{id:'a',text:'Synthetic steer',messageId:'steer-once',activeTurnBehavior:'steer'}]);
+ await assert.rejects(f.host.command({...c,runId:'changed'}),/different content/);
+ const ended={...c,commandId:'ended-once',followUpId:'ended-once'};f.a.activeTurn=null;f.a.status='idle';
+ assert.equal((await f.host.command(ended)).deferred,true);
+ await f.host.command({...ended,activeTurnBehavior:undefined,runId:undefined});
+ assert.equal(sent.length,2);assert.equal(sent[1].messageId,'ended-once');assert.equal(sent[1].activeTurnBehavior,'interrupt');f.close();
+});
+test('unknown steer never replays after adapter restart',async()=>{
+ const f=fixture();await f.host.directory();f.a.activeTurn={turnId:'t'};f.a.status='running';
+ let sends=0;f.client.sendAgentMessage=async()=>{sends++;throw Error('lost reply');};
+ const c={type:'send',sessionId:'a',commandId:'unknown-steer',text:'Synthetic',activeTurnBehavior:'steer',runId:'t'};
+ await assert.rejects(f.host.command(c),/unknown/);
+ const again=new PaseoHost(f.client,f.directory);again.connected=true;await again.directory();
+ await assert.rejects(again.command(c),/No replay/);assert.equal(sends,1);again.close();f.close();
+});

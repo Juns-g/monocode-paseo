@@ -125,3 +125,24 @@ test('directory joins authoritative workspace titles/pins across descriptor page
  assert.equal(detached,1);assert.equal(f.c.selected,null);assert.equal(f.cancels(),0);f.c.close();
  assert.equal(canArchiveWorkspace({workspaceKind:'worktree',gitRuntime:{isDirty:false,aheadOfOrigin:0}}),false);
 });
+
+test('steer is turn-fenced, permission-safe, duplicate-safe and explicitly defers an ended turn',async()=>{
+ const f=fixture(),options=[];
+ f.client.sendAgentMessage=async(id,text,o)=>options.push({id,text,...o});
+ const c={op:'send',serverId:'s',agentId:'a',text:'Synthetic steer',messageId:'steer-once',activeTurnBehavior:'steer',turnId:'t',acknowledgeRace:true};
+ f.setAgent({id:'a',status:'running',activeTurn:{turnId:'t'},pendingPermissions:[]});
+ await assert.rejects(f.c.dispatch({...c,turnId:'other'}),/Turn changed/);
+ f.setAgent({...f.c.selected,pendingPermissions:[{id:'p'}]});
+ assert.equal((await f.c.dispatch(c)).deferred,true);assert.equal(options.length,0);
+ f.setAgent({...f.c.selected,activeTurn:null,status:'idle',pendingPermissions:[]});
+ assert.equal((await f.c.dispatch(c)).deferred,true);assert.equal(options.length,0);
+ f.setAgent({...f.c.selected,activeTurn:{turnId:'t'},status:'running'});
+ await f.c.dispatch(c);await assert.rejects(f.c.dispatch(c),/already used/);
+ assert.deepEqual(options,[{id:'a',text:'Synthetic steer',messageId:'steer-once',activeTurnBehavior:'steer'}]);f.c.close();
+});
+
+test('concurrent duplicate sends cannot pass the post-fetch send fence twice',async()=>{
+ const f=fixture(),c={op:'send',serverId:'s',agentId:'a',text:'Synthetic',messageId:'concurrent',acknowledgeRace:true};
+ const results=await Promise.allSettled([f.c.dispatch(c),f.c.dispatch(c)]);
+ assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(f.sends(),1);f.c.close();
+});

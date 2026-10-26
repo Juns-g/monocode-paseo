@@ -30,6 +30,9 @@ impl Conversation {
             && (crate::paseo_host::active()
                 || self.remote_state.capabilities.contains("paseo.configure"))
     }
+    pub(super) fn paseo_follow_ups(&self) -> bool {
+        self.paseo_controls() && self.remote_state.capabilities.contains("paseo.steer")
+    }
     pub(super) fn paseo_workspace_draft(&self) -> bool {
         self.paseo_controls()
             && self.remote_state.unbound
@@ -279,7 +282,7 @@ impl Conversation {
             Some(self.remote_state.legacy_recovery_error().unwrap_or(
                 "A remote command needs confirmation. Choose Retry before sending another message.",
             ))
-        } else if self.busy || self.stopping {
+        } else if (self.busy || self.stopping) && !self.paseo_follow_ups() {
             Some("Wait for this remote turn to finish before sending another message.")
         } else {
             None

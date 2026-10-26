@@ -614,3 +614,41 @@ fn ordinary_remote_hosts_keep_the_existing_worktree_picker(cx: &mut TestAppConte
         }).unwrap();
     }
 }
+
+#[gpui::test]
+fn paseo_busy_send_uses_the_native_queue_and_steer_controls(cx: &mut TestAppContext) {
+    for prefer_steer in [false, true] {
+        let view = conversation(cx);
+        let (controls, receiver) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences { follow_up: if prefer_steer {"steer"} else {"queue"}.into(), ..Default::default() });
+            view.update(cx, |view, cx| {
+                view.remote_state.capabilities.extend(["paseo.configure".into(), "paseo.steer".into()]);
+                view.busy = true;
+                view.follow_ups.ready = true;
+                view.controls = Some(controls);
+                view.send(cx);
+                assert!(view.input.read(cx).content.is_empty());
+                assert_eq!(view.follow_ups.state.messages.len(), 1);
+                assert_eq!(view.follow_ups.state.messages[0].text, "Keep this next message");
+                assert_eq!(view.follow_ups.state.messages[0].steer, prefer_steer);
+                assert!(!view.remote_state.send_blocked_notice);
+                assert!(view.remote_state.rejected.is_none());
+                assert!(view.transcript.read(cx).source_rows().is_empty());
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.pump_follow_ups(cx);
+            if prefer_steer {
+                let c = receiver.try_recv().expect("native steer control");
+                assert!(matches!(c.decision, Decision::Steer(_)));
+                view.follow_up_delivered(&c.id, cx);
+                assert!(view.follow_ups.state.messages.is_empty());
+            } else {
+                assert!(receiver.try_recv().is_err());
+                assert!(view.follow_ups.sending.is_none());
+            }
+        });
+    }
+}

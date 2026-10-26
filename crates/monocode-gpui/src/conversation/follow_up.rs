@@ -107,8 +107,9 @@ impl Conversation {
             .try_global::<crate::settings::Preferences>()
             .is_none_or(|prefs| prefs.follow_up == "steer")
             || !self.background.tasks.is_empty())
-            && Kind::from_id(&self.summary.provider).can_steer()
-            && message.can_steer();
+            && (self.paseo_follow_ups() || Kind::from_id(&self.summary.provider).can_steer())
+            && message.can_steer()
+            && (!self.paseo_follow_ups() || message.attachments.is_empty());
         self.follow_ups.motion.insert(
             &message.id,
             self.follow_ups.state.messages.is_empty(),
@@ -268,6 +269,9 @@ impl Conversation {
         }
     }
     pub(super) fn pump_follow_ups(&mut self, cx: &mut Context<Self>) {
+        if self.paseo_follow_ups() && (!self.remote_state.online || self.remote_state.pending) {
+            return;
+        }
         if self.editing_last_turn.pending() || self.stopping {
             return;
         }
@@ -316,8 +320,9 @@ impl Conversation {
                 }
                 return;
             }
+            if self.paseo_follow_ups() && (self.needs_approval() || !message.attachments.is_empty()) { return; }
             if !message.steer
-                || !Kind::from_id(&self.summary.provider).can_steer()
+                || (!self.paseo_follow_ups() && !Kind::from_id(&self.summary.provider).can_steer())
                 || !message.can_steer()
                 || !self.follow_ups.ready
                 || (!requested
@@ -497,8 +502,8 @@ impl Conversation {
             .when(self.follow_ups.state.paused && !self.follow_ups.resuming, |d| d.child(
                 div().h(px(28.)).flex().items_center().gap_2().border_b_1().border_color(content(0.1))
                     .child(icon("queue-pause", 14.))
-                    .child(div().flex_1().min_w_0().truncate().child(if failed { "A message couldn't be sent" } else { "Queue paused because you interrupted" }))
-                    .child(queue_button("queue-resume", if failed { "Retry queue" } else { "Resume queue" }, "queue-play").w_auto().px(px(6.)).gap(px(6.)).child(if failed { "Retry" } else { "Resume" }).on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx))))
+                    .child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(if failed { "A message couldn't be sent" } else { "Queue paused because you interrupted" })))
+                    .child(queue_button("queue-resume", if failed { "Retry queue" } else { "Resume queue" }, "queue-play").w_auto().px(px(6.)).gap(px(6.)).child(crate::i18n::t(if failed { "Retry" } else { "Resume" })).on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx))))
             ))
             .children(self.follow_ups.state.messages.iter().enumerate().map(|(index, message)| {
                 let id = message.id.clone();
@@ -512,8 +517,8 @@ impl Conversation {
                             .child(queue_button("queue-cancel", "Cancel queued message edit", "close").on_click(cx.listener(|this, _, window, cx| this.finish_queue_edit(false, window, cx))))
                     } else {
                         let (steer, edit, remove) = (id.clone(), id.clone(), id);
-                        row.child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
-                            .when(Kind::from_id(&self.summary.provider).can_steer(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child("Steer").on_click(cx.listener(move |this, _, _, cx| {
+                        row.child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(crate::i18n::t(&error)))))
+                            .when(self.paseo_follow_ups() || Kind::from_id(&self.summary.provider).can_steer(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child(crate::i18n::t("Steer")).on_click(cx.listener(move |this, _, _, cx| {
                                 if !sending && let Some(message) = this.follow_ups.state.messages.iter_mut().find(|m| m.id == steer) {
                                     if !message.can_steer() && this.busy { return; }
                                     message.steer = true;
@@ -548,7 +553,7 @@ fn queue_button(
     div()
         .id(id)
         .role(Role::Button)
-        .aria_label(label)
+        .aria_label(crate::i18n::t(label))
         .size(px(24.))
         .flex_shrink_0()
         .rounded_md()

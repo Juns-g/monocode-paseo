@@ -147,11 +147,20 @@ export class Controller {
     if(c.op==='send') {
       if(!c.messageId || this.seen.has(c.messageId))throw Error('Send attempt already used; inspect history before explicitly trying a new message.');
       const found=await this.client.fetchAgent(c.agentId);this.target(c);
-      if(isBusy(found?.agent))throw Error('Agent is busy or awaiting permission; draft retained.');
+      if(found?.agent.id!==c.agentId)throw Error('Exact agent ID required');
+      const behavior=c.activeTurnBehavior??'interrupt';
+      if(!['interrupt','steer'].includes(behavior))throw Error('Unsupported send behavior');
+      if(behavior==='steer'){
+        if(!c.turnId)throw Error('Steer requires an observed turn');
+        if(!found.agent.activeTurn)return {deferred:true};
+        if(found.agent.activeTurn.turnId!==c.turnId)throw Error('Turn changed; steer refused.');
+        if(found.agent.pendingPermissions?.length)return {deferred:true};
+      }else if(isBusy(found.agent))throw Error('Agent is busy or awaiting permission; draft retained.');
       if(!c.acknowledgeRace)throw Error('Paseo has no atomic idle-only send; explicit concurrent-send risk acknowledgement required.');
       if(!c.text?.trim() || c.text.length>65536)throw Error('Empty or oversized message');
+      if(this.seen.has(c.messageId))throw Error('Send attempt already used; inspect history before explicitly trying a new message.');
       this.seen.add(c.messageId);if(this.seen.size>1000)this.seen.delete(this.seen.values().next().value);
-      try {await this.client.sendAgentMessage(c.agentId,c.text,{messageId:c.messageId,activeTurnBehavior:'interrupt'});}
+      try {await this.client.sendAgentMessage(c.agentId,c.text,{messageId:c.messageId,activeTurnBehavior:behavior});}
       catch {throw Error('Send outcome unknown. No automatic retry. Inspect canonical history in either client before a new send.');}
       this.invalidate();return {accepted:true,messageId:c.messageId};
     }

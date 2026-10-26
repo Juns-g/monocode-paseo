@@ -10,7 +10,7 @@ import {SyncTransfers} from '../../../host/sync-transfer.ts';
 
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
-export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.project-icons','paseo.workspaces','sessions.no-delete','sessions.list-revision',
+export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','sessions.no-delete','sessions.list-revision',
   'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
 const stamp=value=>{const n=typeof value==='number'?value:Date.parse(value);return Number.isFinite(n)?n:0;};
@@ -105,7 +105,10 @@ export class Attempts {
     }
     this.values[key]={hash,state:'pending'};this.save();
     const work=Promise.resolve().then(async()=>{
-      try{const receipt=await action();this.values[key]={hash,state:'accepted',receipt};this.save();return receipt;}
+      try{const receipt=await action();
+        // A pre-send deferral performed no mutation; the same message may later queue-send.
+        if(receipt.deferred===true)delete this.values[key];else this.values[key]={hash,state:'accepted',receipt};
+        this.save();return receipt;}
       catch(error){this.values[key]={hash,state:'unknown'};this.save();throw error;}
       finally{this.active.delete(key);}
     });
@@ -392,7 +395,9 @@ export class PaseoHost {
         if(agent.requiresAttention && agent.attentionReason!=='permission' && !agent.pendingPermissions?.length)await control.dispatch({...base,op:'clearAttention'});
       }else if(c.type==='send'){
         if(c.attachments?.length||c.intent||c.draftBlockId||c.planBlockId)throw Error('此适配层暂不支持附件、计划或草稿；请在 Paseo 发送。');
-        await control.dispatch({...base,op:'send',messageId:c.commandId,text:c.text,acknowledgeRace:true});
+        const result=await control.dispatch({...base,op:'send',messageId:c.commandId,text:c.text,acknowledgeRace:true,
+          activeTurnBehavior:c.activeTurnBehavior,turnId:c.runId});
+        if(result.deferred)return {commandId:c.commandId,sessionId:agent.id,revision:this.revision,deferred:true};
       }else if(c.type==='cancel'){
         await control.dispatch({...base,op:'cancel',turnId:c.runId});
       }else if(c.type==='approve'){

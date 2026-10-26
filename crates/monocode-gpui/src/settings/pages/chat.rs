@@ -53,7 +53,7 @@ impl SettingsView {
             self.row(
                 Some("follow-up"),
                 true,
-                "Follow-up behavior",
+                crate::i18n::t("Follow-up behavior"),
                 Some("Queue follow-ups until the active turn finishes, or steer the active turn immediately.".into()),
                 vec![self.segmented(
                     "follow-up",

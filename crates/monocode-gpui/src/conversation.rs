@@ -1058,6 +1058,9 @@ impl Conversation {
             || self.settings.orchestrator
             || self.settings.access == AccessMode::ReadOnly;
         let mut settings = self.settings.clone();
+        if self.paseo_follow_ups() {
+            settings.remote_action.get_or_insert_with(|| serde_json::json!({"type":"send"}))["paseoFollowUps"] = serde_json::json!(true);
+        }
         if let Some(model) = self.model_info() {
             for control in &model.controls {
                 settings
@@ -1279,6 +1282,12 @@ impl Conversation {
                                 this.follow_up_delivered(&id, cx);
                             }
                         }
+                        for id in update.follow_up_deferred {
+                            if this.paseo_follow_ups() && this.follow_ups.sending.as_deref() == Some(&id) {
+                                this.follow_ups.sending = None;
+                                this.follow_ups.ready = false;
+                            }
+                        }
                         for (id, error) in update.follow_up_errors {
                             if this.settings.mono.is_some() {
                                 this.mono_message_failed(id, error);
@@ -1409,6 +1418,12 @@ impl Conversation {
                                     }
                                     this.save_follow_ups(cx);
                                 }
+                            }
+                            // A steer may enter the channel just after the observer's last drain.
+                            // Only a clean idle snapshot can release it back to the unsent queue.
+                            if this.paseo_follow_ups() && this.status == "Ready"
+                                && this.follow_ups.state.messages.iter().any(|m| m.steer && this.follow_ups.sending.as_deref() == Some(&m.id)) {
+                                this.follow_ups.sending = None;
                             }
                             if let Some(id) = this.follow_ups.sending.clone() {
                                 this.fail_follow_up(
@@ -4023,6 +4038,16 @@ pub(crate) fn git_branch(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 impl Conversation {
+    pub(crate) fn test_queue_fixture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menu(window, cx);
+        self.remote_state.capabilities.extend(["paseo.configure".into(), "paseo.steer".into()]);
+        self.busy = true;
+        self.follow_ups.ready = false;
+        self.follow_ups.state.messages = vec![monocode_core::follow_up::Message {
+            id: "synthetic-queued".into(), text: "Synthetic queued follow-up".into(), ..Default::default()
+        }];
+        cx.notify();
+    }
     pub(crate) fn test_close_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menu(window, cx);
     }

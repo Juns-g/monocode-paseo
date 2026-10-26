@@ -8782,6 +8782,12 @@ impl Shell {
         self.invalidate_chrome(cx);
         cx.notify();
     }
+    pub(crate) fn paseo_fixture_show_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menu(cx);
+        if let Some(view) = self.workspace.active.and_then(|id| self.sessions.get(&id)) {
+            view.update(cx, |view, cx| view.test_queue_fixture(window, cx));
+        }
+    }
     pub(crate) fn paseo_fixture_show_favorites(
         &mut self,
         window: &mut Window,

@@ -446,7 +446,7 @@ impl Store {
             .and_then(|v| v.split_once(':'))
         {
             if let Ok(id) = id.parse::<i64>() {
-                if self.shared_delivered(id, message)? {
+                if id >= 0 && self.shared_delivered(id, message)? {
                     return Ok(Some("1".into()));
                 }
             }
