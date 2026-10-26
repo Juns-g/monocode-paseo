@@ -50,6 +50,7 @@ struct Tokens {
 }
 thread_local! { static TOKENS: std::cell::RefCell<Option<Tokens>> = const { std::cell::RefCell::new(None) }; }
 pub(crate) fn configure(p: &crate::settings::Preferences, system_light: bool) -> bool {
+    crate::i18n::configure(p);
     let light = p.theme == "light" || (p.theme == "system" && system_light);
     let palette = crate::settings::palette(&p.workspace_theme, light);
     let glass = window_glass(p, system_light);
@@ -291,7 +292,7 @@ pub(crate) fn section_label(label: &'static str) -> Div {
         .text_size(px(12.))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(content(0.5))
-        .child(div().flex_1().child(label))
+        .child(div().flex_1().child(crate::i18n::t(label)))
 }
 pub(crate) fn icon(path: &'static str, side: f32) -> Svg {
     svg()

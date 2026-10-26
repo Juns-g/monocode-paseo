@@ -435,3 +435,182 @@ fn ambiguous_legacy_requests_block_send_retry_and_restore_without_consuming_draf
         })
     });
 }
+
+#[gpui::test]
+fn sending_while_remote_turn_runs_shows_a_not_sent_notice_without_a_retry_command(
+    cx: &mut TestAppContext,
+) {
+    for (busy, stopping) in [(true, false), (false, true), (true, true)] {
+        let view = conversation(cx);
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, _| view.clone())
+                .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |view, _, cx| {
+                view.busy = busy;
+                view.stopping = stopping;
+                view.attachments = vec![PathBuf::from("/home/me/design.png")];
+                view.send(cx);
+
+                assert_eq!(view.input.read(cx).content, "Keep this next message");
+                assert_eq!(view.attachments, [PathBuf::from("/home/me/design.png")]);
+                assert!(view.follow_ups.state.messages.is_empty());
+                assert!(view.settings.remote_action.is_none());
+                assert!(!view.cancel.load(Ordering::Relaxed));
+                assert_eq!((view.busy, view.stopping), (busy, stopping));
+                assert!(view.transcript.read(cx).source_rows().is_empty());
+                assert!(!view.remote_state.pending);
+                assert!(view.remote_state.error.is_none());
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(
+            visual.debug_bounds("remote-send-notice").is_some(),
+            "busy={busy} stopping={stopping}: the rejected send must stay visible while the turn runs"
+        );
+        assert!(
+            visual.debug_bounds("remote-retry").is_none(),
+            "busy={busy} stopping={stopping}: a busy rejection is not a retryable remote command"
+        );
+    }
+}
+
+#[gpui::test]
+fn only_an_unbound_paseo_draft_offers_workspace_selection_without_local_git(cx: &mut TestAppContext) {
+    for bound in [false, true] {
+        let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+        let project = store.remember_remote_project("remote-ui-tests", &json!({"id":"paseo:/repo","cwd":"/repo"})).unwrap();
+        let summary = store.create("codex", &project.key).unwrap();
+        if bound {
+            let mut binding = store.remote_session(summary.id).unwrap().unwrap();
+            binding.session_id = Some("already-created-empty-agent".into());
+            store.save_remote_session(&binding).unwrap();
+        }
+        let window = cx.open_window(Default::default(), |_, cx| {
+            let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+            view.loaded = true;
+            view.remote_state.online = true;
+            view.remote_state.capabilities = ["paseo.configure", "paseo.workspaces"].into_iter().map(str::to_owned).collect();
+            view
+        });
+        window.update(cx, |view, window, cx| {
+            assert!(view.git.is_none());
+            assert!(!view.summary.has_messages);
+            view.remote_state.workspace_choices = vec![json!({
+                "id":"chosen-workspace","title":"Existing task","cwd":"/repo"
+            })];
+            view.toggle_menu(ComposerMenu::Workspace, window, cx);
+            if bound {
+                assert!(view.menu.is_none(), "an existing empty agent must not offer reparenting");
+                view.menu_choice("workspace:paseo:existing:chosen-workspace", cx);
+                assert!(view.settings.remote_workspace_id.is_none());
+            } else {
+                let mut events = Vec::new();
+                let (_, items, _, _) = view.menu_items(ComposerMenu::Workspace, &mut events, window, cx);
+                let actions: Vec<_> = items.iter().filter_map(|item| match item {
+                    MenuItem::Action(action) => Some(action.id.as_ref()),
+                    _ => None,
+                }).collect();
+                assert!(actions.contains(&"workspace:paseo:new"));
+                assert!(!actions.contains(&"workspace:new"));
+                assert!(!actions.contains(&"workspace:existing"));
+                assert!(actions.contains(&"workspace:paseo:existing:chosen-workspace"));
+                view.menu_choice("workspace:paseo:existing:chosen-workspace", cx);
+                assert_eq!(view.settings.remote_workspace_id.as_deref(), Some("chosen-workspace"));
+                view.menu_choice("workspace:paseo:existing:missing", cx);
+                assert_eq!(view.settings.remote_workspace_id.as_deref(), Some("chosen-workspace"));
+                view.menu_choice("workspace:paseo:new", cx);
+                assert!(view.settings.remote_workspace_id.is_none());
+                assert!(view.settings.remote_action.is_none());
+                assert!(view.follow_ups.state.messages.is_empty());
+                assert!(view.transcript.read(cx).source_rows().is_empty());
+            }
+        }).unwrap();
+    }
+}
+
+#[gpui::test]
+fn paseo_new_draft_loads_workspace_choices_over_real_transport_before_enabling_send(
+    cx: &mut TestAppContext,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let host = crate::runtime::remote::TestHost::with_capabilities(
+        vec!["paseo.configure", "paseo.workspaces"],
+        move |request| {
+            recorded.lock().unwrap().push(request.clone());
+            assert_eq!(request["method"], "paseo.workspaces");
+            assert_eq!(request["params"]["projectId"], "paseo:/repo");
+            Some(json!([{"id":"chosen-workspace","title":"Existing task","cwd":"/repo"}]))
+        },
+    );
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let project = store.remember_remote_project(
+        "env", &json!({"id":"paseo:/repo","cwd":"/repo"}),
+    ).unwrap();
+    let summary = store.create("codex", &project.key).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let window = cx.open_window(Default::default(), |_, cx| {
+        let mut view = Conversation::new(summary, store.clone(), cx);
+        view.remote_state.client = Some(host.client.clone());
+        view.seed_new_settings(Settings {
+            model: Some("codex:fixture-model".into()), ..Default::default()
+        }, cx);
+        view.input.update(cx, |input, cx| input.set_text("Test; reply 111".into(), cx));
+        view
+    });
+    window.update(cx, |view, _, cx| view.load(cx)).unwrap();
+    cx.run_until_parked();
+    window.update(cx, |view, window, cx| {
+        assert!(view.loaded, "actual draft startup failed: {}", view.status);
+        assert!(view.remote_state.online);
+        assert!(view.remote_state.error.is_none());
+        assert!(view.paseo_workspace_draft());
+        assert_eq!(view.remote_state.workspace_choices.len(), 1);
+        assert_eq!(view.input.read(cx).content, "Test; reply 111");
+        assert!(!view.remote_send_guard(cx), "{}", view.status);
+        assert!(!view.attaching && !view.busy && !view.stopping);
+        view.toggle_menu(ComposerMenu::Workspace, window, cx);
+        assert!(view.menu.is_some());
+        let binding = locked(&store).unwrap().remote_session(view.summary.id).unwrap().unwrap();
+        assert!(binding.session_id.is_none());
+        assert!(binding.outbox.is_empty(), "loading must not create or send");
+    }).unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("paseo-workspace-selector").is_some());
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[gpui::test]
+fn ordinary_remote_hosts_keep_the_existing_worktree_picker(cx: &mut TestAppContext) {
+    for (remote, stopping) in [(true, false), (true, true), (false, true)] {
+        let view = conversation(cx);
+        cx.update(|cx| view.update(cx, |view, _| {
+            view.remote_state.capabilities = ["git.worktrees"].into_iter().map(str::to_owned).collect();
+            view.git = Some(monocode_core::git::Snapshot::default());
+            view.summary.has_messages = false;
+            view.stopping = stopping;
+            if !remote {
+                view.summary.cwd = "/test-project".into();
+            }
+            assert_eq!(view.is_remote(), remote);
+            assert!(!view.paseo_controls());
+        }));
+        let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| view.clone())).unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let point = window.update(visual, |view, _, _| view.workspace_anchor.get().unwrap().center()).unwrap();
+        visual.simulate_click(point, Default::default());
+        visual.run_until_parked();
+        window.update(visual, |view, _, cx| {
+            assert!(view.menu_is(ComposerMenu::Workspace),
+                "remote={remote} stopping={stopping}: ordinary workspace control was blocked: {}", view.status);
+            view.menu_choice("workspace:new", cx);
+            assert!(view.settings.new_worktree);
+            assert!(view.settings.remote_workspace_id.is_none());
+        }).unwrap();
+    }
+}

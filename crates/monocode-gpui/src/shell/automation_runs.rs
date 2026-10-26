@@ -60,6 +60,9 @@ fn service_lock(service: &ServiceHandle) -> Result<std::sync::MutexGuard<'_, Ser
 
 impl Shell {
     pub(super) fn initialize_automations(&mut self, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            return;
+        }
         if self.automation_state.opening || self.automation_state.service.is_some() {
             return;
         }

@@ -436,18 +436,33 @@ impl Shell {
             .all(|id| self.session_metadata(*id, cx).summary.archived);
         let mut items = Vec::new();
         if self.reminders.iter().any(|r| ids.contains(&r.session_id)) {
-            items.push(MenuAction::new("reminder:cancel", "Cancel reminder").into());
+            items
+                .push(MenuAction::new("reminder:cancel", crate::i18n::t("Cancel reminder")).into());
             items.push(MenuItem::Separator);
         }
-        items.push(MenuAction::new("pin", if all_pinned { "Unpin" } else { "Pin" }).into());
+        items.push(
+            MenuAction::new(
+                "pin",
+                crate::i18n::t(if all_pinned { "Unpin" } else { "Pin" }),
+            )
+            .into(),
+        );
         if !multiple {
             items.extend([
-                MenuAction::new("rename", "Rename").shortcut("F2").into(),
-                MenuAction::new("copy-session-id", "Copy session ID")
+                MenuAction::new("rename", crate::i18n::t("Rename"))
+                    .shortcut("F2")
+                    .into(),
+                MenuAction::new("copy-session-id", crate::i18n::t("Copy session ID"))
                     .submenu(vec![
-                        MenuAction::new("copy-harness-session-id", "Harness session ID")
-                            .disabled(summary.provider_id.is_none()),
-                        MenuAction::new("copy-monocode-session-id", "MonoCode session ID"),
+                        MenuAction::new(
+                            "copy-harness-session-id",
+                            crate::i18n::t("Harness session ID"),
+                        )
+                        .disabled(summary.provider_id.is_none()),
+                        MenuAction::new(
+                            "copy-monocode-session-id",
+                            crate::i18n::t("MonoCode session ID"),
+                        ),
                     ])
                     .into(),
                 MenuAction::new(
@@ -462,16 +477,18 @@ impl Shell {
             ]);
         }
         items.extend([
-            MenuAction::new("reminder", "Remind me")
+            MenuAction::new("reminder", crate::i18n::t("Remind me"))
                 .submenu(
                     reminder_presets(Local::now().naive_local())
                         .into_iter()
-                        .map(|(id, label, enabled)| MenuAction::new(id, label).disabled(!enabled))
+                        .map(|(id, label, enabled)| {
+                            MenuAction::new(id, crate::i18n::t(&label)).disabled(!enabled)
+                        })
                         .collect(),
                 )
                 .into(),
             MenuItem::Separator,
-            MenuAction::new("folder-new", "New folder").into(),
+            MenuAction::new("folder-new", crate::i18n::t("New folder")).into(),
         ]);
         if !groups.folders.is_empty() {
             items.push(MenuItem::Separator);
@@ -504,11 +521,16 @@ impl Shell {
                 if all_archived { "Unarchive" } else { "Archive" },
             )
             .into(),
-            MenuAction::new("delete", "Delete")
+            MenuAction::new("delete", crate::i18n::t("Delete"))
                 .shortcut("⌫")
                 .danger()
                 .into(),
         ]);
+        if crate::paseo_host::active() {
+            items.retain(
+                |item| !matches!(item, MenuItem::Action(action) if action.id.as_ref() == "delete"),
+            );
+        }
         items
     }
     pub(super) fn run_session_menu(
@@ -645,9 +667,11 @@ impl Shell {
         let focus = swatches.read(cx).focus.clone();
         vec![
             MenuItem::Custom(swatches.into(), focus),
-            MenuAction::new("rename", "Rename").shortcut("F2").into(),
+            MenuAction::new("rename", crate::i18n::t("Rename"))
+                .shortcut("F2")
+                .into(),
             MenuItem::Separator,
-            MenuAction::new("ungroup", "Ungroup").into(),
+            MenuAction::new("ungroup", crate::i18n::t("Ungroup")).into(),
         ]
     }
     pub(super) fn run_folder_menu(
@@ -748,6 +772,11 @@ impl Shell {
     }
 
     pub(super) fn delete_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            self.error = Some("不能删除 Paseo 会话".into());
+            cx.notify();
+            return;
+        }
         if self.workspace.review_owners.iter().any(|(pane, owner)| {
             *owner == id
                 && (self.workspace.tab_of(*pane).is_some()
@@ -1626,7 +1655,7 @@ impl Shell {
                         .text_color(content(0.45))
                         .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
                         .child(icon("plus", 12.))
-                        .child("New session")
+                        .child(crate::i18n::t("New session"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.create_in_folder(folder.clone(), cx);
                         })),
@@ -1812,7 +1841,7 @@ impl Shell {
                                                     div()
                                                         .font_weight(FontWeight::MEDIUM)
                                                         .text_color(content(0.8))
-                                                        .child("Issue or pull request URL"),
+                                                        .child(crate::i18n::t("Issue or pull request URL")),
                                                 )
                                                 .child(field)
                                                 .child(match &dialog.error {

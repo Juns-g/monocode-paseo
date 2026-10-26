@@ -35,7 +35,7 @@ impl Shell {
     /// sits idle at a prompt and opening a fresh one otherwise.
     pub(super) fn run_action(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.workspace.project.clone();
-        if project.starts_with("remote://") {
+        if project.starts_with("remote://") && self.allowed_terminal_cwd(cx).is_err() {
             self.error = Some("Actions are not available on remote projects.".into());
             cx.notify();
             return;
@@ -73,7 +73,9 @@ impl Shell {
                 terminal
             }
             None => {
-                let cwd = self.terminal_cwd(cx);
+                let cwd = self
+                    .allowed_terminal_cwd(cx)
+                    .expect("terminal action guard");
                 let dock = self.workspace.docks.entry(project.clone()).or_default();
                 dock.size = dock.side.clamp(dock.size, viewport);
                 dock.add(cwd.clone());
@@ -155,7 +157,8 @@ impl Shell {
 
     /// The footer's split button: run the current action, or pick another.
     pub(super) fn actions_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.workspace.project.starts_with("remote://") {
+        if self.workspace.project.starts_with("remote://") && self.allowed_terminal_cwd(cx).is_err()
+        {
             return None;
         }
         let classic = self.workspace.boxy_layout();

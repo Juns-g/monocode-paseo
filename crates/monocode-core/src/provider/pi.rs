@@ -24,6 +24,16 @@ pub(super) struct State {
 
 pub(super) fn configure(command: &mut Command, request: &Request, probe: bool) {
     command.args(["--mode", "rpc"]);
+    if request.kind == Kind::Omp && !probe {
+        command.args([
+            "--approval-mode",
+            match request.settings.access {
+                AccessMode::FullAccess if !request.settings.plan => "yolo",
+                AccessMode::AutoAcceptEdits if !request.settings.plan => "write",
+                _ => "always-ask",
+            },
+        ]);
+    }
     if probe || request.settings.text_only {
         command.arg("--no-session");
     }
@@ -771,6 +781,26 @@ mod tests {
             settings: Default::default(),
         })
     }
+    #[test]
+    fn omp_full_permission_launch_matches_paseo_yolo_without_changing_model_routes() {
+        let mut p = protocol(Kind::Omp);
+        p.request.settings.access = AccessMode::FullAccess;
+        p.request.model = Some("cpa-gemini/gemini-3.8-flash-high".into());
+        let mut command = Command::new("unused");
+        configure(&mut command, &p.request, false);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|args| args == ["--approval-mode", "yolo"]));
+        assert!(args
+            .windows(2)
+            .any(|args| args == ["--model", "cpa-gemini/gemini-3.8-flash-high"]));
+        assert!(!args.contains(&"--tools"));
+    }
+
     #[test]
     fn prompt_acknowledgements_do_not_finish_a_turn_and_retries_are_kept_alive() {
         for kind in [Kind::Pi, Kind::Omp] {

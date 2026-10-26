@@ -1203,6 +1203,42 @@ fn fresh_receipt_preserves_the_matching_desktop_model_id_spelling() {
         "claude:sonnet-4.6"
     );
 }
+
+#[test]
+fn cleared_preset_controls_do_not_resurrect_after_shared_session_reload() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let (id, source) = saved(
+        &store,
+        json!([{"role":"user", "text":"keep history", "future":{"keep":true}}]),
+    );
+    store.conn.execute("UPDATE sessions SET model_settings=?2 WHERE id=?1", params![source,
+        r#"{"reasoningEffort":"xhigh","serviceTier":"fast","thinking":"true","fast":"true"}"#]).unwrap();
+    let mut settings = store.agent_settings(id).unwrap().unwrap();
+    settings.model = Some("cpa-gemini/gemini-3.8-flash-high".into());
+    settings.effort = None;
+    settings.fast = false;
+    settings.service_tier = None;
+    settings.thinking = None;
+    settings.model_settings.clear();
+    settings.access = crate::agent::AccessMode::FullAccess;
+    store.configure_agent(id, "omp", &settings).unwrap();
+    let reloaded = store.agent_settings(id).unwrap().unwrap();
+    assert_eq!(reloaded.model, settings.model);
+    assert_eq!(reloaded.access, crate::agent::AccessMode::FullAccess);
+    assert!(
+        reloaded.effort.is_none() && reloaded.service_tier.is_none() && reloaded.thinking.is_none()
+    );
+    assert!(!reloaded.fast);
+    assert_eq!(
+        reloaded.model_settings,
+        HashMap::from([("fast".into(), "false".into())])
+    );
+    assert_eq!(
+        store.shared_blocks(id).unwrap()[0]["future"],
+        json!({"keep":true})
+    );
+}
+
 #[test]
 fn desktop_steers_restore_the_original_turn_without_needing_model_metadata() {
     let turns = project_turns(&[

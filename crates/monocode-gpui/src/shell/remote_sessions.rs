@@ -1,6 +1,5 @@
 //! Project indexes are fetched on workers; opening a row materializes the chat.
 use super::*;
-use serde_json::json;
 
 impl Shell {
     pub(super) fn refresh_remote_projects(&mut self, cx: &mut Context<Self>) {
@@ -11,54 +10,32 @@ impl Shell {
         let project_key = self.workspace.project.clone();
         let store = self.store.clone();
         let client = self.remote.clone();
+        let revision = self.remote_revisions.get(&project_key).cloned();
+        let conditional = crate::paseo_host::active();
         let work = cx.background_executor().spawn(async move {
-            let project = locked(&store)?
-                .remote_projects()?
-                .into_values()
-                .find(|p| p.key == project_key)
-                .ok_or(
-                    "Remote project identity is missing. Open this folder on its machine again.",
-                )?;
-            let machine = client.machine_for_environment(&project.environment_id)?;
-            let response = client.request(
-                &machine.id,
-                "sessions.list",
-                json!({"projectId":project.project_id}),
-            )?;
-            let values = response.as_array().ok_or("Invalid remote session list")?;
-            let store = locked(&store)?;
-            let mut summaries = Vec::new();
-            let host_ids: HashSet<String> = values
-                .iter()
-                .filter_map(|value| value["id"].as_str().map(str::to_owned))
-                .collect();
-            store.prune_remote_sessions(&project, &host_ids)?;
-            for value in values {
-                let summary = store.register_remote_summary(&project, value)?;
-                let state = store
-                    .remote_session(summary.id)?
-                    .ok_or("Remote session identity is missing")?;
-                summaries.push((
-                    summary,
-                    state.running,
-                    state.needs_input,
-                    value["draft"] == true,
-                ));
-            }
-            let retained: HashSet<i64> = store
-                .sessions()?
-                .iter()
-                .filter(|s| s.cwd == project.key)
-                .map(|s| s.id)
-                .collect();
-            Ok::<_, String>((project.key, summaries, retained))
+            crate::runtime::remote::refresh_project_index(
+                &store,
+                &client,
+                &project_key,
+                revision.as_deref(),
+                conditional,
+            )
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.remote_refreshing = false;
                 match result {
-                    Ok((project, summaries, retained)) => {
+                    Ok(Some(index)) => {
+                        this.remote_details.extend(index.presentation);
+                        let project = index.project;
+                        if let Some(revision) = index.revision {
+                            this.remote_revisions.insert(project.clone(), revision);
+                        } else {
+                            this.remote_revisions.remove(&project);
+                        }
+                        let summaries = index.summaries;
+                        let retained = index.retained;
                         let removed: Vec<_> = this
                             .order
                             .iter()
@@ -71,6 +48,7 @@ impl Shell {
                             .collect();
                         for id in removed {
                             this.remote_marks.remove(&id);
+                            this.started_by.remove(&id);
                             this.order.retain(|existing| *existing != id);
                             if let Some(view) = this.sessions.get(&id) {
                                 view.update(cx, |view, cx| {
@@ -89,6 +67,10 @@ impl Shell {
                         }
                         for (summary, running, waiting, draft) in summaries {
                             let id = summary.id;
+                            this.started_by.remove(&id);
+                            if let Some(parent) = index.started_by.get(&id) {
+                                this.started_by.insert(id, *parent);
+                            }
                             this.remote_marks.insert(id, (running, waiting));
                             if draft {
                                 this.draft_sessions.insert(id);
@@ -109,10 +91,11 @@ impl Shell {
                             this.session_summaries.insert(id, summary);
                         }
                         if this.workspace.project == project {
-                            this.refresh_sidebar_structure(cx);
                             this.invalidate_chrome(cx);
+                            this.refresh_sidebar_structure(cx);
                         }
                     }
+                    Ok(None) => return,
                     Err(error) => {
                         // A transient disconnect retains the last host index.
                         // The active conversation exposes the error and Retry.

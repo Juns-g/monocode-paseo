@@ -28,6 +28,8 @@ pub(super) struct Shared {
     columns: HashSet<String>,
     ids: RefCell<HashMap<i64, String>>,
     extras: RefCell<BTreeMap<String, String>>,
+    writes: std::cell::Cell<u64>,
+    written_bytes: std::cell::Cell<u64>,
     extras_db: Option<Connection>,
     snapshots: RefCell<HashMap<i64, HistoryRevision>>,
     /// The first block sequence of each indexed Mono's row numbering.
@@ -268,12 +270,15 @@ impl Store {
         }
         let (extras, extras_db) = settings::open(path, read_only)?;
         let store = Self {
+            remote_status: Default::default(),
             conn,
             path: path.into(),
             shared: Some(Shared {
                 columns,
                 ids: RefCell::new(HashMap::new()),
                 extras: RefCell::new(extras),
+                writes: Default::default(),
+                written_bytes: Default::default(),
                 extras_db,
                 snapshots: RefCell::new(HashMap::new()),
                 windows: RefCell::new(HashMap::new()),
@@ -455,25 +460,68 @@ impl Store {
             .get(key)
             .cloned())
     }
+    /// Committed settings transactions and changed key/value bytes, not SQLite/WAL or OS I/O.
+    pub fn sidecar_write_metrics(&self) -> (u64, u64) {
+        self.shared.as_ref().map_or((0, 0), |shared| {
+            (shared.writes.get(), shared.written_bytes.get())
+        })
+    }
     pub(super) fn shared_save_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        self.shared_save_settings(&[(key.to_owned(), value.to_owned())])
+    }
+    pub(super) fn shared_save_settings(&self, values: &[(String, String)]) -> Result<(), String> {
+        self.shared_patch_settings(values, &[])
+    }
+    pub(super) fn shared_patch_settings(
+        &self,
+        values: &[(String, String)],
+        remove: &[String],
+    ) -> Result<(), String> {
         self.shared_writable()?;
         let shared = self.shared.as_ref().unwrap();
-        if shared
-            .extras
-            .borrow()
-            .get(key)
-            .is_some_and(|old| old == value)
-        {
+        let cache = shared.extras.borrow();
+        let changed: Vec<_> = values
+            .iter()
+            .filter(|(k, v)| cache.get(k) != Some(v))
+            .collect();
+        let removed: Vec<_> = remove
+            .iter()
+            .filter(|key| cache.contains_key(*key))
+            .collect();
+        if changed.is_empty() && removed.is_empty() {
             return Ok(());
         }
+        drop(cache);
         if let Some(conn) = &shared.extras_db {
-            sql(conn.execute(
-                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![key, value],
-            ))?;
+            let tx = sql(conn.unchecked_transaction())?;
+            for (key, value) in &changed {
+                sql(tx.execute(
+                    "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![key, value],
+                ))?;
+            }
+            for key in &removed {
+                sql(tx.execute("DELETE FROM settings WHERE key=?1", [key]))?;
+            }
+            sql(tx.commit())?;
+            shared.writes.set(shared.writes.get() + 1);
+            let bytes: usize = changed
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                + removed.iter().map(|key| key.len()).sum::<usize>();
+            shared
+                .written_bytes
+                .set(shared.written_bytes.get() + bytes as u64);
         }
         // Publish only committed values. A failed save must remain retryable.
-        shared.extras.borrow_mut().insert(key.into(), value.into());
+        let mut cache = shared.extras.borrow_mut();
+        for (key, value) in changed {
+            cache.insert(key.clone(), value.clone());
+        }
+        for key in removed {
+            cache.remove(key);
+        }
         Ok(())
     }
     pub(super) fn shared_sessions(&self) -> Result<Vec<Session>, String> {
@@ -764,9 +812,9 @@ impl Store {
     /// their source transcript inside a surrounding transaction (rewind and
     /// worktree cleanup). These must not re-save or re-index turn receipts.
     fn shared_save_agent_preferences(&self, id: i64, settings: &Settings) -> Result<(), String> {
-        let current = self.shared_agent(id)?.unwrap_or_default();
-        let mut controls = current.model_settings;
-        controls.extend(settings.model_settings.clone());
+        // The caller owns a complete snapshot. Merging the previous model's
+        // controls resurrects cleared effort/speed values after a preset switch.
+        let mut controls = settings.model_settings.clone();
         let effort_key = [
             "effort",
             "reasoning",

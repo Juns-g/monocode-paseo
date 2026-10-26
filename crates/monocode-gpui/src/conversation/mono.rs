@@ -686,6 +686,14 @@ impl Conversation {
     }
     /// `ModelPicker` with `hideSettings`: its trigger opens the model list.
     pub(super) fn toggle_mono_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.mono.is_none()
+            && cx
+                .try_global::<crate::settings::Preferences>()
+                .is_some_and(|prefs| !prefs.agent_presets.is_empty())
+        {
+            self.toggle_menu(ComposerMenu::Model, window, cx);
+            return;
+        }
         if self.mono_ui.models.is_some() {
             self.close_mono_models(window, cx);
             return;

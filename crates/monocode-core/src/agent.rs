@@ -134,6 +134,9 @@ pub struct Settings {
     pub new_worktree: bool,
     pub worktree_base: Option<String>,
     pub worktree_cwd: Option<String>,
+    /// Explicit Paseo workspace for an unbound draft; None creates an independent workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_workspace_id: Option<String>,
     pub worktree_removed: bool,
     pub handoff: Option<Handoff>,
     pub pending_provider_switch: Option<ProviderSwitch>,

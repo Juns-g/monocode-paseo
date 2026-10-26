@@ -6,6 +6,7 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Preferences {
+    pub native_locale: Option<String>,
     // General
     pub sounds: bool,
     pub notifications: bool,
@@ -77,6 +78,11 @@ pub(crate) struct Preferences {
     pub default_access: Option<String>,
     /// Last explicit effort choice for each provider, shared across projects.
     pub provider_efforts: HashMap<String, String>,
+    pub agent_presets: Vec<super::AgentPreset>,
+    pub default_agent_preset: Option<String>,
+    pub configured_models: HashMap<String, super::ConfiguredAgent>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
     // Monos
     pub monos: bool,
     pub rail_monos_pinned: bool,
@@ -94,6 +100,7 @@ pub(crate) const UI_SCALE_PERCENTS: [u32; 16] = [
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            native_locale: None,
             sounds: true,
             notifications: false,
             project_notifications: serde_json::json!({}),
@@ -154,6 +161,10 @@ impl Default for Preferences {
             model_picker_tab: None,
             default_access: None,
             provider_efforts: HashMap::new(),
+            agent_presets: Vec::new(),
+            default_agent_preset: None,
+            configured_models: HashMap::new(),
+            extra: HashMap::new(),
             monos: true,
             rail_monos_pinned: false,
             mono_menu_bar_icon: true,
@@ -164,6 +175,50 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    pub(crate) fn new_chat_preset(
+        &self,
+        provider: &str,
+        model: Option<&str>,
+    ) -> Option<super::AgentPreset> {
+        self.agent_presets
+            .iter()
+            .find(|preset| {
+                Some(&preset.id) == self.default_agent_preset.as_ref()
+                    && preset.provider == provider
+                    && Some(preset.model.as_str()) == model
+            })
+            .cloned()
+    }
+    pub(crate) fn named_catalog(
+        &self,
+        provider: &str,
+        mut live: Vec<monocode_core::catalog::Model>,
+    ) -> Vec<monocode_core::catalog::Model> {
+        if let Some(configured) = self.configured_models.get(provider) {
+            for entry in &configured.models {
+                if let Some(model) = live.iter_mut().find(|model| model.id == entry.id) {
+                    model.name = entry.label.clone();
+                } else {
+                    live.push(monocode_core::catalog::Model {
+                        id: entry.id.clone(),
+                        name: entry.label.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        live
+    }
+
+    pub(crate) fn configured_model_name(&self, provider: &str, id: Option<&str>) -> Option<&str> {
+        self.configured_models
+            .get(provider)?
+            .models
+            .iter()
+            .find(|model| Some(model.id.as_str()) == id)
+            .map(|model| model.label.as_str())
+    }
+
     pub(crate) fn apply_workspace_theme(&mut self, id: String) {
         let color: gpui::Hsla = gpui::rgb(super::palette(&id, false).surface).into();
         self.theme_hue = (color.h * 360.).round() as u32;

@@ -34,6 +34,7 @@ mod git_status;
 #[cfg(target_os = "macos")]
 mod hang_watchdog;
 mod history;
+mod i18n;
 mod image_lightbox;
 mod image_memory;
 mod inbox;
@@ -47,11 +48,14 @@ mod metal_tests;
 mod mobile;
 mod modal;
 mod monos;
+mod native_shell;
 mod notes;
 mod notifications;
 mod pane_layout;
 mod pane_motion;
 mod particle_text;
+mod paseo_host;
+mod paseo_prototype;
 mod pickers;
 mod popover;
 mod project_background;
@@ -88,10 +92,7 @@ mod visuals;
 mod workspace;
 mod worktree_switcher;
 
-use gpui::{
-    App, Bounds, KeyBinding, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, actions, point, prelude::*, px, size,
-};
+use gpui::{App, KeyBinding, actions, prelude::*};
 use monocode_core::{store::Store, transcript::Transcript};
 use std::{
     path::PathBuf,
@@ -132,6 +133,9 @@ fn restart(cx: &mut App) {
 }
 
 fn data_dir() -> PathBuf {
+    if paseo_host::active() {
+        return paseo_prototype::data_dir();
+    }
     if let Some(path) = std::env::var_os("MONOCODE_NATIVE_DATA_DIR") {
         return path.into();
     }
@@ -170,6 +174,62 @@ fn plist_data_mode(plist: &str) -> Option<bool> {
     }
 }
 fn main() {
+    let prototype_args: Vec<String> = std::env::args().skip(1).collect();
+    if prototype_args
+        .first()
+        .is_some_and(|a| a == "--paseo-prototype-info")
+    {
+        println!(
+            "{}",
+            serde_json::json!({"paseo_bundle":paseo_prototype::is_bundle(),
+            "data_dir":paseo_prototype::data_dir(),"opens_monocode_store":true,"shell":"original","endpoint":"127.0.0.1:6973"})
+        );
+        return;
+    }
+    if prototype_args.first().is_some_and(|a| a == "--paseo-probe") {
+        if let Err(error) = paseo_prototype::probe() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if prototype_args
+        .first()
+        .is_some_and(|a| a == "--paseo-perf-check")
+    {
+        let path = prototype_args
+            .get(1)
+            .expect("--paseo-perf-check needs an isolated scratch path");
+        if let Err(error) = paseo_host::perf_check(std::path::Path::new(path)) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if prototype_args
+        .first()
+        .is_some_and(|a| a == "--paseo-host-check")
+    {
+        let path = prototype_args
+            .get(1)
+            .expect("--paseo-host-check needs an isolated scratch path");
+        if let Err(error) = paseo_host::check(std::path::Path::new(path)) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if prototype_args
+        .first()
+        .is_some_and(|a| a == "--paseo-prototype" || a == "--paseo-legacy-ui")
+    {
+        paseo_prototype::run();
+        return;
+    }
+    if paseo_host::active() && !prototype_args.is_empty() {
+        eprintln!("This isolated bundle accepts only Paseo probe options");
+        std::process::exit(2);
+    }
     if let Some(code) = monocode_core::remote::ssh_askpass::maybe_run() {
         std::process::exit(code);
     }
@@ -218,12 +278,27 @@ fn main() {
         }
         return;
     }
+    let mut paseo = if paseo_host::active() {
+        if !prototype_args.is_empty() {
+            eprintln!("This bundle uses its isolated Paseo store only");
+            std::process::exit(2);
+        }
+        Some(
+            paseo_host::start(&paseo_prototype::data_dir()).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1)
+            }),
+        )
+    } else {
+        None
+    };
     let mut args = std::env::args().skip(1);
     let mut fixture = false;
     let mut chat_fixture = false;
     let mut visual_fixture = false;
     // Development stays separate; release builds use the installed app's data.
-    let mut use_monocode = bundle_uses_monocode_data().unwrap_or(!cfg!(debug_assertions));
+    let mut use_monocode =
+        !paseo_host::active() && bundle_uses_monocode_data().unwrap_or(!cfg!(debug_assertions));
     let mut monocode_db = monocode_core::store::monocode_database();
     let mut check_data = false;
     let mut explicit_cwd = false;
@@ -288,7 +363,9 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let mut db = if check_data {
+    let mut db = if let Some(store) = paseo.as_mut().and_then(|host| host.store.take()) {
+        Ok(store)
+    } else if check_data {
         Store::read_monocode(&database)
     } else {
         Store::open_monocode(&database)
@@ -317,11 +394,73 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("checkpoints"),
     );
-    let saved = db.ui_state().unwrap_or_else(|e| {
+    let mut saved = db.ui_state().unwrap_or_else(|e| {
         eprintln!("Cannot read workspace settings: {e}");
         None
     });
-    let existing_project = if use_monocode {
+    if let Some(host) = &paseo {
+        let summaries = db.sessions().expect("Paseo summaries");
+        let metadata = summaries
+            .iter()
+            .map(|s| (s.id, s.cwd.clone()))
+            .collect::<Vec<_>>();
+        let mut workspace = workspace::Workspace::restore(saved.as_deref(), &metadata, &host.cwd);
+        paseo_host::restrict_workspace(&mut workspace);
+        for (key, label) in &host.labels {
+            workspace
+                .project_appearance
+                .entry(key.clone())
+                .or_insert_with(|| monocode_core::project_appearance::ProjectAppearance {
+                    name: label.clone(),
+                    ..Default::default()
+                });
+        }
+        workspace.preferences.extra.insert(
+            "paseo_all_projects".into(),
+            serde_json::json!(host.all_projects),
+        );
+        workspace.preferences.extra.insert(
+            "paseo_visible_projects".into(),
+            serde_json::json!(host.projects),
+        );
+        workspace.preferences.extra.insert(
+            paseo_host::PROJECT_SELECTION.into(),
+            serde_json::to_value(&host.selection).expect("project selection"),
+        );
+        workspace.preferences.extra.insert(
+            "paseo_environment".into(),
+            serde_json::json!(host.server_id),
+        );
+        workspace.preferences.extra.insert(
+            "paseo_host_endpoint".into(),
+            serde_json::json!(host.endpoint),
+        );
+        workspace.projects = host.projects.clone();
+        for (key, path) in &host.icons {
+            workspace
+                .project_appearance
+                .entry(key.clone())
+                .or_default()
+                .logo = Some(path.clone());
+        }
+        workspace.project = host.cwd.clone();
+        if !summaries
+            .iter()
+            .any(|s| Some(s.id) == workspace.active && s.cwd == workspace.project)
+        {
+            workspace.active = None;
+        }
+        if workspace.active.is_none()
+            && let Some(s) = summaries
+                .iter()
+                .find(|s| s.cwd == workspace.project && !s.archived)
+        {
+            workspace.active = Some(s.id);
+            workspace.tabs.push(s.id);
+        }
+        saved = Some(serde_json::to_string(&workspace).expect("Paseo workspace"));
+    }
+    let existing_project = if use_monocode || paseo.is_some() {
         saved
             .as_deref()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
@@ -375,7 +514,7 @@ fn main() {
         db.write_rows(s.id, 0, &fixtures::visuals().rows).unwrap();
     }
     let mut sessions = db.sessions().expect("read native sessions");
-    if sessions.is_empty() {
+    if sessions.is_empty() && paseo.is_none() {
         sessions.push(db.create("codex", &cwd).expect("create initial session"));
     }
     // Gather compact sidebar state before entering the platform event loop.
@@ -391,6 +530,7 @@ fn main() {
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
     let db = Arc::new(Mutex::new(db));
+    let host_child = paseo.as_ref().map(|host| host.child.clone());
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
     gpui::Application::with_platform(platform)
@@ -398,6 +538,9 @@ fn main() {
         .run(move |cx: &mut App| {
             #[cfg(debug_assertions)]
             dev_reload::install(cx);
+            if let Some(child) = host_child {
+                paseo_host::Host::install_quit(child, cx);
+            }
             cx.set_global(title_raster);
             image_memory::init(cx);
             #[cfg(target_os = "macos")]
@@ -430,35 +573,8 @@ fn main() {
                 }
             })
             .detach();
-            let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
             cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(820.), px(520.))),
-                    // Linux desktops match this to the .desktop file's
-                    // StartupWMClass to show the app icon.
-                    app_id: Some("dev.usemono.gpui".into()),
-                    window_background: if cfg!(target_os = "macos") {
-                        WindowBackgroundAppearance::Blurred
-                    } else {
-                        WindowBackgroundAppearance::Opaque
-                    },
-                    // GPUI owns the custom chrome. AppKit must not reinterpret
-                    // its controls as native titlebar double-click/drag gestures.
-                    app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Monocode Native".into()),
-                        appears_transparent: cfg!(target_os = "macos"),
-                        traffic_light_position: if cfg!(target_os = "macos") {
-                            // Original macOS chrome: 12 pt left inset, with
-                            // 14 pt native buttons centered in the 40 pt bar.
-                            Some(point(px(12.), px((theme::TITLE_BAR_HEIGHT - 14.) / 2.)))
-                        } else {
-                            None
-                        },
-                    }),
-                    ..Default::default()
-                },
+                native_shell::window_options("Monocode Native", Some("dev.usemono.gpui"), cx),
                 |window, cx| {
                     let shell = cx.new(|cx| {
                         shell::Shell::new_with_metadata(
@@ -471,17 +587,7 @@ fn main() {
                         )
                     });
                     shell.update(cx, |shell, cx| shell.focus_active(window, cx));
-                    #[cfg(target_os = "macos")]
-                    {
-                        traffic_lights::pin(window, theme::TITLE_BAR_HEIGHT);
-                        // AppKit rebuilds the buttons on some titlebar changes.
-                        shell.update(cx, |_, cx| {
-                            cx.observe_window_activation(window, |_, window, _| {
-                                traffic_lights::pin(window, theme::TITLE_BAR_HEIGHT)
-                            })
-                            .detach();
-                        });
-                    }
+                    shell.update(cx, |_, cx| native_shell::pin_titlebar(window, cx));
                     window.activate_window();
                     shell
                 },
@@ -495,8 +601,11 @@ fn main() {
 mod native_tests {
     use super::*;
     use crate::{input, transcript::TranscriptView};
+    use gpui::{
+        Bounds, EntityInputHandler, ListOffset, TestAppContext, WindowBounds, WindowOptions, point,
+        px, size,
+    };
     use gpui::{Context, Entity, Render, StyleRefinement, Window, div};
-    use gpui::{EntityInputHandler, ListOffset, TestAppContext, point};
     use monocode_core::transcript::Row;
     struct Surface {
         transcript: Entity<TranscriptView>,

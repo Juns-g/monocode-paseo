@@ -89,6 +89,9 @@ pub(crate) fn run_turn(
         remote::run(summary, prompt, settings, controls, store, cancel, tx);
         return;
     }
+    if crate::paseo_host::active() {
+        return;
+    } // This bundle never starts a local provider.
     run_turn_using(
         TurnInput {
             summary,

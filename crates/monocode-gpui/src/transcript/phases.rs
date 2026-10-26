@@ -28,6 +28,12 @@ impl Phases {
 }
 
 pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
+    collect_inner(rows, from, streaming, false)
+}
+pub(crate) fn collect_preserving_prose(rows: &[Row], from: usize, streaming: bool) -> Phases {
+    collect_inner(rows, from, streaming, true)
+}
+fn collect_inner(rows: &[Row], from: usize, streaming: bool, preserve_prose: bool) -> Phases {
     let mut result = Phases::default();
     let mut members = Vec::new();
     let mut calls = Vec::new();
@@ -69,17 +75,18 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
         } else if role == "tool"
             && let Ok(mut call) = serde_json::from_str::<ToolCall>(&rows[at].text)
         {
-            let standalone = match call.panel() {
-                Some(Panel::Agent(_))
-                    if live_turn.is_some_and(|turn| at >= turn)
-                        || matches!(call.state, ToolState::Failed | ToolState::Cancelled) =>
-                {
-                    result.pinned.insert(at);
-                    true
-                }
-                Some(Panel::Tasks(_)) => true,
-                _ => false,
-            };
+            let standalone = !preserve_prose
+                && match call.panel() {
+                    Some(Panel::Agent(_))
+                        if live_turn.is_some_and(|turn| at >= turn)
+                            || matches!(call.state, ToolState::Failed | ToolState::Cancelled) =>
+                    {
+                        result.pinned.insert(at);
+                        true
+                    }
+                    Some(Panel::Tasks(_)) => true,
+                    _ => false,
+                };
             if standalone {
                 flush(at, &mut members, &mut calls, &mut result);
                 leading = false;
@@ -105,7 +112,7 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
             }
         } else {
             // React's first assistant message replaces the initial private think.
-            if role == "assistant" && leading && calls.is_empty() {
+            if role == "assistant" && leading && calls.is_empty() && !preserve_prose {
                 result.hidden.extend(members.drain(..));
             }
             flush(at, &mut members, &mut calls, &mut result);
@@ -124,6 +131,18 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prose_preserving_mode_keeps_the_leading_thinking_disclosure() {
+        let rows = [
+            row("user", "Question"),
+            row("reasoning", "Synthetic thought"),
+            row("assistant", "Answer"),
+        ];
+        assert!(collect(&rows, 0, false).hidden.contains(&1));
+        let phases = collect_preserving_prose(&rows, 0, false);
+        assert!(!phases.hidden.contains(&1));
+        assert!(phases.at(1).is_some());
+    }
     fn build(rows: &[Row]) -> Phases {
         collect(rows, 0, false)
     }

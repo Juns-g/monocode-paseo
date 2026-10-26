@@ -9,6 +9,10 @@ pub(super) struct State {
     pub(super) refreshing: bool,
     pub(super) pending: bool,
     pub(super) online: bool,
+    /// A send rejected only because a turn is running; not a remote command.
+    send_blocked_notice: bool,
+    pub(super) unbound: bool,
+    pub(super) workspace_choices: Vec<Value>,
     error: Option<String>,
     rejected: Option<Value>,
     snapshot: Option<Value>,
@@ -21,6 +25,17 @@ impl State {
     }
 }
 impl Conversation {
+    pub(super) fn paseo_controls(&self) -> bool {
+        self.is_remote()
+            && (crate::paseo_host::active()
+                || self.remote_state.capabilities.contains("paseo.configure"))
+    }
+    pub(super) fn paseo_workspace_draft(&self) -> bool {
+        self.paseo_controls()
+            && self.remote_state.unbound
+            && !self.summary.has_messages
+            && self.remote_state.capabilities.contains("paseo.workspaces")
+    }
     pub(super) fn is_remote(&self) -> bool {
         self.summary.cwd.starts_with("remote://")
     }
@@ -53,7 +68,12 @@ impl Conversation {
                 }
             }));
         }
-        if !self.loaded || self.history_unloaded {
+        // Failed Paseo loads retry via the clock/button, not SessionChanged/paint.
+        let failed = self.remote_state.error.is_some()
+            && cx
+                .try_global::<crate::settings::Preferences>()
+                .is_some_and(crate::paseo_host::project_ui);
+        if (!self.loaded || self.history_unloaded) && !failed {
             self.refresh_remote_snapshot(cx);
         }
     }
@@ -88,12 +108,25 @@ impl Conversation {
             } else {
                 None
             };
+            let workspace_choices = if remote.session_id.is_none()
+                && descriptor.as_ref().is_some_and(|d| d["capabilities"]
+                    .as_array().is_some_and(|caps| caps.iter().any(|c| c == "paseo.workspaces")))
+            {
+                Some(client.request(&machine.id, "paseo.workspaces",
+                    json!({"projectId":remote.project.project_id}))?
+                    .as_array().ok_or("Invalid Paseo workspace choices")?.clone())
+            } else {
+                None
+            };
             let snapshot = remote
                 .session_id
                 .as_deref()
                 .map(|session| client.load_session(&machine.id, session, known.as_ref()))
                 .transpose()?;
-            if let Some(snapshot) = snapshot.as_ref() {
+            let changed = initial
+                || known.as_ref().map(|s| &s["revision"])
+                    != snapshot.as_ref().map(|s| &s["revision"]);
+            if let Some(snapshot) = snapshot.as_ref().filter(|_| changed) {
                 let store = locked(&store)?;
                 let summary = store.register_remote_summary(&remote.project, snapshot)?;
                 remote = store
@@ -101,9 +134,6 @@ impl Conversation {
                     .ok_or("Remote session identity is missing")?;
                 settings = store.agent_settings(summary.id)?.unwrap_or_default();
             }
-            let changed = initial
-                || known.as_ref().map(|s| &s["revision"])
-                    != snapshot.as_ref().map(|s| &s["revision"]);
             let history = if changed {
                 let qualified = snapshot.as_ref().map(|snapshot| {
                     let mut snapshot = snapshot.clone();
@@ -128,7 +158,10 @@ impl Conversation {
             } else {
                 None
             };
-            Ok::<_, String>((remote, settings, snapshot, history, descriptor))
+            if initial && crate::paseo_host::active() && let Some(id) = remote.session_id.as_deref() {
+                client.request(&machine.id, "commands.dispatch", json!({"type":"view", "sessionId":id, "commandId":monocode_core::mono::new_id()}))?;
+            }
+            Ok::<_, String>((remote, settings, snapshot, history, descriptor, workspace_choices))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -136,7 +169,11 @@ impl Conversation {
                 this.remote_state.refreshing = false;
                 this.loading = false;
                 match result {
-                    Ok((remote, settings, snapshot, history, descriptor)) => {
+                    Ok((remote, settings, snapshot, history, descriptor, workspace_choices)) => {
+                        this.remote_state.unbound = remote.session_id.is_none();
+                        if let Some(choices) = workspace_choices {
+                            this.remote_state.workspace_choices = choices;
+                        }
                         this.remote_state.online = true;
                         this.remote_state.error = remote
                             .rejected
@@ -161,8 +198,15 @@ impl Conversation {
                             this.model = this.settings.model.clone();
                         }
                         if let Some((history, turns)) = history {
+                            let preserve = this
+                                .remote_state
+                                .capabilities
+                                .contains("paseo.preserve-prose");
                             this.settings.turns = turns.clone();
                             this.transcript.update(cx, |view, cx| {
+                                if preserve {
+                                    view.paseo_mode();
+                                }
                                 view.set_turns(turns);
                                 view.install_prepared_history(history, cx);
                             });
@@ -226,6 +270,7 @@ impl Conversation {
             .update(cx, |view, cx| view.set_saved_draft(draft, cx));
     }
     pub(super) fn remote_send_guard(&mut self, cx: &mut Context<Self>) -> bool {
+        self.remote_state.send_blocked_notice = false;
         let error = if !self.loaded {
             Some("Wait for this remote conversation to load.")
         } else if !self.remote_state.online {
@@ -241,6 +286,10 @@ impl Conversation {
         };
         if let Some(error) = error {
             self.status = error.into();
+            self.remote_state.send_blocked_notice = self.loaded
+                && self.remote_state.online
+                && !self.remote_state.pending
+                && (self.busy || self.stopping);
             cx.notify();
             return true;
         }
@@ -332,6 +381,24 @@ impl Conversation {
         self.launch_prompt(prompt, cx);
     }
     pub(super) fn remote_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.is_remote()
+            && self.remote_state.send_blocked_notice
+            && (self.busy || self.stopping)
+            && (!self.input.read(cx).content.trim().is_empty() || !self.attachments.is_empty())
+        {
+            return Some(
+                div()
+                    .mx_2()
+                    .my_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(content(0.04))
+                    .text_size(px(12.))
+                    .debug_selector(|| "remote-send-notice".into())
+                    .child("尚未发送，内容仍保留在输入框。当前任务结束后请再次发送。")
+                    .into_any_element(),
+            );
+        }
         if !self.is_remote()
             || self.busy
             || (self.remote_state.error.is_none() && !self.remote_state.pending)

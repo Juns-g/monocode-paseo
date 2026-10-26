@@ -12,6 +12,7 @@ impl Shell {
                 && saved.file_view_mode == prefs.file_view_mode
                 && saved.default_access == prefs.default_access
                 && saved.provider_efforts == prefs.provider_efforts
+                && (!crate::paseo_host::active() || saved.agent_presets == prefs.agent_presets)
             {
                 return;
             }
@@ -21,6 +22,9 @@ impl Shell {
             saved.file_view_mode = prefs.file_view_mode.clone();
             saved.default_access = prefs.default_access.clone();
             saved.provider_efforts = prefs.provider_efforts.clone();
+            if crate::paseo_host::active() {
+                saved.agent_presets = prefs.agent_presets.clone();
+            }
             this.sync_settings(cx);
             this.persist(cx);
         });

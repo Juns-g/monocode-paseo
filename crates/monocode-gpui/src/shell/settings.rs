@@ -337,6 +337,10 @@ impl Shell {
             .unwrap_or(Kind::Codex)
     }
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
+        crate::i18n::configure(&self.workspace.preferences);
+        if crate::paseo_host::active() {
+            crate::paseo_host::restrict_workspace(&mut self.workspace);
+        }
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
         monocode_core::cli::initialize(&self.workspace.preferences.binary_paths);

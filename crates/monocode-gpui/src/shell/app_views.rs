@@ -240,6 +240,9 @@ impl Shell {
     }
 
     pub(super) fn open_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            return;
+        }
         self.prepare_app_view(window, cx);
         self.ensure_background_inbox(window, cx);
         if let Some(inbox) = &self.inbox {
@@ -249,6 +252,9 @@ impl Shell {
     }
 
     pub(super) fn ensure_background_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            return;
+        }
         if self.inbox.is_none() {
             let projects = self.workspace.projects.iter().map(Into::into).collect();
             let cwd = self.workspace.project.clone().into();
@@ -296,6 +302,9 @@ impl Shell {
     }
 
     pub(super) fn open_automations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            return;
+        }
         let Some(service) = self.automation_state.service.clone() else {
             self.automation_state.open_requested = Some(self.navigation_revision);
             self.initialize_automations(cx);

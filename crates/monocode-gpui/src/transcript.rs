@@ -515,6 +515,7 @@ pub(crate) struct TranscriptView {
     chat_layout: bool,
     anchor_prompts: bool,
     smooth_reveal: bool,
+    preserve_prose: bool,
     search_match: Option<(usize, String)>,
     highlights: HashMap<u64, Option<Arc<HighlightedDocument>>>,
     highlighting: HashSet<u64>,
@@ -2323,6 +2324,7 @@ impl TranscriptView {
             chat_layout: true,
             anchor_prompts: true,
             smooth_reveal: true,
+            preserve_prose: false,
             search_match: None,
             highlights: HashMap::new(),
             highlighting: HashSet::new(),
@@ -2392,6 +2394,17 @@ impl TranscriptView {
             #[cfg(test)]
             rebuild_passes: 0,
         }
+    }
+    /// Paseo assistant entries are all public replies, including background continuations.
+    pub(crate) fn paseo_mode(&mut self) {
+        self.preserve_prose = true;
+    }
+    pub(crate) fn remote_duration(&mut self, turn: usize, ms: u64) {
+        self.elapsed
+            .insert(turn, std::time::Duration::from_millis(ms));
+        let info = self.turns.entry(turn).or_default();
+        info.duration_ms = ms;
+        info.duration_known = true;
     }
     pub(crate) fn apply_preferences(
         &mut self,
@@ -3004,6 +3017,8 @@ impl TranscriptView {
         self.rows.truncate(display_start);
         let activity = if self.mono {
             phases::Phases::default()
+        } else if self.preserve_prose {
+            phases::collect_preserving_prose(&self.source, source_start, self.streaming)
         } else {
             phases::collect(&self.source, source_start, self.streaming)
         };
@@ -3070,6 +3085,7 @@ impl TranscriptView {
                 });
                 // A Mono's work stays in its activity panel, never folded inline.
                 has_work = !self.mono
+                    && !self.preserve_prose
                     && final_answer.is_some_and(|answer| {
                         self.source[turn..answer].iter().any(|r| r.role == "tool")
                     });
@@ -3127,7 +3143,7 @@ impl TranscriptView {
                 });
             }
             let phase = activity.at(at);
-            let grouped = phase.is_some_and(|group| group.steps > 1);
+            let grouped = phase.is_some_and(|group| group.steps > 1 || self.preserve_prose);
             let active = phase.is_some_and(|group| {
                 self.streaming
                     && (group.end == self.source.len() || awaiting_answer == Some(group.end))
@@ -3169,7 +3185,17 @@ impl TranscriptView {
             {
                 let group = phase.unwrap();
                 let (title, icon) = if group.calls.is_empty() {
-                    (if active { "Thinking…" } else { "Thought" }.into(), "minus")
+                    (
+                        if active {
+                            "Thinking…"
+                        } else if self.preserve_prose {
+                            "Thinking"
+                        } else {
+                            "Thought"
+                        }
+                        .into(),
+                        "minus",
+                    )
                 } else {
                     crate::activity::summary(&group.calls, active)
                 };
@@ -3812,6 +3838,22 @@ impl TranscriptView {
         pinned_answers: &HashMap<usize, usize>,
         replaced_work: Option<std::ops::Range<usize>>,
     ) -> Vec<UiRow> {
+        // Exit rows outlive a source patch, but message ordinals do not.
+        let owners: HashMap<_, _> = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (message.start, index))
+            .collect();
+        old.retain_mut(|row| {
+            if let Some(&message) = owners.get(&row.key.0) {
+                row.message = message;
+                true
+            } else {
+                self.motions.remove(&row.key);
+                false
+            }
+        });
         let phase_toggle = self.phase_toggle.take();
         if old.is_empty() && !self.streaming && self.motions.is_empty() {
             return target;
@@ -5639,6 +5681,65 @@ fn paint_edge_fade(bounds: Bounds<Pixels>, begin: bool, window: &mut Window) {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl TranscriptView {
+    pub(crate) fn test_measure_all_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_measurements(window, cx);
+        for ix in 0..self.rows.len() {
+            self.measure_row_height(ix, window, cx);
+        }
+        assert!(
+            self.rows
+                .iter()
+                .all(|row| row.message < self.messages.len())
+        );
+        for row in &self.rows {
+            assert_eq!(self.messages[row.message].start, row.key.0);
+        }
+        assert!(
+            self.messages
+                .iter()
+                .all(|message| message.start < self.source.len())
+        );
+    }
+    /// Inspect the real built rows; optionally use the WorkLine's expansion state.
+    pub(crate) fn test_work_rows(
+        &mut self,
+        expand: bool,
+        cx: &mut Context<Self>,
+    ) -> (bool, Vec<(usize, &'static str)>) {
+        if expand {
+            let turn = self.source.iter().rposition(Row::is_prompt).unwrap() + 1;
+            self.work_folds.insert(turn, true);
+            self.rebuild(turn, cx);
+        }
+        (
+            self.streaming,
+            self.rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.key.0,
+                        match row.body {
+                            Body::WorkLine {
+                                expandable: true, ..
+                            } => "work-fold",
+                            Body::WorkLine { .. } => "work-line",
+                            Body::Phase { active: true, .. } => "live-phase",
+                            Body::Phase { .. } => "phase",
+                            Body::Tool { .. } => "tool",
+                            Body::Reasoning => "reasoning",
+                            Body::Markdown(_) => "markdown",
+                            Body::Plain(_) => "plain",
+                            _ => "other",
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 }
 

@@ -289,7 +289,7 @@ impl Protocol {
         } else if !self.acp.settings_applied {
             self.acp.settings_applied = true;
             let setup = self.acp.setup.clone();
-            self.acp_settings(&setup);
+            self.acp_settings(&setup)?;
             self.acp_next(stdin)
         } else if let Some(mode) = self.acp.mode.take() {
             self.acp_send(
@@ -445,11 +445,27 @@ impl Protocol {
         }
         Ok(())
     }
-    fn acp_settings(&mut self, setup: &Value) {
+    fn acp_settings(&mut self, setup: &Value) -> Result<(), String> {
         let kind = self.request.kind;
         let settings = &self.request.settings;
         if kind == Kind::Hermes {
-            return;
+            if let Some(effort) = &settings.effort {
+                let config = setup["configOptions"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let option = setting_option(&config, "effort");
+                let mut choices = Vec::new();
+                if let Some(option) = option {
+                    config_choices(&option["options"], &mut choices);
+                }
+                if !choices.contains(effort) {
+                    return Err(format!("Hermes ACP does not advertise reasoning effort {effort}; refusing to silently use its default."));
+                }
+                self.acp.options.push_back(("session/set_config_option",
+                    json!({"sessionId":self.acp.session,"configId":config_id(option.unwrap()),"value":effort})));
+            }
+            return Ok(());
         }
         let mut selected = settings.model_settings.clone();
         if let Some(effort) = &settings.effort {
@@ -476,7 +492,7 @@ impl Protocol {
                     json!({"sessionId":self.acp.session,"modeId":effort}),
                 ));
             }
-            return;
+            return Ok(());
         }
         let config = setup["configOptions"]
             .as_array()
@@ -527,6 +543,7 @@ impl Protocol {
                 .options
                 .push_back(("session/set_config_option", params));
         }
+        Ok(())
     }
     fn acp_failure(
         &mut self,
@@ -1451,6 +1468,33 @@ mod tests {
             assert!(p.done);
         }
     }
+    #[test]
+    fn hermes_preset_uses_dont_ask_and_refuses_unadvertised_effort() {
+        let mut p = protocol(Kind::Hermes);
+        p.request.settings.access = AccessMode::FullAccess;
+        p.request.model = Some("openai-codex:gpt-6.1-sol".into());
+        p.request.settings.effort = Some("high".into());
+        p.acp_options(&json!({})).unwrap();
+        assert_eq!(p.acp.mode, Some("dont_ask"));
+        assert_eq!(p.acp.options[0].1["modelId"], "openai-codex:gpt-6.1-sol");
+        assert!(p
+            .acp_settings(&json!({}))
+            .unwrap_err()
+            .contains("does not advertise"));
+        p.acp.options.clear();
+        p.acp_settings(
+            &json!({"configOptions":[{"id":"reasoning_effort","options":[{"value":"high"}]}]}),
+        )
+        .unwrap();
+        assert_eq!(p.acp.options[0].0, "session/set_config_option");
+        assert_eq!(p.acp.options[0].1["configId"], "reasoning_effort");
+        assert_eq!(p.acp.options[0].1["value"], "high");
+        p.request.settings.effort = None;
+        p.acp.options.clear();
+        p.acp_settings(&json!({})).unwrap();
+        assert!(p.acp.options.is_empty());
+    }
+
     #[test]
     fn resuming_mutes_replay_and_replaces_missing_sessions_like_the_desktop() {
         let mut p = protocol(Kind::Grok);

@@ -31,6 +31,9 @@ pub(crate) fn get(cx: &App) -> Option<Entity<Accounts>> {
     cx.try_global::<Shared>().map(|s| s.0.clone())
 }
 pub(crate) fn install(store: Database, cx: &mut App) {
+    if crate::paseo_host::active() {
+        return;
+    }
     if get(cx).is_some() {
         return;
     }

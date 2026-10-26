@@ -54,7 +54,7 @@ pub(crate) enum Rail {
 
 /// `.zen-phase-step.orchestration-tree-step`: a step branching off the
 /// transcript's tool rail, its row 2px lower inside the step's padding.
-pub(super) fn step(last: bool, child: impl IntoElement) -> gpui::Div {
+pub(crate) fn step(last: bool, child: impl IntoElement) -> gpui::Div {
     div()
         .relative()
         .pl(px(20.))
@@ -130,7 +130,9 @@ impl Shell {
     /// Moves each rail toward its open state. A rail the sidebar first shows
     /// is simply there; later changes grow and fold.
     pub(super) fn sync_rails(&mut self, ids: &[i64], cx: &mut Context<Self>) {
-        let (started, children) = if self.workspace.classic_layout {
+        let (started, children) = if self.workspace.classic_layout
+            && !crate::paseo_host::project_ui(&self.workspace.preferences)
+        {
             // Original Sidebar.tsx leaves /operator launches in the list.
             (HashMap::new(), HashSet::new())
         } else {
@@ -204,7 +206,10 @@ impl Shell {
     }
 
     fn session_card_at_depth(&self, id: i64, nested: bool, cx: &mut Context<Self>) -> AnyElement {
-        if self.workspace.classic_layout {
+        if self.workspace.classic_layout
+            && !(crate::paseo_host::project_ui(&self.workspace.preferences)
+                && self.rails.started.contains_key(&id))
+        {
             return self.classic_session_card_at_depth(id, nested, false, cx);
         }
         let Some(rail) = self.rail(id, &self.rails.started) else {
@@ -217,7 +222,11 @@ impl Shell {
         let now = Instant::now();
         let progress = self.rails.motions.get(&id).map_or(0., |m| m.value(now));
         let open = self.rails.motions.get(&id).is_some_and(|m| m.open);
-        let row = self.session_row_with(id, nested, Some((&rail, open)), cx);
+        let row = if self.workspace.classic_layout {
+            self.classic_session_row_with(id, nested, false, Some((&rail, open)), cx)
+        } else {
+            self.session_row_with(id, nested, Some((&rail, open)), cx)
+        };
         if progress <= 0. {
             return row;
         }
@@ -229,7 +238,11 @@ impl Shell {
                 .children(children.iter().enumerate().map(|(ix, child)| {
                     step(
                         ix + 1 == children.len(),
-                        self.session_row_with(*child, true, None, cx),
+                        if self.workspace.classic_layout {
+                            self.classic_session_row_with(*child, true, true, None, cx)
+                        } else {
+                            self.session_row_with(*child, true, None, cx)
+                        },
                     )
                 }))
                 .into_any_element(),
@@ -266,6 +279,11 @@ impl Shell {
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if crate::paseo_host::project_ui(&self.workspace.preferences)
+            && self.rails.started.contains_key(&id)
+        {
+            return self.session_card_at_depth(id, nested, cx);
+        }
         let rail = self
             .rail(id, &self.rails.started)
             .filter(|rail| matches!(rail, Rail::Agents(_)));

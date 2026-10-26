@@ -75,6 +75,7 @@ impl Store {
             summary,
             project,
             session_id,
+            parent_session_id: None,
             outbox: vec![],
             uploads: vec![],
             rejected: None,
@@ -353,7 +354,14 @@ impl Store {
         ids: impl IntoIterator<Item = i64>,
     ) -> Result<(), String> {
         let mut hidden = self.hidden_legacy_remote_sessions()?;
+        let before = hidden.len();
         hidden.extend(ids.into_iter().filter(|id| *id >= 0));
+        if hidden.len() == before {
+            return Ok(());
+        }
+        let hidden = hidden
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         self.save_setting(
             HIDDEN,
             &serde_json::to_string(&hidden).map_err(|error| error.to_string())?,

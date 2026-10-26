@@ -154,10 +154,10 @@ impl Input {
             // Preserve byte positions used by the native selection handler.
             return ("*".repeat(self.content.len()).into(), None);
         }
-        let text = if self.content.is_empty() {
-            &self.placeholder
+        let text: SharedString = if self.content.is_empty() {
+            crate::i18n::t(&self.placeholder).into()
         } else {
-            &self.content
+            self.content.clone()
         };
         let command = self.command_layout();
         let display = match command {

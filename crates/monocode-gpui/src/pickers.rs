@@ -231,14 +231,17 @@ enum ModelTab {
 }
 
 struct ModelEntry {
+    preset: Option<String>,
     kind: Kind,
     id: Option<String>,
     name: SharedString,
     enabled: bool,
+    description: String,
 }
 
 /// The model the next turn uses; `None` is the provider's default.
 pub(crate) struct ModelPicked(pub Kind, pub Option<String>);
+pub(crate) struct PresetPicked(pub String);
 
 /// ModelFlyout: providers down a rail on the left, a search field over the
 /// selected provider's models on the right. Switching providers is available
@@ -254,6 +257,7 @@ pub(crate) struct ModelList {
     loading: Vec<Kind>,
     missing: Vec<Kind>,
     switch_allowed: bool,
+    presets: Option<bool>,
     hidden: Vec<String>,
     /// QuickModelSelector.tsx: providers as tabs above the search and list.
     quick: bool,
@@ -263,6 +267,7 @@ pub(crate) struct ModelList {
     _changed: Subscription,
 }
 impl EventEmitter<ModelPicked> for ModelList {}
+impl EventEmitter<PresetPicked> for ModelList {}
 impl ModelList {
     pub(crate) fn new_for(
         provider: Kind,
@@ -297,6 +302,7 @@ impl ModelList {
             loading: Vec::new(),
             missing: Vec::new(),
             switch_allowed: true,
+            presets: None,
             hidden: Vec::new(),
             quick: false,
             tab: cx
@@ -336,6 +342,10 @@ impl ModelList {
             self.tab = ModelTab::Favorites;
         }
         self.hidden = hidden;
+        self
+    }
+    pub(crate) fn with_presets(mut self, allowed: Option<bool>) -> Self {
+        self.presets = allowed;
         self
     }
     /// The quick composer's inline selector: providers in a row of tabs,
@@ -516,35 +526,116 @@ impl ModelList {
     fn entries(&self, cx: &gpui::App) -> Vec<ModelEntry> {
         let ModelTab::Harness(kind) = self.tab else {
             let query = self.query(cx);
-            return cx
-                .try_global::<crate::settings::Preferences>()
-                .into_iter()
-                .flat_map(|prefs| &prefs.favorite_models)
-                .filter_map(|choice| {
-                    let kind = Kind::parse(&choice.provider)?;
-                    if kind != self.provider && self.hidden.iter().any(|id| id == kind.id()) {
-                        return None;
+            let mut entries = Vec::new();
+            if let Some(allowed) = self.presets {
+                for preset in cx
+                    .try_global::<crate::settings::Preferences>()
+                    .into_iter()
+                    .flat_map(|p| &p.agent_presets)
+                {
+                    let Ok((kind, _)) = preset.paseo_settings() else {
+                        continue;
+                    };
+                    let description = preset.summary();
+                    if !query.is_empty()
+                        && !format!("{} {description} {}", preset.name, preset.notes)
+                            .to_lowercase()
+                            .contains(&query)
+                    {
+                        continue;
                     }
-                    let name = self.saved_model_name(kind, choice.model.as_deref());
-                    let name: SharedString = format!("{} · {}", kind.label(), name).into();
-                    if !query.is_empty() && !name.to_lowercase().contains(&query) {
-                        return None;
-                    }
-                    Some(ModelEntry {
+                    entries.push(ModelEntry {
+                        preset: Some(preset.id.clone()),
                         kind,
-                        id: choice.model.clone(),
-                        name,
-                        enabled: self.enabled(kind),
-                    })
-                })
-                .collect();
+                        id: Some(format!("{}:{}", kind.id(), preset.model)),
+                        name: preset.name.clone().into(),
+                        enabled: allowed && self.enabled(kind),
+                        description,
+                    });
+                }
+            }
+            entries.extend(
+                cx.try_global::<crate::settings::Preferences>()
+                    .into_iter()
+                    .flat_map(|prefs| &prefs.favorite_models)
+                    .filter_map(|choice| {
+                        let kind = Kind::parse(&choice.provider)?;
+                        if kind != self.provider && self.hidden.iter().any(|id| id == kind.id()) {
+                            return None;
+                        }
+                        let name: SharedString = format!(
+                            "{} · {}",
+                            kind.label(),
+                            self.saved_model_name(kind, choice.model.as_deref(), cx)
+                        )
+                        .into();
+                        if !query.is_empty() && !name.to_lowercase().contains(&query) {
+                            return None;
+                        }
+                        Some(ModelEntry {
+                            preset: None,
+                            kind,
+                            id: choice.model.clone(),
+                            name,
+                            enabled: self.enabled(kind),
+                            description: String::new(),
+                        })
+                    }),
+            );
+            return entries;
         };
         let enabled = self.enabled(kind);
+        if let Some(agent) = cx
+            .try_global::<crate::settings::Preferences>()
+            .and_then(|prefs| prefs.configured_models.get(kind.id()))
+            && self.remote_project.is_none()
+        {
+            let mut entries: Vec<_> = agent
+                .models
+                .iter()
+                .map(|model| ModelEntry {
+                    preset: None,
+                    kind,
+                    id: Some(model.id.clone()),
+                    name: model.label.clone().into(),
+                    description: model.description.clone(),
+                    enabled,
+                })
+                .collect();
+            if kind == self.provider && !entries.iter().any(|entry| entry.id == self.current) {
+                entries.push(ModelEntry {
+                    preset: None,
+                    kind,
+                    id: self.current.clone(),
+                    name: self.saved_model_name(kind, self.current.as_deref(), cx),
+                    description: "Current model (outside configured catalog)".into(),
+                    enabled,
+                });
+            }
+            let query = self.query(cx);
+            return entries
+                .into_iter()
+                .filter(|entry| {
+                    query.is_empty()
+                        || format!(
+                            "{} {} {} {}",
+                            entry.name,
+                            entry.description,
+                            entry.id.as_deref().unwrap_or(""),
+                            agent.label
+                        )
+                        .to_lowercase()
+                        .contains(&query)
+                })
+                .collect();
+        }
         let mut entries = vec![ModelEntry {
+            preset: None,
             kind,
             id: None,
             name: "Default".into(),
             enabled,
+            description: String::new(),
         }];
         if let Some(prefs) = cx.try_global::<crate::settings::Preferences>() {
             for choice in &prefs.recent_models {
@@ -553,10 +644,12 @@ impl ModelList {
                     && !entries.iter().any(|entry| entry.id == choice.model)
                 {
                     entries.push(ModelEntry {
+                        preset: None,
                         kind,
                         id: choice.model.clone(),
-                        name: self.saved_model_name(kind, choice.model.as_deref()),
+                        name: self.saved_model_name(kind, choice.model.as_deref(), cx),
                         enabled,
+                        description: String::new(),
                     });
                 }
             }
@@ -571,10 +664,12 @@ impl ModelList {
                             .any(|entry| entry.id.as_deref() == Some(model.id.as_str()))
                 })
                 .map(|model| ModelEntry {
+                    preset: None,
                     kind,
                     id: Some(model.id.clone()),
                     name: model_display_name(kind, &model.id, &model.name),
                     enabled,
+                    description: String::new(),
                 })
                 .collect();
             entries.extend(additional);
@@ -584,10 +679,12 @@ impl ModelList {
                 .into_iter()
                 .filter(|(id, _)| !entries.iter().any(|entry| entry.id.as_deref() == Some(*id)))
                 .map(|(id, name)| ModelEntry {
+                    preset: None,
                     kind,
                     id: Some(id.into()),
                     name: name.into(),
                     enabled,
+                    description: String::new(),
                 })
                 .collect();
             entries.extend(additional);
@@ -598,10 +695,12 @@ impl ModelList {
             && !entries.iter().any(|e| e.id.as_ref() == Some(id))
         {
             entries.push(ModelEntry {
+                preset: None,
                 kind,
                 id: Some(id.clone()),
                 name: model_name(kind, Some(id)),
                 enabled,
+                description: String::new(),
             });
         }
         let query = self.query(cx);
@@ -624,7 +723,13 @@ impl ModelList {
                     .as_ref()
                     .is_some_and(|providers| providers.contains(&kind)))
     }
-    fn saved_model_name(&self, kind: Kind, id: Option<&str>) -> SharedString {
+    fn saved_model_name(&self, kind: Kind, id: Option<&str>, cx: &gpui::App) -> SharedString {
+        if let Some(name) = cx
+            .try_global::<crate::settings::Preferences>()
+            .and_then(|prefs| prefs.configured_model_name(kind.id(), id))
+        {
+            return name.to_owned().into();
+        }
         self.catalogs
             .iter()
             .find(|(provider, _)| *provider == kind)
@@ -632,10 +737,18 @@ impl ModelList {
             .map(|model| model_display_name(kind, &model.id, &model.name))
             .unwrap_or_else(|| model_name(kind, id))
     }
+    pub(crate) fn preferred_height(&self, cx: &gpui::App) -> f32 {
+        if self.presets.is_none() {
+            return 442.;
+        }
+        (64. + self.entries(cx).len() as f32 * 48.).clamp(112., 320.)
+    }
     fn current_index(&self, cx: &gpui::App) -> usize {
         self.entries(cx)
             .iter()
-            .position(|entry| entry.kind == self.provider && entry.id == self.current)
+            .position(|entry| {
+                entry.preset.is_none() && entry.kind == self.provider && entry.id == self.current
+            })
             .unwrap_or(0)
     }
     fn select_tab(&mut self, tab: ModelTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -679,9 +792,31 @@ impl ModelList {
         if let Some(entry) = self.entries(cx).into_iter().nth(ix)
             && entry.enabled
         {
-            remember_model(entry.kind, entry.id.clone(), cx);
-            cx.emit(ModelPicked(entry.kind, entry.id));
+            if let Some(id) = entry.preset {
+                cx.emit(PresetPicked(id));
+            } else {
+                remember_model(entry.kind, entry.id.clone(), cx);
+                cx.emit(ModelPicked(entry.kind, entry.id));
+            }
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_pick_preset(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.tab = ModelTab::Favorites;
+        self.remote_providers = Some(Kind::ALL.to_vec());
+        let ix = self
+            .entries(cx)
+            .iter()
+            .position(|entry| entry.preset.as_deref() == Some(id))
+            .expect("saved preset in Favorites");
+        self.pick(ix, cx);
+    }
+    #[cfg(test)]
+    pub(crate) fn show_favorites(&mut self, cx: &mut Context<Self>) {
+        self.remote_providers = Some(Kind::ALL.to_vec());
+        self.tab = ModelTab::Favorites;
+        self.highlighted = self.current_index(cx);
+        cx.notify();
     }
     fn tab(&self, tab: ModelTab, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.tab == tab;
@@ -695,13 +830,16 @@ impl ModelList {
                 } else {
                     kind.id()
                 },
-                kind.label().into(),
+                cx.try_global::<crate::settings::Preferences>()
+                    .and_then(|prefs| prefs.configured_models.get(kind.id()))
+                    .map(|agent| agent.label.clone().into())
+                    .unwrap_or_else(|| kind.label().into()),
             ),
         };
         div()
             .id(id)
             .role(Role::Tab)
-            .aria_label(label)
+            .aria_label(crate::i18n::t(&label))
             .aria_selected(selected)
             .group(id)
             .cursor_pointer()
@@ -731,7 +869,7 @@ impl ModelList {
     }
 }
 impl Render for ModelList {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.quick {
             return self.render_quick(cx);
         }
@@ -757,11 +895,12 @@ impl Render for ModelList {
             .enumerate()
             .map(|(ix, entry)| {
                 let highlighted = self.highlighted == ix && entry.enabled;
-                let current = entry.kind == self.provider && entry.id == self.current;
+                let current = entry.preset.is_none() && entry.kind == self.provider && entry.id == self.current;
                 div()
                     .id(("model-option", ix))
                     .role(Role::ListBoxOption)
                     .aria_label(entry.name.clone())
+                    .aria_description(entry.description.clone())
                     .aria_selected(current)
                     .when(!entry.enabled, |d| {
                         d.aria_description(if self.missing.contains(&entry.kind) {
@@ -772,7 +911,8 @@ impl Render for ModelList {
                     })
                     .cursor_pointer()
                     .flex_shrink_0()
-                    .h(px(32.))
+                    .min_h(px(32.))
+                    .py_1()
                     .px_1()
                     .rounded(px(8.))
                     .flex()
@@ -788,8 +928,11 @@ impl Render for ModelList {
                             .flex_1()
                             .min_w_0()
                             .px(px(6.))
-                            .truncate()
-                            .child(entry.name),
+                            .flex().flex_col()
+                            .child(div().truncate().child(entry.name))
+                            .when(!entry.description.is_empty(), |d| d.child(div()
+                                .text_size(px(10.)).text_color(content(0.5))
+                                .child(entry.description))),
                     )
                     .when(current, |d| {
                         d.child(
@@ -817,6 +960,11 @@ impl Render for ModelList {
             .role(Role::Dialog)
             .aria_label("Models")
             .size_full()
+            .when(self.presets.is_some(), |d| {
+                d.h(px(self.preferred_height(cx).min(
+                    (window.viewport_size().height.as_f32() - 80.).max(80.),
+                )))
+            })
             .min_h_0()
             .flex()
             .capture_action(cx.listener(|this, _: &input::Up, _, cx| {
@@ -916,7 +1064,7 @@ impl Render for ModelList {
                                         .py_2()
                                         .text_size(px(12.))
                                         .text_color(content(0.5))
-                                        .child("Loading models…"),
+                                        .child(crate::i18n::t("Loading models…")),
                                 )
                             })
                             .when_some(error, |d, error| {
@@ -933,7 +1081,7 @@ impl Render for ModelList {
                                                 .role(Role::Button)
                                                 .aria_label("Retry model discovery")
                                                 .py_2()
-                                                .child("Retry")
+                                                .child(crate::i18n::t("Retry"))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     if let Some(kind) = kind {
                                                         this.discover(kind, cx);
@@ -1103,7 +1251,7 @@ impl ModelList {
                         div()
                             .id(id.clone())
                             .role(Role::Tab)
-                            .aria_label(label)
+                            .aria_label(crate::i18n::t(label))
                             .aria_selected(selected)
                             .group(id.clone())
                             .cursor_pointer()
@@ -1202,6 +1350,8 @@ pub(crate) struct ProjectPicker {
     current: String,
     active: usize,
     allow_remote: bool,
+    available: Option<Vec<String>>,
+    adding: bool,
     search: Entity<input::Input>,
     _changed: Subscription,
 }
@@ -1226,12 +1376,18 @@ impl ProjectPicker {
             current: current.into(),
             active: 0,
             allow_remote: false,
+            available: None,
+            adding: false,
             search,
             _changed: changed,
         }
     }
     pub(crate) fn search_focus(&self, cx: &gpui::App) -> FocusHandle {
         self.search.focus_handle(cx)
+    }
+    pub(crate) fn available_projects(mut self, paths: Option<Vec<String>>) -> Self {
+        self.available = paths;
+        self
     }
     pub(crate) fn allow_remote(mut self) -> Self {
         self.allow_remote = true;
@@ -1276,8 +1432,14 @@ impl ProjectPicker {
     }
     fn matches(&self, cx: &gpui::App) -> Vec<String> {
         let query = self.search.read(cx).content.to_lowercase();
-        self.projects
+        let projects = if self.adding {
+            self.available.as_ref().unwrap_or(&self.projects)
+        } else {
+            &self.projects
+        };
+        projects
             .iter()
+            .filter(|path| !self.adding || !self.projects.contains(path))
             .filter(|path| {
                 query.is_empty()
                     || format!("{}\n{}", self.label(path), path)
@@ -1389,7 +1551,7 @@ impl Render for ProjectPicker {
                             .flex_shrink_0()
                             .text_size(px(11.))
                             .text_color(content(0.4))
-                            .child("Mono"),
+                            .child(crate::i18n::t("Mono")),
                     )
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
@@ -1437,7 +1599,10 @@ impl Render for ProjectPicker {
                                 .text_color(content(1.))
                                 .into_any_element()
                         } else {
-                            if path.starts_with("remote://") {
+                            if crate::project_settings::uses_remote_icon(
+                                &path,
+                                crate::paseo_host::active() || self.available.is_some(),
+                            ) {
                                 icon("globe", 14.)
                                     .text_color(content(0.6))
                                     .into_any_element()
@@ -1564,7 +1729,11 @@ impl Render for ProjectPicker {
                         div()
                             .id("project-new")
                             .role(Role::Button)
-                            .aria_label("New project")
+                            .aria_label(if self.available.is_some() {
+                                "Add project…"
+                            } else {
+                                "New project"
+                            })
                             .group("project-new")
                             .cursor_pointer()
                             .h(px(36.))
@@ -1581,10 +1750,29 @@ impl Render for ProjectPicker {
                                     .text_color(content(0.75))
                                     .group_hover("project-new", |s| s.text_color(content(1.))),
                             )
-                            .child("New project")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ProjectPicked::New))),
+                            .child(if self.available.is_some() {
+                                if self.adding {
+                                    "Back to projects"
+                                } else {
+                                    "Add project…"
+                                }
+                            } else {
+                                "New project"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.available.is_some() {
+                                    this.adding = !this.adding;
+                                    this.active = 0;
+                                    this.search.update(cx, |s, cx| {
+                                        s.take(cx);
+                                    });
+                                    cx.notify();
+                                } else {
+                                    cx.emit(ProjectPicked::New);
+                                }
+                            })),
                     )
-                    .when(self.allow_remote, |d| {
+                    .when(self.allow_remote && self.available.is_none(), |d| {
                         d.child(
                             div()
                                 .id("project-remote")
@@ -1601,12 +1789,83 @@ impl Render for ProjectPicker {
                                 .text_color(content(0.75))
                                 .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
                                 .child(icon("globe", 16.).text_color(content(0.75)))
-                                .child("Open folder on a machine…")
+                                .child(crate::i18n::t("Open folder on a machine…"))
                                 .on_click(
                                     cx.listener(|_, _, _, cx| cx.emit(ProjectPicked::Remote)),
                                 ),
                         )
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod configured_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn paseo_favorite_height_hugs_rows_without_changing_ordinary_picker(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences::default());
+            let list = cx.new(|cx| {
+                ModelList::new_for(Kind::Hermes, None, "/synthetic", Default::default(), cx)
+            });
+            assert_eq!(list.read(cx).preferred_height(cx), 442.);
+            list.update(cx, |list, cx| {
+                list.presets = Some(true);
+                list.tab = ModelTab::Favorites;
+                assert_eq!(list.preferred_height(cx), 112.);
+            });
+        });
+    }
+    #[gpui::test]
+    fn project_add_picker_keeps_hidden_projects_out_of_default_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let picker = cx.new(|cx| {
+                ProjectPicker::new(&["daily".into(), "bots".into()], "daily", cx)
+                    .available_projects(Some(vec!["daily".into(), "bots".into(), "fixture".into()]))
+            });
+            assert_eq!(picker.read(cx).matches(cx), vec!["daily", "bots"]);
+            picker.update(cx, |picker, _| picker.adding = true);
+            assert_eq!(picker.read(cx).matches(cx), vec!["fixture"]);
+        });
+    }
+    #[gpui::test]
+    fn curated_picker_keeps_exact_order_labels_descriptions_and_off_list_current(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(crate::settings::presets::tests::source_preferences()));
+        let list = cx.new(|cx| {
+            ModelList::new_for(
+                Kind::Hermes,
+                Some("old:route".into()),
+                "/work",
+                Default::default(),
+                cx,
+            )
+        });
+        list.update(cx, |list, cx| {
+            let prefs = cx.global::<crate::settings::Preferences>();
+            let expected = &prefs.configured_models["hermes"].models;
+            let entries = list.entries(cx);
+            assert_eq!(entries.len(), expected.len() + 1);
+            for (entry, expected) in entries.iter().zip(expected) {
+                assert_eq!(entry.id.as_deref(), Some(expected.id.as_str()));
+                assert_eq!(entry.name.as_ref(), expected.label);
+                assert_eq!(entry.description, expected.description);
+            }
+            assert_eq!(entries.last().unwrap().id.as_deref(), Some("old:route"));
+            assert!(entries.last().unwrap().enabled);
+            list.switch_allowed = false;
+            assert!(!list.enabled(Kind::Codex));
+            list.pick(0, cx);
+            assert_eq!(
+                cx.global::<crate::settings::Preferences>().recent_models[0]
+                    .model
+                    .as_deref(),
+                Some("openai-codex:gpt-6.1-sol")
+            );
+        });
     }
 }

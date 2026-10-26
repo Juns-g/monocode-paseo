@@ -454,6 +454,7 @@ fn supported_remote_method(method: &str) -> bool {
             | "projects.browse"
             | "projects.open"
             | "models.list"
+            | "paseo.workspaces"
             | "sessions.list"
             | "sessions.update"
             | "sessions.delete"

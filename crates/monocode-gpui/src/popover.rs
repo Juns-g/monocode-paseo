@@ -1113,6 +1113,32 @@ impl Menu {
         self.sub_region.set(None);
         cx.notify();
     }
+    #[cfg(test)]
+    pub(crate) fn test_flyout(&self, id: &str) -> gpui::AnyView {
+        self.items
+            .iter()
+            .find_map(|item| match item {
+                MenuItem::Action(a) if a.id.as_ref() == id => {
+                    a.flyout.as_ref().map(|f| f.view.clone())
+                }
+                _ => None,
+            })
+            .expect("fixture flyout")
+    }
+    #[cfg(test)]
+    pub(crate) fn test_pick_action(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ix = self
+            .items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Action(a) if a.id.as_ref() == id))
+            .expect("fixture menu action");
+        self.pick(ix, window, cx);
+    }
     fn pick(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(action) = self.action(ix) else {
             return;
@@ -1298,7 +1324,13 @@ impl Menu {
                 MenuStyle::Git | MenuStyle::Filter => {
                     d.items_center().gap_2().rounded(px(8.)).h(px(28.))
                 }
-                MenuStyle::Settings => d.items_center().gap_2().rounded(px(8.)).h(px(36.)),
+                MenuStyle::Settings => d.items_center().gap_2().rounded(px(8.)).map(|d| {
+                    if action.description.is_some() {
+                        d.min_h(px(36.)).py_2()
+                    } else {
+                        d.h(px(36.))
+                    }
+                }),
                 MenuStyle::Recent => d.items_center().gap_2().rounded(px(8.)).h(px(40.)),
                 MenuStyle::Composer | MenuStyle::Access => {
                     d.items_start().gap(px(10.)).rounded(px(8.)).py_2()
@@ -1524,7 +1556,7 @@ impl Render for Menu {
                     .line_height(px(15.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(content(0.4))
-                    .child(text.to_uppercase())
+                    .child(crate::i18n::t(text).to_uppercase())
                     .into_any(),
                 MenuItem::Note(text) => div()
                     .flex_shrink_0()
@@ -1533,7 +1565,7 @@ impl Render for Menu {
                     .text_size(px(11.))
                     .line_height(px(16.))
                     .text_color(content(0.5))
-                    .child(text.clone())
+                    .child(crate::i18n::t(text))
                     .into_any(),
                 MenuItem::Separator => separator(ix, style),
                 MenuItem::Action(action) => {

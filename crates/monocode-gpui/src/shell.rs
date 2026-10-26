@@ -24,6 +24,7 @@ mod project_settings;
 mod quick_composer;
 mod quick_open;
 mod rails;
+pub(crate) use rails::step as sidebar_step;
 mod remote_projects;
 mod remote_sessions;
 mod search;
@@ -571,6 +572,8 @@ pub(crate) struct Shell {
     remote: Arc<monocode_core::remote::Connections>,
     remote_project_picker: Option<remote_projects::Open>,
     remote_refreshing: bool,
+    remote_revisions: HashMap<String, String>,
+    remote_details: HashMap<i64, serde_json::Value>,
     remote_marks: HashMap<i64, (bool, bool)>,
     _remote_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
@@ -796,7 +799,11 @@ impl Shell {
             }
         });
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
-        let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
+        let mut workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
+        if crate::paseo_host::active() {
+            crate::paseo_host::restrict_workspace(&mut workspace);
+        }
+        crate::i18n::configure(&workspace.preferences);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
         let latest_state = Arc::new(Mutex::new(serde_json::to_string(&workspace).unwrap()));
         let quit_state = latest_state.clone();
@@ -925,6 +932,8 @@ impl Shell {
             remote,
             remote_project_picker: None,
             remote_refreshing: false,
+            remote_revisions: HashMap::new(),
+            remote_details: Default::default(),
             remote_marks: HashMap::new(),
             _remote_clock: remote_clock,
             sessions: HashMap::new(),
@@ -1073,76 +1082,81 @@ impl Shell {
         }
         this.observe_accounts(cx);
         this.observe_picker_preferences(cx);
-        let mono_owner = cx.weak_entity();
-        let mono_active =
-            this.workspace
+        if !crate::paseo_host::active() {
+            let mono_owner = cx.weak_entity();
+            let mono_active = this
+                .workspace
                 .scope_focus
                 .get(&this.tab_scope())
                 .and_then(|tab| match tab {
                     TitleTab::Mono { id, .. } => Some(id.clone()),
                     _ => None,
                 });
-        let monos = cx.new(|cx| {
-            crate::monos::Monos::new(
-                this.store.clone(),
-                mono_owner,
-                this.workspace.preferences.clone(),
-                mono_active,
-                this.notification_state.region.clone(),
-                cx,
-            )
-        });
-        this.observations.push(
-            cx.subscribe(&monos, |this, _, _: &crate::monos::Changed, cx| {
-                this.sync_mono_search(cx);
-                this.update_usage_provider(cx);
-                this.invalidate_chrome(cx);
-                cx.notify();
-            }),
-        );
-        this.observations.push(cx.subscribe(
-            &monos,
-            |this, _, opened: &crate::monos::TabOpened, cx| {
-                this.mono_opened(opened.0.clone(), cx);
-            },
-        ));
-        this.observations.push(cx.subscribe(
-            &monos,
-            |_, _, request: &crate::monos::ShowDetails, cx| {
-                let id = request.0.clone();
-                cx.spawn(async move |this, cx| {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        if this
-                            .monos
-                            .as_ref()
-                            .is_some_and(|m| m.read(cx).active.as_ref() == Some(&id))
-                        {
-                            this.set_right_panel_open(true, window, cx);
-                        }
-                    });
-                })
-                .detach();
-            },
-        ));
-        let mut mono_chrome = monos.read(cx).overview_chrome();
-        let mut mono_error = monos.read(cx).error.clone();
-        this.observations
-            .push(cx.observe(&monos, move |this, monos, cx| {
-                let chrome = monos.read(cx).overview_chrome();
-                if chrome != mono_chrome {
-                    mono_chrome = chrome;
+            let monos = cx.new(|cx| {
+                crate::monos::Monos::new(
+                    this.store.clone(),
+                    mono_owner,
+                    this.workspace.preferences.clone(),
+                    mono_active,
+                    this.notification_state.region.clone(),
+                    cx,
+                )
+            });
+            this.observations.push(cx.subscribe(
+                &monos,
+                |this, _, _: &crate::monos::Changed, cx| {
+                    this.sync_mono_search(cx);
+                    this.update_usage_provider(cx);
                     this.invalidate_chrome(cx);
                     cx.notify();
-                }
-                let error = &monos.read(cx).error;
-                if *error != mono_error {
-                    mono_error = error.clone();
-                    cx.notify();
-                }
-            }));
-        this.monos = Some(monos);
+                },
+            ));
+            this.observations.push(cx.subscribe(
+                &monos,
+                |this, _, opened: &crate::monos::TabOpened, cx| {
+                    this.mono_opened(opened.0.clone(), cx);
+                },
+            ));
+            this.observations.push(cx.subscribe(
+                &monos,
+                |_, _, request: &crate::monos::ShowDetails, cx| {
+                    let id = request.0.clone();
+                    cx.spawn(async move |this, cx| {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if this
+                                .monos
+                                .as_ref()
+                                .is_some_and(|m| m.read(cx).active.as_ref() == Some(&id))
+                            {
+                                this.set_right_panel_open(true, window, cx);
+                            }
+                        });
+                    })
+                    .detach();
+                },
+            ));
+            let mut mono_chrome = monos.read(cx).overview_chrome();
+            let mut mono_error = monos.read(cx).error.clone();
+            this.observations
+                .push(cx.observe(&monos, move |this, monos, cx| {
+                    let chrome = monos.read(cx).overview_chrome();
+                    if chrome != mono_chrome {
+                        mono_chrome = chrome;
+                        this.invalidate_chrome(cx);
+                        cx.notify();
+                    }
+                    let error = &monos.read(cx).error;
+                    if *error != mono_error {
+                        mono_error = error.clone();
+                        cx.notify();
+                    }
+                }));
+            this.monos = Some(monos);
+        }
         this.bind_notices(cx);
-        this.init_app_bridge(cx);
+        if !crate::paseo_host::active() {
+            this.init_app_bridge(cx);
+        }
         for summary in summaries {
             if this
                 .monos
@@ -2799,6 +2813,29 @@ impl Shell {
             })
             .unwrap_or_else(|| self.working_copy().to_owned())
     }
+    fn allowed_terminal_cwd(&self, cx: &App) -> Result<String, String> {
+        let cwd = self.terminal_cwd(cx);
+        if !self.workspace.project.starts_with("remote://") {
+            return Ok(cwd);
+        }
+        let prefs = &self.workspace.preferences;
+        crate::paseo_host::terminal_path(
+            crate::paseo_host::project_ui(prefs),
+            prefs
+                .extra
+                .get("paseo_environment")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            &self.workspace.project,
+            prefs
+                .extra
+                .get("paseo_host_endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            &cwd,
+        )
+        .map_err(crate::i18n::t)
+    }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
         let terminal = cx.new(|cx| Terminal::new(cwd, cx));
         self.observations
@@ -2807,7 +2844,7 @@ impl Shell {
     }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
     fn ensure_terminals(&mut self, project: &str, cx: &mut Context<Self>) {
-        if project.starts_with("remote://") {
+        if project.starts_with("remote://") && self.allowed_terminal_cwd(cx).is_err() {
             return;
         }
         let Some(dock) = self.workspace.docks.get(project) else {
@@ -2816,6 +2853,29 @@ impl Shell {
         let wanted = dock.terminals.clone();
         let have = self.terminals.get(project).map_or(0, Vec::len);
         for cwd in wanted.into_iter().skip(have) {
+            let cwd = if project.starts_with("remote://") {
+                let prefs = &self.workspace.preferences;
+                let Ok(cwd) = crate::paseo_host::terminal_path(
+                    crate::paseo_host::project_ui(prefs),
+                    prefs
+                        .extra
+                        .get("paseo_environment")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    project,
+                    prefs
+                        .extra
+                        .get("paseo_host_endpoint")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    &cwd,
+                ) else {
+                    continue;
+                };
+                cwd
+            } else {
+                cwd
+            };
             let terminal = self.spawn_terminal(cwd, cx);
             self.terminals
                 .entry(project.to_owned())
@@ -2860,8 +2920,8 @@ impl Shell {
     /// Terminal: New (cmd-`): another terminal in the project's dock, which
     /// opens if it was hidden.
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.project.starts_with("remote://") {
-            self.error = Some("Terminals are not available on remote projects.".into());
+        if let Err(error) = self.allowed_terminal_cwd(cx) {
+            self.error = Some(error);
             cx.notify();
             return;
         }
@@ -2869,7 +2929,7 @@ impl Shell {
             return;
         }
         let project = self.workspace.project.clone();
-        let cwd = self.terminal_cwd(cx);
+        let cwd = self.allowed_terminal_cwd(cx).expect("terminal guard");
         let was_open = self
             .workspace
             .docks
@@ -2901,8 +2961,8 @@ impl Shell {
     }
     /// Terminal: Toggle (cmd-j).
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.project.starts_with("remote://") {
-            self.error = Some("Terminals are not available on remote projects.".into());
+        if let Err(error) = self.allowed_terminal_cwd(cx) {
+            self.error = Some(error);
             cx.notify();
             return;
         }
@@ -4104,7 +4164,38 @@ impl Shell {
             self.create_session(self.default_kind(), true, cx);
         }
     }
+    fn add_paseo_project(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !crate::paseo_host::project_ui(&self.workspace.preferences)
+            || self.workspace.projects.iter().any(|p| p == path)
+        {
+            return;
+        }
+        let mut config = crate::paseo_host::ProjectSelection::read(
+            self.workspace
+                .preferences
+                .extra
+                .get(crate::paseo_host::PROJECT_SELECTION),
+        );
+        if !config.added.iter().any(|p| p == path) {
+            config.added.push(path.into());
+        }
+        self.workspace.preferences.extra.insert(
+            crate::paseo_host::PROJECT_SELECTION.into(),
+            serde_json::to_value(config).expect("project selection"),
+        );
+        self.workspace.projects.push(path.into());
+        self.workspace.preferences.extra.insert(
+            "paseo_visible_projects".into(),
+            serde_json::json!(self.workspace.projects),
+        );
+        self.persist(cx);
+    }
     fn open_project(&mut self, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            self.error = Some("请从侧栏选择现有 Paseo 项目".into());
+            cx.notify();
+            return;
+        }
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -4130,6 +4221,9 @@ impl Shell {
             }
         })
         .detach();
+    }
+    fn new_chat(&mut self, cx: &mut Context<Self>) {
+        self.create(self.default_kind(), cx);
     }
     fn create(&mut self, kind: Kind, cx: &mut Context<Self>) {
         self.create_session(kind, false, cx);
@@ -4166,8 +4260,16 @@ impl Shell {
         let account = crate::accounts::get(cx)
             .map(|center| center.read(cx).selected(kind, &cwd))
             .unwrap_or_default();
-        let access = crate::conversation::default_access(cx);
+        let access = if crate::paseo_host::project_ui(&self.workspace.preferences) {
+            monocode_core::agent::AccessMode::FullAccess
+        } else {
+            crate::conversation::default_access(cx)
+        };
         let effort = crate::conversation::preferred_effort(kind.id(), cx);
+        let preset = self
+            .workspace
+            .preferences
+            .new_chat_preset(kind.id(), model.as_deref());
         let work = cx.background_executor().spawn({
             let cwd = cwd.clone();
             let worktree_cwd = focus.as_ref().map(|f| f.path.clone());
@@ -4192,6 +4294,9 @@ impl Shell {
                 }
                 settings.account = account;
                 settings.worktree_cwd = worktree_cwd;
+                if let Some(preset) = preset {
+                    preset.apply(&mut settings)?;
+                }
                 if settings.model.is_some()
                     || settings.effort.is_some()
                     || !settings.model_settings.is_empty()
@@ -4984,21 +5089,21 @@ impl Shell {
                 let count = tabs.len();
                 let closable = tab.session().is_none_or(|id| self.tab_can_close(id, cx));
                 let mut items = vec![
-                    MenuAction::new("close", "Close Tab")
+                    MenuAction::new("close", crate::i18n::t("Close Tab"))
                         .shortcut(format!("{MOD}W"))
                         .disabled(!closable)
                         .into(),
                     MenuItem::Separator,
-                    MenuAction::new("others", "Close Other Tabs")
+                    MenuAction::new("others", crate::i18n::t("Close Other Tabs"))
                         .disabled(count < 2)
                         .into(),
-                    MenuAction::new("right", "Close Tabs to the Right")
+                    MenuAction::new("right", crate::i18n::t("Close Tabs to the Right"))
                         .disabled(ix + 1 >= count)
                         .into(),
-                    MenuAction::new("left", "Close Tabs to the Left")
+                    MenuAction::new("left", crate::i18n::t("Close Tabs to the Left"))
                         .disabled(ix == 0)
                         .into(),
-                    MenuAction::new("all", "Close All Tabs")
+                    MenuAction::new("all", crate::i18n::t("Close All Tabs"))
                         .shortcut(if cfg!(target_os = "macos") {
                             "⌘⇧W"
                         } else {
@@ -5024,7 +5129,9 @@ impl Shell {
                             },
                         )
                         .into(),
-                        MenuAction::new("delete", "Delete").danger().into(),
+                        MenuAction::new("delete", crate::i18n::t("Delete"))
+                            .danger()
+                            .into(),
                     ]);
                 }
                 (
@@ -5096,12 +5203,15 @@ impl Shell {
             MenuTarget::ProjectRailAdd => (
                 "Open project".into(),
                 vec![
-                    MenuAction::new("open-project", "Open folder…")
+                    MenuAction::new("open-project", crate::i18n::t("Open folder…"))
                         .icon("folder-add")
                         .into(),
-                    MenuAction::new("open-remote-project", "Open folder on a machine…")
-                        .icon("globe")
-                        .into(),
+                    MenuAction::new(
+                        "open-remote-project",
+                        crate::i18n::t("Open folder on a machine…"),
+                    )
+                    .icon("globe")
+                    .into(),
                 ],
                 230.,
                 MenuStyle::Explorer,
@@ -5171,6 +5281,16 @@ impl Shell {
                 let picker = cx.new(|cx| {
                     ProjectPicker::new(&self.workspace.projects, &self.workspace.project, cx)
                         .appearance(self.workspace.project_appearance.clone())
+                        .available_projects(
+                            crate::paseo_host::project_ui(&self.workspace.preferences).then(|| {
+                                self.workspace
+                                    .preferences
+                                    .extra
+                                    .get("paseo_all_projects")
+                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                    .unwrap_or_default()
+                            }),
+                        )
                         .allow_remote()
                 });
                 events.push(cx.subscribe_in(
@@ -5180,6 +5300,7 @@ impl Shell {
                         this.close_menu(cx);
                         match picked {
                             ProjectPicked::Project(path) if *path != this.workspace.project => {
+                                this.add_paseo_project(path, cx);
                                 this.select_project(path.clone(), window, cx)
                             }
                             ProjectPicked::Project(_) | ProjectPicked::Mono(_) => {}
@@ -5204,9 +5325,10 @@ impl Shell {
                             &self.workspace.project,
                         ))
                     });
-                let worktree = MenuAction::new("switch-worktree", "Switch worktree")
-                    .icon("folder-tree")
-                    .flyout(self.worktree_flyout(events, window, cx));
+                let worktree =
+                    MenuAction::new("switch-worktree", crate::i18n::t("Switch worktree"))
+                        .icon("folder-tree")
+                        .flyout(self.worktree_flyout(events, window, cx));
                 (
                     format!("{} menu", self.project_label(&self.workspace.project)).into(),
                     vec![
@@ -5216,7 +5338,7 @@ impl Shell {
                         }
                         .into(),
                         MenuItem::Separator,
-                        MenuAction::new("switch-project", "Switch project")
+                        MenuAction::new("switch-project", crate::i18n::t("Switch project"))
                             .icon("folder")
                             .flyout(Flyout {
                                 view: picker.into(),
@@ -5228,14 +5350,17 @@ impl Shell {
                                 surface: None,
                             })
                             .into(),
-                        MenuAction::new("project-settings", "Project settings")
+                        MenuAction::new("project-settings", crate::i18n::t("Project settings"))
                             .icon("sliders")
                             .flyout(self.project_settings_flyout(events, window, cx))
                             .into(),
-                        MenuAction::new("open-remote-project", "Open folder on a machine…")
-                            .icon("globe")
-                            .into(),
-                        MenuAction::new("settings", "Settings")
+                        MenuAction::new(
+                            "open-remote-project",
+                            crate::i18n::t("Open folder on a machine…"),
+                        )
+                        .icon("globe")
+                        .into(),
+                        MenuAction::new("settings", crate::i18n::t("Settings"))
                             .icon("settings")
                             .shortcut(format!("{MOD},"))
                             .into(),
@@ -5251,7 +5376,7 @@ impl Shell {
                     vec![
                         MenuItem::Custom(controls.clone().into(), controls.read(cx).focus(cx)),
                         MenuItem::Separator,
-                        MenuAction::new("delete-project-group", "Delete group")
+                        MenuAction::new("delete-project-group", crate::i18n::t("Delete group"))
                             .icon("trash")
                             .description("Projects will become ungrouped")
                             .danger()
@@ -5267,14 +5392,20 @@ impl Shell {
                 let mut items: Vec<MenuItem> = vec![
                     MenuItem::Custom(controls.clone().into(), controls.read(cx).focus(cx)),
                     MenuItem::Separator,
-                    MenuAction::new("background", "Background image")
+                    MenuAction::new("background", crate::i18n::t("Background image"))
                         .icon("image-add")
                         .into(),
                 ];
                 if *rail {
-                    let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
+                    let mut groups = vec![MenuAction::new(
+                        "project-group:new",
+                        crate::i18n::t("New group…"),
+                    )];
                     if self.workspace.project_rail_assignments.contains_key(path) {
-                        groups.push(MenuAction::new("project-group:", "No group"));
+                        groups.push(MenuAction::new(
+                            "project-group:",
+                            crate::i18n::t("No group"),
+                        ));
                     }
                     groups.extend(self.workspace.project_rail_groups.iter().map(|group| {
                         MenuAction::new(format!("project-group:{}", group.id), group.name.clone())
@@ -5285,7 +5416,7 @@ impl Shell {
                     }));
                     let pinned = self.workspace.project_rail_pinned.contains(path);
                     items.extend([
-                        MenuAction::new("project-group", "Move to group")
+                        MenuAction::new("project-group", crate::i18n::t("Move to group"))
                             .icon("folder-tree")
                             .submenu(groups)
                             .into(),
@@ -5309,8 +5440,10 @@ impl Shell {
                     MenuItem::Separator,
                     self.project_notification_menu(path).into(),
                     MenuItem::Separator,
-                    MenuAction::new("archive", "Archive").icon("archive").into(),
-                    MenuAction::new("delete", "Delete")
+                    MenuAction::new("archive", crate::i18n::t("Archive"))
+                        .icon("archive")
+                        .into(),
+                    MenuAction::new("delete", crate::i18n::t("Delete"))
                         .icon("trash")
                         .danger()
                         .into(),
@@ -5891,6 +6024,10 @@ impl Shell {
             // Sidebar.tsx's `px-2` inside its 1px card border.
             .px(px(if nested { 7. } else { 9. }))
             .rounded_md()
+            .flex()
+            .items_center()
+            .when(active, |d| d.bg(content(0.1)))
+            .hover(move |s| s.bg(content(if active { 0.1 } else { 0.05 })))
             // The border is dashed for a saved draft. It overlays the row, so
             // the hover anchor still spans the whole card.
             .when(draft, |d| {
@@ -5906,11 +6043,7 @@ impl Shell {
                         .border_color(content(if active { 0.3 } else { 0.25 })),
                 )
             })
-            .flex()
-            .items_center()
-            .when(active, |d| d.bg(content(0.1)))
             .when(started_in_view && !active, |d| d.bg(content(0.05)))
-            .hover(|s| s.bg(content(if active { 0.1 } else { 0.05 })))
             .when(
                 self.sidebar_drop == Some(session_groups::ListDrop::Session(id)),
                 |d| d.bg(content(0.14)),
@@ -6016,68 +6149,102 @@ impl Shell {
         if self.session_hover == Some(id) {
             return self.session_archive_button(id, session, cx);
         }
+        let details = self
+            .remote_details
+            .get(&id)
+            .unwrap_or(&serde_json::Value::Null);
+        let bucket = crate::paseo_host::StatusBucket::from_details(
+            details,
+            session.busy,
+            session.needs_approval(),
+        );
+        if crate::paseo_host::project_ui(&self.workspace.preferences)
+            && bucket == crate::paseo_host::StatusBucket::Failed
+        {
+            return div()
+                .flex()
+                .gap_1()
+                .text_size(px(11.))
+                .text_color(rgb(0xf87171))
+                .child(icon("circle-alert", 14.))
+                .child(crate::i18n::t("Failed"))
+                .into_any();
+        }
         div()
             .flex_shrink_0()
             .text_size(px(11.))
             .line_height(px(16.))
             .font_weight(FontWeight::NORMAL)
             .text_color(content(0.4))
-            .child(if session.needs_approval() {
-                div()
-                    .id(("session-approval", id as usize))
-                    .role(Role::Image)
-                    .aria_label("Needs approval")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(0xfbbf24))
-                    .child(icon("circle-alert", 14.))
-                    .when(detailed, |d| d.child("Needs approval"))
-                    .into_any()
-            } else if detailed && session.responding() {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(content(0.5))
-                    .children(self.session_marks.get(&id).cloned())
-                    .child("Working…")
-                    .into_any()
-            } else if detailed && self.unseen_finished.contains(&id) {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(0x2dd4bf))
-                    .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
-                    .child("Done")
-                    .into_any()
-            } else if session.has_saved_draft() {
-                div()
-                    .id(("session-draft", id as usize))
-                    .role(Role::Image)
-                    .aria_label("Draft")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(icon("circle-dashed-hi", 14.).text_color(content(0.4)))
-                    .when(detailed, |d| d.child("Draft"))
-                    .into_any()
-            } else if let Some(reminder) = self.reminders.iter().find(|r| r.session_id == id) {
-                div()
-                    .id(("session-reminder", id as usize))
-                    .aria_label(local_reminder_label(reminder.due_at))
-                    .text_color(rgb(0xf59e0b))
-                    .child(session_groups::reminder_caption(reminder.due_at))
-                    .into_any()
-            } else {
-                div()
-                    .child(monocode_core::time::relative(
-                        session.summary.updated_at,
-                        monocode_core::time::now_ms(),
-                    ))
-                    .into_any()
-            })
+            .child(
+                if session.needs_approval()
+                    || (crate::paseo_host::project_ui(&self.workspace.preferences)
+                        && bucket == crate::paseo_host::StatusBucket::NeedsInput)
+                {
+                    div()
+                        .id(("session-approval", id as usize))
+                        .role(Role::Image)
+                        .aria_label("Needs approval")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(rgb(0xfbbf24))
+                        .child(icon("circle-alert", 14.))
+                        .when(detailed, |d| d.child(crate::i18n::t("Needs approval")))
+                        .into_any()
+                } else if detailed
+                    && (session.responding()
+                        || (crate::paseo_host::project_ui(&self.workspace.preferences)
+                            && bucket == crate::paseo_host::StatusBucket::Working))
+                {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(content(0.5))
+                        .children(self.session_marks.get(&id).cloned())
+                        .child(crate::i18n::t("Working…"))
+                        .into_any()
+                } else if detailed
+                    && (self.unseen_finished.contains(&id)
+                        || (crate::paseo_host::project_ui(&self.workspace.preferences)
+                            && bucket == crate::paseo_host::StatusBucket::Attention))
+                {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(rgb(0x2dd4bf))
+                        .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
+                        .child(crate::i18n::t("Done"))
+                        .into_any()
+                } else if session.has_saved_draft() {
+                    div()
+                        .id(("session-draft", id as usize))
+                        .role(Role::Image)
+                        .aria_label("Draft")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(icon("circle-dashed-hi", 14.).text_color(content(0.4)))
+                        .when(detailed, |d| d.child(crate::i18n::t("Draft")))
+                        .into_any()
+                } else if let Some(reminder) = self.reminders.iter().find(|r| r.session_id == id) {
+                    div()
+                        .id(("session-reminder", id as usize))
+                        .aria_label(local_reminder_label(reminder.due_at))
+                        .text_color(rgb(0xf59e0b))
+                        .child(session_groups::reminder_caption(reminder.due_at))
+                        .into_any()
+                } else {
+                    div()
+                        .child(monocode_core::time::relative(
+                            session.summary.updated_at,
+                            monocode_core::time::now_ms(),
+                        ))
+                        .into_any()
+                },
+            )
             .into_any()
     }
 
@@ -6130,8 +6297,24 @@ impl Shell {
                         })
             })
             .collect();
+        let created = crate::paseo_host::project_ui(&self.workspace.preferences)
+            && self
+                .workspace
+                .preferences
+                .extra
+                .get("paseo_sort")
+                .and_then(|v| v.as_str())
+                == Some("created");
         ids.sort_by_key(|id| {
-            std::cmp::Reverse((self.session_metadata(*id, cx).summary.updated_at, *id))
+            let at = if created {
+                self.remote_details
+                    .get(id)
+                    .and_then(|v| v["createdAt"].as_u64())
+                    .unwrap_or(0)
+            } else {
+                self.session_metadata(*id, cx).summary.updated_at
+            };
+            std::cmp::Reverse((at, *id))
         });
         ids
     }
@@ -6262,6 +6445,12 @@ impl Shell {
                                     div().flex_1().min_w_0().flex().items_center().child(
                                         div()
                                             .id("workspace-project")
+                                            .when(
+                                                crate::paseo_host::project_ui(
+                                                    &self.workspace.preferences,
+                                                ),
+                                                |d| d.flex_1(),
+                                            )
                                             .debug_selector(|| "sidebar-project-button".into())
                                             .relative()
                                             .role(Role::Button)
@@ -6334,6 +6523,34 @@ impl Shell {
                                                 }
                                             })),
                                     ),
+                                )
+                                .when(
+                                    crate::paseo_host::project_ui(&self.workspace.preferences),
+                                    |d| {
+                                        d.child(
+                                            div()
+                                                .id("sidebar-new-chat")
+                                                .debug_selector(|| "sidebar-new-chat".into())
+                                                .role(Role::Button)
+                                                .aria_label("New chat")
+                                                .cursor(CursorStyle::Arrow)
+                                                .h(px(28.))
+                                                .px_2()
+                                                .gap_1()
+                                                .rounded_md()
+                                                .flex()
+                                                .items_center()
+                                                .text_size(px(12.))
+                                                .text_color(content(1.))
+                                                .bg(content(0.1))
+                                                .hover(|s| s.bg(content(0.18)))
+                                                .child(icon("plus", 14.))
+                                                .child(crate::i18n::t("New chat"))
+                                                .on_click(
+                                                    cx.listener(|this, _, _, cx| this.new_chat(cx)),
+                                                ),
+                                        )
+                                    },
                                 )
                                 .child(
                                     icon_button(
@@ -6545,6 +6762,17 @@ impl Shell {
                             .when(active, |d| d.bg(content(0.1)))
                             .hover(|s| s.opacity(1.).bg(content(if active { 0.1 } else { 0.05 })))
                             .child(self.project_mark(&path, 12.))
+                            .when(
+                                crate::paseo_host::project_ui(&self.workspace.preferences),
+                                |d| {
+                                    d.gap_1().child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .truncate()
+                                            .child(self.project_label(&path)),
+                                    )
+                                },
+                            )
                             .when(hovered, |d| d.child(self.space_anchor.probe()))
                             .on_hover({
                                 let path = path.clone();
@@ -7631,9 +7859,7 @@ impl Shell {
                                 icon("plus", 14.)
                                     .group_hover("new-tab", |s| s.text_color(content(1.))),
                             )
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.create(this.default_kind(), cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx))),
                     )
                     .child(titlebar_drag_area().flex_1().min_w_0()),
             )
@@ -8027,7 +8253,7 @@ impl Render for Shell {
                 if this.dock_focused(window, cx).is_some() {
                     this.new_terminal(window, cx);
                 } else {
-                    this.create(this.default_kind(), cx);
+                    this.new_chat(cx);
                 }
             }))
             .on_action(
@@ -8369,10 +8595,296 @@ impl Render for Shell {
 }
 
 #[cfg(test)]
+pub(crate) fn paseo_shell_fixture(cx: &mut Context<Shell>) -> Shell {
+    let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+    let project = store
+        .remember_remote_project(
+            "paseo-fixture",
+            &serde_json::json!({"id":"p", "cwd":"/fixture", "name":"Workspace"}),
+        )
+        .unwrap();
+    let snapshot = serde_json::json!({"projectId":"p", "revision":1, "status":"idle", "updatedAt":10000,
+    "session":{"id":"a", "harness":"hermes", "title":"原生 Shell · Paseo", "model":"hermes:exact-model", "cwd":"/fixture", "blocks":[
+        {"id":"u", "role":"user", "text":"请保留所有回复，并折叠工作步骤。", "startedAt":1000, "durationMs":9000},
+        {"id":"t", "role":"tool", "text":"", "tool":{"nativeName":"read", "status":"completed", "nativeInput":"{\"filePath\":\"fixture.rs\"}", "detail":"Synthetic hidden output"}},
+        {"id":"a1", "role":"assistant", "text":"第一段报告：这是原版 Monocode Shell。"},
+        {"id":"r", "role":"reasoning", "text":"Synthetic hidden reasoning"},
+        {"id":"a2", "role":"assistant", "text":"第二段回复也应保持可见。"}
+    ]}});
+    let summary = store.register_remote_summary(&project, &snapshot).unwrap();
+    let id = summary.id;
+    let mut state = Workspace::default();
+    state.add_project(&project.key);
+    state.open(id);
+    state.compact_session_cards = false;
+    crate::paseo_host::restrict_workspace(&mut state);
+    // Real project picker/image path; synthetic artwork in the test's temp area.
+    for (index, name) in ["Workspace", "Helpers"].iter().enumerate() {
+        let key = if index == 0 {
+            project.key.clone()
+        } else {
+            "remote://paseo-fixture/second".into()
+        };
+        if !state.projects.contains(&key) {
+            store
+                .remember_remote_project(
+                    "paseo-fixture",
+                    &serde_json::json!({"id":"second","cwd":"/second","name":"Helpers"}),
+                )
+                .unwrap();
+            state.projects.push(key.clone());
+        }
+        let path = std::env::temp_dir().join(format!(
+            "paseo-r9-fixture-icon-{}-{index}.png",
+            std::process::id()
+        ));
+        image::RgbaImage::from_pixel(
+            24,
+            24,
+            image::Rgba(if index == 0 {
+                [55, 190, 180, 255]
+            } else {
+                [235, 140, 60, 255]
+            }),
+        )
+        .save(&path)
+        .unwrap();
+        state.project_appearance.insert(
+            key,
+            monocode_core::project_appearance::ProjectAppearance {
+                name: name.to_string(),
+                logo: Some(path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+    }
+    state.preferences.extra.insert(
+        crate::paseo_host::PROJECT_SELECTION.into(),
+        serde_json::to_value(crate::paseo_host::ProjectSelection::default()).unwrap(),
+    );
+    state.preferences.extra.insert(
+        "paseo_all_projects".into(),
+        serde_json::json!([
+            project.key,
+            "remote://paseo-fixture/second",
+            "remote://paseo-fixture/hidden"
+        ]),
+    );
+    state.preferences.extra.insert(
+        "paseo_visible_projects".into(),
+        serde_json::json!(state.projects),
+    );
+    state.preferences.native_locale = Some("en".into());
+    state.preferences.agent_presets = vec![crate::settings::AgentPreset {
+        id: "fixture-preset".into(),
+        name: "Saved Hermes preset".into(),
+        provider: "hermes".into(),
+        model: "exact-model".into(),
+        mode_id: "dont_ask".into(),
+        thinking_option_id: None,
+        notes: "Synthetic saved preset".into(),
+        feature_values: Default::default(),
+        extra: Default::default(),
+    }];
+    let saved = serde_json::to_string(&state).unwrap();
+    let shell = Shell::new(
+        Arc::new(Mutex::new(store)),
+        vec![summary],
+        project.key,
+        Some(saved),
+        cx,
+    );
+    shell.sessions[&id].update(cx, |view, cx| {
+        view.install_paseo_test_snapshot(&snapshot, cx)
+    });
+    shell
+}
+
+#[cfg(test)]
+impl Shell {
+    pub(crate) fn paseo_fixture_check_draft_and_add(&mut self, cx: &mut Context<Self>) {
+        let id = self.workspace.active.expect("draft selected");
+        let store = self.store.lock().unwrap();
+        let binding = store.remote_session(id).unwrap().unwrap();
+        assert_eq!(binding.project.key, self.workspace.project);
+        assert!(binding.session_id.is_none());
+        assert!(binding.outbox.is_empty());
+        assert_eq!(
+            store.agent_settings(id).unwrap().unwrap().access,
+            monocode_core::agent::AccessMode::FullAccess
+        );
+        drop(store);
+        self.add_paseo_project("remote://paseo-fixture/hidden", cx);
+        assert_eq!(self.workspace.projects.len(), 3);
+        let saved = crate::paseo_host::ProjectSelection::read(
+            self.workspace
+                .preferences
+                .extra
+                .get(crate::paseo_host::PROJECT_SELECTION),
+        );
+        assert!(
+            saved
+                .added
+                .iter()
+                .any(|p| p == "remote://paseo-fixture/hidden")
+        );
+    }
+    pub(crate) fn paseo_fixture_r11b(
+        &mut self,
+        lang: &str,
+        terminal: bool,
+        status: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace.preferences.native_locale = Some(lang.into());
+        self.workspace.preferences.extra.insert(
+            "paseo_environment".into(),
+            serde_json::json!("paseo-fixture"),
+        );
+        self.workspace.preferences.extra.insert(
+            "paseo_host_endpoint".into(),
+            serde_json::json!("http://127.0.0.1:1234"),
+        );
+        crate::i18n::configure(&self.workspace.preferences);
+        if let Some(id) = self.workspace.active {
+            self.sessions[&id].update(cx, |v, cx| {
+                v.test_close_model_menu(window, cx);
+                v.settings.worktree_cwd = Some(std::env::temp_dir().to_string_lossy().into_owned());
+            });
+            if status {
+                self.workspace
+                    .preferences
+                    .extra
+                    .insert("paseo_group".into(), serde_json::json!("status"));
+                let template = self.session_metadata(id, cx).summary.clone();
+                for (ix, bucket) in ["needs_input", "failed", "attention", "running", "done"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let sid = if ix == 0 { id } else { -1000 - ix as i64 };
+                    if sid != id {
+                        let mut row = template.clone();
+                        row.id = sid;
+                        row.title = format!("Synthetic {bucket}");
+                        self.session_summaries.insert(sid, row);
+                        if !self.order.contains(&sid) {
+                            self.order.push(sid);
+                        }
+                    }
+                    self.remote_details.insert(sid,serde_json::json!({"bucket":bucket,"enteredAt":1000+ix,"createdAt":2000+ix}));
+                }
+            }
+        }
+        if terminal {
+            self.new_terminal(window, cx);
+        }
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
+    pub(crate) fn paseo_fixture_show_favorites(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_menu(cx);
+        if let Some(view) = self.workspace.active.and_then(|id| self.sessions.get(&id)) {
+            view.update(cx, |view, cx| {
+                view.test_model_favorites(window, cx);
+            });
+        }
+    }
+    pub(crate) fn paseo_fixture_show_switcher(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu(
+            MenuTarget::Header,
+            Anchor::Point(gpui::point(px(20.), px(50.))),
+            window,
+            cx,
+        );
+        if let Some(open) = &self.menu {
+            open.menu.update(cx, |menu, cx| {
+                menu.test_pick_action("switch-project", window, cx)
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{EntityInputHandler, TestAppContext, WindowHandle};
     use monocode_core::store::Store;
+    #[gpui::test]
+    fn paseo_terminal_uses_existing_dock_and_local_cwd_and_refuses_missing(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = window(cx);
+        let dir = std::env::temp_dir().join(format!(
+            "paseo-terminal-test-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        window
+            .update(cx, |shell, w, cx| {
+                let project = format!("remote://fixture{}", dir.as_path().to_str().unwrap());
+                shell.workspace.project = project.clone();
+                shell.workspace.active = None;
+                shell.new_terminal(w, cx);
+                assert!(!shell.terminals.contains_key(&project));
+                assert!(shell.error.as_ref().unwrap().contains("remote projects"));
+                shell.workspace.preferences.extra.insert(
+                    crate::paseo_host::PROJECT_SELECTION.into(),
+                    serde_json::json!({}),
+                );
+                shell
+                    .workspace
+                    .preferences
+                    .extra
+                    .insert("paseo_environment".into(), serde_json::json!("fixture"));
+                shell.workspace.preferences.extra.insert(
+                    "paseo_host_endpoint".into(),
+                    serde_json::json!("http://127.0.0.1:1234"),
+                );
+                shell.new_terminal(w, cx);
+                assert_eq!(shell.terminals[&project].len(), 1);
+                assert_eq!(
+                    shell.terminals[&project][0].read(cx).cwd,
+                    dir.as_path().canonicalize().unwrap().to_str().unwrap()
+                );
+                assert!(shell.actions_button(cx).is_some());
+                let action = crate::workspace::ProjectAction {
+                    id: "synthetic-action".into(),
+                    name: "Synthetic".into(),
+                    command: "echo synthetic".into(),
+                    icon: "terminal".into(),
+                };
+                shell
+                    .workspace
+                    .actions
+                    .insert(project.clone(), vec![action]);
+                shell.run_action("synthetic-action", w, cx);
+                assert_eq!(
+                    shell.terminals[&project].last().unwrap().read(cx).cwd,
+                    dir.canonicalize().unwrap().to_string_lossy()
+                );
+                shell.workspace.project = "remote://fixture/synthetic/missing-folder".into();
+                shell.new_terminal(w, cx);
+                assert!(!shell.terminals.contains_key(&shell.workspace.project));
+                assert!(
+                    shell
+                        .error
+                        .as_ref()
+                        .unwrap()
+                        .contains("Project folder not found")
+                );
+            })
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[gpui::test]
     fn hovering_archive_preserves_history_and_does_not_select_the_row(cx: &mut TestAppContext) {
         let (window, a, b) = window(cx);

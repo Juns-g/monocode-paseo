@@ -6,18 +6,52 @@ impl Shell {
     pub(super) fn filter_menu_items(&self, cx: &App) -> Vec<MenuItem> {
         let filters = &self.workspace.session_filters;
         let mut items = vec![
-            MenuAction::new("archived", "Archived")
+            MenuAction::new("archived", crate::i18n::t("Archived"))
                 .checked(self.workspace.preferences.show_archived)
                 .into(),
-            MenuItem::Header("Status".into()),
         ];
+        if crate::paseo_host::project_ui(&self.workspace.preferences) {
+            items.push(MenuItem::Header(crate::i18n::t("Group by").into()));
+            for (id, label) in [("project", "Project"), ("status", "Status")] {
+                items.push(
+                    MenuAction::new(format!("paseo-group:{id}"), crate::i18n::t(label))
+                        .checked(
+                            self.workspace
+                                .preferences
+                                .extra
+                                .get("paseo_group")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("project")
+                                == id,
+                        )
+                        .into(),
+                );
+            }
+            items.push(MenuItem::Header(crate::i18n::t("Sort").into()));
+            for (id, label) in [("activity", "Last activity"), ("created", "Created")] {
+                items.push(
+                    MenuAction::new(format!("paseo-sort:{id}"), crate::i18n::t(label))
+                        .checked(
+                            self.workspace
+                                .preferences
+                                .extra
+                                .get("paseo_sort")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("activity")
+                                == id,
+                        )
+                        .into(),
+                );
+            }
+        }
+        items.push(MenuItem::Header("Status".into()));
         for (id, label, checked) in [
             ("working", "Working", filters.status.working),
             ("approval", "Needs approval", filters.status.needs_approval),
             ("done", "Done", filters.status.done),
         ] {
             items.push(
-                MenuAction::new(id, label)
+                MenuAction::new(id, crate::i18n::t(label))
                     .checked(checked)
                     .keep_open()
                     .into(),
@@ -58,12 +92,33 @@ impl Shell {
         }
         if filters.active(self.workspace.preferences.show_archived) {
             items.push(MenuItem::Separator);
-            items.push(MenuAction::new("clear", "Clear filters").keep_open().into());
+            items.push(
+                MenuAction::new("clear", crate::i18n::t("Clear filters"))
+                    .keep_open()
+                    .into(),
+            );
         }
         items
     }
 
     pub(super) fn change_session_filter(&mut self, action: &str, cx: &mut Context<Self>) {
+        if crate::paseo_host::project_ui(&self.workspace.preferences) {
+            for (prefix, key, choices) in [
+                ("paseo-group:", "paseo_group", ["project", "status"]),
+                ("paseo-sort:", "paseo_sort", ["activity", "created"]),
+            ] {
+                if let Some(value) = action.strip_prefix(prefix).filter(|v| choices.contains(v)) {
+                    self.workspace
+                        .preferences
+                        .extra
+                        .insert(key.into(), serde_json::json!(value));
+                    self.invalidate_chrome(cx);
+                    self.persist(cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let filters = &mut self.workspace.session_filters;
         match action {
             "archived" => {
@@ -89,6 +144,21 @@ impl Shell {
                 } else {
                     return;
                 }
+            }
+        }
+        if crate::paseo_host::active() {
+            let key = "paseo_visible_projects";
+            if let Some(projects) = self
+                .workspace
+                .preferences
+                .extra
+                .get(key)
+                .and_then(|v| v.as_array())
+            {
+                self.workspace.projects = projects
+                    .iter()
+                    .filter_map(|p| p.as_str().map(str::to_owned))
+                    .collect();
             }
         }
         self.close_preview(cx);

@@ -1,6 +1,9 @@
 use super::*;
 impl Shell {
     pub(super) fn configure_quick_composer(&mut self, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            return;
+        }
         if let Some(receiver) = self.quick.configure(&self.workspace.preferences) {
             self.quick.task = Some(cx.spawn(async move |this, cx| {
                 while receiver.recv().await.is_ok() {
@@ -143,6 +146,10 @@ impl Shell {
         let store = self.store.clone();
         let choice = launch.clone();
         crate::conversation::remember_access(choice.access, cx);
+        let preset = self
+            .workspace
+            .preferences
+            .new_chat_preset(choice.kind.id(), choice.model.as_deref());
         crate::pickers::remember_model(choice.kind, choice.model.clone(), cx);
         let account = crate::accounts::get(cx)
             .map(|a| a.read(cx).selected(launch.kind, &launch.cwd))
@@ -150,7 +157,7 @@ impl Shell {
         let work = cx.background_executor().spawn(async move {
             let store = locked(&store)?;
             let summary = store.create(choice.kind.id(), &choice.cwd)?;
-            let settings = monocode_core::agent::Settings {
+            let mut settings = monocode_core::agent::Settings {
                 account,
                 model: choice.model,
                 access: choice.access,
@@ -161,6 +168,10 @@ impl Shell {
                 worktree_cwd: choice.worktree_cwd,
                 ..Default::default()
             };
+            if let Some(preset) = preset {
+                preset.apply(&mut settings)?;
+                settings.access = choice.access;
+            }
             store.save_agent_settings(summary.id, &settings)?;
             Ok::<_, String>((summary, settings))
         });

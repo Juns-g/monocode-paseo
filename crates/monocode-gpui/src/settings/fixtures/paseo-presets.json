@@ -1,0 +1,278 @@
+{
+  "source": "/synthetic/paseo/config.json",
+  "providers": {
+    "hermes": {
+      "sourceProvider": "hermes",
+      "label": "Hermes",
+      "models": [
+        {
+          "id": "openai-codex:gpt-6.1-sol",
+          "label": "GPT-6.1 Sol",
+          "description": "日常默认；沿用现有推理配置。",
+          "isDefault": true
+        },
+        {
+          "id": "openai-codex:gpt-6-astra",
+          "label": "GPT-6 Astra"
+        },
+        {
+          "id": "openai-codex:gpt-6-luna",
+          "label": "GPT-6 Luna"
+        },
+        {
+          "id": "custom:cpa-gemini:gemini-3.8-flash-high",
+          "label": "Gemini 3.8 Flash High · CPA"
+        },
+        {
+          "id": "deepseek:deepseek-flash",
+          "label": "DeepSeek V4.1 Flash",
+          "description": "官方 Flash；支持图片输入，替代旧 Flash / Vision 实验名称。"
+        },
+        {
+          "id": "deepseek:deepseek-v4-pro",
+          "label": "DeepSeek V4 Pro"
+        },
+        {
+          "id": "custom:magpie-grok:grok/grok-4.7",
+          "label": "Grok 4.7",
+          "description": "经本机 Magpie 复用 Grok 登录；常规档。"
+        },
+        {
+          "id": "custom:magpie-grok:grok/grok-4.7-build-fast",
+          "label": "Grok 4.7 · Fast（高消耗）",
+          "description": "仅手动加速备用，不作默认或自动回退；较高套餐用量费率。"
+        },
+        {
+          "id": "custom:sub2tok:claude-sonnet-5-5",
+          "label": "Claude Sonnet 5.5 · sub2tok",
+          "description": "直连 sub2tok，原生 Anthropic Messages；常规 Claude 入口。"
+        },
+        {
+          "id": "custom:sub2tok:claude-opus-5-5",
+          "label": "Claude Opus 5.5 · sub2tok",
+          "description": "直连 sub2tok；手动选择，不作默认或自动回退。"
+        },
+        {
+          "id": "custom:sub2tok:claude-haiku-5-5",
+          "label": "Claude Haiku 5.5 · sub2tok",
+          "description": "直连 sub2tok；轻量备用，不改既有子任务分工。"
+        }
+      ],
+      "command": [
+        "hermes",
+        "acp"
+      ]
+    },
+    "claude": {
+      "sourceProvider": "claude-code",
+      "label": "Claude Code · sub2tok",
+      "models": [
+        {
+          "id": "claude-sonnet-5-5",
+          "label": "Claude Sonnet 5.5",
+          "description": "日常编码默认",
+          "isDefault": true
+        },
+        {
+          "id": "claude-opus-5-5",
+          "label": "Claude Opus 5.5",
+          "description": "复杂任务，手动选择"
+        },
+        {
+          "id": "claude-haiku-5-5",
+          "label": "Claude Haiku 5.5",
+          "description": "轻量任务"
+        }
+      ],
+      "command": [
+        "/synthetic/bin/claude"
+      ]
+    },
+    "omp": {
+      "sourceProvider": "omp",
+      "label": "omp",
+      "models": [
+        {
+          "id": "openai-codex/gpt-6-sol",
+          "label": "GPT-6 Sol"
+        },
+        {
+          "id": "openai-codex/gpt-6-luna",
+          "label": "GPT-6 Luna（子任务）"
+        },
+        {
+          "id": "cpa-gemini/gemini-3.8-flash-high",
+          "label": "Gemini 3.8 Flash High (CPA)",
+          "description": "cpa-gemini/gemini-3.8-flash-high",
+          "isDefault": true
+        },
+        {
+          "id": "deepseek/deepseek-v4-pro",
+          "label": "DeepSeek V4 Pro",
+          "description": "deepseek/deepseek-v4-pro"
+        },
+        {
+          "id": "deepseek/deepseek-v4-flash",
+          "label": "DeepSeek V4 Flash",
+          "description": "deepseek/deepseek-v4-flash"
+        },
+        {
+          "id": "deepseek/deepseek-v4-flash-vision-exp",
+          "label": "DeepSeek V4 Flash Vision Exp",
+          "description": "deepseek/deepseek-v4-flash-vision-exp"
+        },
+        {
+          "id": "openai-codex/gpt-6-astra",
+          "label": "GPT-6-Astra",
+          "description": "openai-codex/gpt-6-astra"
+        },
+        {
+          "id": "sub2tok/claude-sonnet-5-5",
+          "label": "Claude Sonnet 5.5 · sub2tok"
+        },
+        {
+          "id": "sub2tok/claude-opus-5-5",
+          "label": "Claude Opus 5.5 · sub2tok"
+        },
+        {
+          "id": "sub2tok/claude-haiku-5-5",
+          "label": "Claude Haiku 5.5 · sub2tok"
+        }
+      ],
+      "command": null
+    },
+    "codex": {
+      "sourceProvider": "codex",
+      "label": "codex",
+      "models": [
+        {
+          "id": "gpt-6.1-sol",
+          "label": "GPT-6.1 Sol",
+          "isDefault": true,
+          "thinkingOptions": [
+            {
+              "id": "low",
+              "label": "Low"
+            },
+            {
+              "id": "medium",
+              "label": "Medium"
+            },
+            {
+              "id": "high",
+              "label": "High",
+              "isDefault": true
+            },
+            {
+              "id": "xhigh",
+              "label": "Xhigh"
+            },
+            {
+              "id": "max",
+              "label": "Max"
+            },
+            {
+              "id": "ultra",
+              "label": "Ultra"
+            }
+          ]
+        },
+        {
+          "id": "gpt-6-luna",
+          "label": "GPT-6 Luna"
+        },
+        {
+          "id": "gpt-6-astra",
+          "label": "GPT-6-Astra",
+          "description": "手动升级备选；不作为日常默认模型。"
+        }
+      ],
+      "command": null
+    }
+  },
+  "profiles": [
+    {
+      "id": "hermes-claude-opus",
+      "name": "Hermes · Claude Opus 5.5",
+      "icon": "sparkles",
+      "color": "orange",
+      "provider": "hermes",
+      "model": "custom:sub2tok:claude-opus-5-5",
+      "modeId": "dont_ask",
+      "notes": "Hermes 复杂推理/长文判断的 Claude 高档；手动选择，不作默认或自动回退。",
+      "sourceProvider": "hermes"
+    },
+    {
+      "id": "hermes-gpt-6",
+      "name": "Hermes · GPT-6.1 Sol",
+      "icon": "sparkles",
+      "color": "violet",
+      "provider": "hermes",
+      "model": "openai-codex:gpt-6.1-sol",
+      "modeId": "dont_ask",
+      "thinkingOptionId": "high",
+      "notes": "个人通用 Agent 主力：6.1 Sol High；研究、旅行、邮件、文件与任务编排。复杂代码交给 Codex；实质子任务默认 6 Luna Max。",
+      "sourceProvider": "hermes"
+    },
+    {
+      "id": "hermes-gemini",
+      "name": "Hermes · Gemini Flash",
+      "icon": "zap",
+      "color": "green",
+      "provider": "hermes",
+      "model": "custom:cpa-gemini:gemini-3.8-flash-high",
+      "modeId": "dont_ask",
+      "notes": "轻量快速备用入口，不消耗 Codex 订阅额度，自动执行。",
+      "sourceProvider": "hermes"
+    },
+    {
+      "id": "hermes-gpt-astra",
+      "name": "Hermes · GPT-6 Astra",
+      "icon": "sparkles",
+      "color": "violet",
+      "provider": "hermes",
+      "model": "openai-codex:gpt-6-astra",
+      "modeId": "dont_ask",
+      "notes": "Hermes 的 GPT-6 Astra 手动选项。",
+      "sourceProvider": "hermes"
+    },
+    {
+      "id": "claude-code-opus",
+      "name": "Claude Code · Opus 5.5",
+      "icon": "terminal",
+      "color": "orange",
+      "provider": "claude",
+      "model": "claude-opus-5-5",
+      "modeId": "bypassPermissions",
+      "thinkingOptionId": "xhigh",
+      "notes": "Claude Code 复杂重构/疑难排错：Opus 5.5 Xhigh，全权限；手动选择。",
+      "sourceProvider": "claude-code"
+    },
+    {
+      "id": "codex-gpt-6",
+      "name": "Codex · GPT-6.1 Sol",
+      "icon": "terminal",
+      "color": "violet",
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "modeId": "full-access",
+      "thinkingOptionId": "high",
+      "featureValues": {
+        "service_tier": "default"
+      },
+      "notes": "代码主力：6.1 Sol High，全权限。未显式选模的子 Agent 默认 6 Luna Max；复杂子任务可显式使用 Sol。",
+      "sourceProvider": "codex"
+    },
+    {
+      "id": "omp-gemini",
+      "name": "OMP · Gemini Flash",
+      "icon": "cpu",
+      "color": "yellow",
+      "provider": "omp",
+      "model": "cpa-gemini/gemini-3.8-flash-high",
+      "modeId": "full",
+      "notes": "OMP 的 Gemini 3.8 Flash High (CPA) 预设。",
+      "sourceProvider": "omp"
+    }
+  ]
+}

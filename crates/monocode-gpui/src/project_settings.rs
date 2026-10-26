@@ -87,8 +87,11 @@ fn mascot(index: usize, side: f32, color: gpui::Hsla) -> AnyElement {
     .flex_shrink_0()
     .into_any_element()
 }
+pub(crate) fn uses_remote_icon(project: &str, paseo: bool) -> bool {
+    project.starts_with("remote://") && !paseo
+}
 pub(crate) fn project_icon(appearance: &ProjectAppearance, project: &str, side: f32) -> AnyElement {
-    if project.starts_with("remote://") && appearance.logo.is_none() {
+    if uses_remote_icon(project, crate::paseo_host::active()) && appearance.logo.is_none() {
         return icon("internet", side)
             .text_color(content(0.7))
             .into_any_element();
@@ -108,7 +111,7 @@ pub(crate) fn project_icon(appearance: &ProjectAppearance, project: &str, side: 
 }
 /// Sidebar.tsx's CurrentProjectIcon: a 10px mascot inside a 20px tile.
 pub(crate) fn header_project_icon(appearance: &ProjectAppearance, project: &str) -> AnyElement {
-    if project.starts_with("remote://") && appearance.logo.is_none() {
+    if uses_remote_icon(project, crate::paseo_host::active()) && appearance.logo.is_none() {
         return div()
             .size(px(20.))
             .flex()
@@ -1077,5 +1080,15 @@ impl Render for BackgroundDialog {
                     .on_click(cx.listener(|this,_,_,cx|{this.background=Background::default();this.effect_open=false;this.error=None;this.save(cx);}))))
             )
             .children(self.effect_popup(cx))
+    }
+}
+
+#[cfg(test)]
+mod paseo_icon_tests {
+    #[test]
+    fn ordinary_remote_keeps_globe_paseo_uses_project_appearance() {
+        assert!(super::uses_remote_icon("remote://normal/project", false));
+        assert!(!super::uses_remote_icon("remote://paseo/project", true));
+        assert!(!super::uses_remote_icon("/local/project", false));
     }
 }

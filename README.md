@@ -1,90 +1,49 @@
-<p align="center">
-  <img src="public/monocode.png" alt="MonoCode" width="88" />
-</p>
+# Monocode Paseo（实验版）
 
-<h1 align="center">MonoCode</h1>
+基于 [MonoCode](https://github.com/hardbeat920/monocode) 的原生 GPUI 客户端（`mc/migrate-monocode-to-gpui`，同步到 `native-v0.16.0-preview.7`），把后端换成本机的 [Paseo](https://github.com/getpaseo/paseo) daemon：界面沿用原版 Monocode 原生 Shell，对话、执行和历史都留在 Paseo 里，两边看到的是同一批对话，可以互相接着聊。
 
-<p align="center">
-  <strong>A GUI for your coding agents.</strong>
-</p>
+> ⚠️ **个人实验版本**：只在作者自己的 macOS（Apple Silicon）+ Paseo 0.13.0-beta.1 上用过，不保证效果、兼容性或稳定性，不提供支持。需要正式体验请用原版 MonoCode。原版说明见 [README.upstream.md](README.upstream.md)。
 
-<p align="center">
-  <img width="1680" height="1050" alt="MonoCode with agent sessions open side by side" src="https://github.com/user-attachments/assets/2cd4a6ec-eb1e-4b45-8627-a76442ea3874" />
-</p>
+## 怎么用
 
-Works with your subscriptions on Claude Code, Codex, Cursor, Grok Build, OpenCode, Antigravity, Pi, omp, fx, Hermes Agent, and Devin. If they’re installed and logged in, MonoCode can run them. Tabs are sessions. The composer is the input. MonoCode does not sell tokens.
-
-## Install
-
-Install and sign in to at least one supported agent first. See [provider setup](docs/providers.md) for instructions.
-
-| Platform | Download |
-| --- | --- |
-| macOS, Apple Silicon | [MonoCode.dmg](https://dl.usemono.dev/MonoCode.dmg) |
-| macOS, Intel | [MonoCode_x64.dmg](https://dl.usemono.dev/MonoCode_x64.dmg) |
-| Linux, x86_64 | [.deb, .rpm, or AppImage](https://github.com/hardbeat920/monocode/releases/latest) |
-| Windows, x86_64 | [Installer](https://github.com/hardbeat920/monocode/releases/latest) |
-
-On macOS, open the DMG and drag MonoCode to Applications. On Windows, run the installer. See [Linux setup](docs/install.md) for dependencies and package instructions.
-
-## Get started
-
-Open a project folder, choose an agent, and send a message. Each tab is a session. Split panes to work with sessions side by side.
-
-- Keep conversations organized by project.
-- Use separate Git worktrees for parallel tasks.
-- Edit files and review changes in the app.
-- Start a message with `/operator` to let an agent open sessions and manage worktrees and notes.
-
-Monos are experimental agents that work across your projects. They keep a memory and can run scheduled tasks you set up with them.
-
-MonoCode is still early. If something breaks, [report a bug](https://github.com/hardbeat920/monocode/issues).
-
-## Guides
-
-- [Provider setup](docs/providers.md)
-- [Linux installation](docs/install.md)
-- [Agent access with /operator](docs/agent-access.md)
-- [Remote sessions, experimental](docs/remote-access.md)
-
-## Build from source
-
-You’ll need Node.js 20+ and a stable Rust toolchain. See [build setup](docs/building.md) for platform dependencies and packaging.
-
-The mobile app is a separate Expo project in [`mobile/`](mobile/README.md). Run it with `cd mobile && npm install && npm start`.
-
-```bash
-npm install
-npm run tauri dev
-```
-
-Small, focused contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-
-## Monocode Native preview
-
-The Rust + GPUI app is an experimental preview. React/Tauri remains the
-production app.
-
-To try GPUI from this checkout with Node.js 22+, Rust and Xcode on macOS:
+前提：macOS；本机已在跑 Paseo daemon（默认 `127.0.0.1:6973`，只接受 loopback）；Rust stable；Node（测试过 24.22.0）；一份已装好依赖的 Paseo 源码（打包时用来 bundle 官方 SDK，装好的 App 不再依赖它）。
 
 ```sh
-npm run native:dev     # launch with a separate development database
-npm run native:build   # create an optimized app using installed MonoCode data
+RUSTUP_TOOLCHAIN=stable cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --release
+PASEO_SOURCE=/path/to/paseo python3 crates/monocode-gpui/paseo-prototype/package.py /tmp/monocode-paseo
+open "/tmp/monocode-paseo/Monocode Paseo Prototype.app"
 ```
 
-Type `r` then Enter in the development terminal to rebuild and restart; there is
-no hot reload. The release app saves changes to your installed MonoCode data.
-See the [native guide](docs/native/README.md) for prerequisites, build output,
-checks and preview limitations.
+- 独立 Bundle ID `dev.usemono.paseo-prototype`，数据在 `~/Library/Application Support/Monocode Paseo Prototype/`，不碰原版 MonoCode 的数据。
+- 认证走 Paseo 官方的本地凭据读取，不把任何凭据写进源码或 App。
+- 可选配置 `~/Library/Application Support/Monocode Paseo Prototype/prototype.json`（或环境变量 `PASEO_PROTOTYPE_CONFIG`）：
 
-## Contributors
+```json
+{ "endpoint": "127.0.0.1:6973", "serverId": "你的 serverId（可选）", "defaultProjectNames": ["项目A", "项目B"], "nodePath": "/path/to/node" }
+```
 
-Thanks to everyone who contributes to MonoCode!
+- 打包产物是 ad-hoc 签名，未公证；Node 路径在打包时记录，移动后用 `nodePath` 覆盖。
 
-[![MonoCode contributors](https://contrib.rocks/image?repo=hardbeat920/monocode)](https://github.com/hardbeat920/monocode/graphs/contributors)
+## 和原版 MonoCode 的差异
 
-Contributor image by [contrib.rocks](https://contrib.rocks).
+**可用**
+- 原版窗口、侧栏、标签页、分屏、输入框；Paseo 对话实时同步，回复全部可见、工具和思考折叠。
+- 新建对话（首次发送时才在 Paseo 创建，防重复；可选新建独立工作区或加入同项目最近 20 个工作区之一）、切换模型/强度、预设（也出现在模型选择的 Favorites 里）。
+- 子 Agent 嵌套在父对话下显示；同一 Git 仓库的 linked worktree 合并到一个项目导航。
+- 权限审批与问题回答、取消当前回合。
+- 侧栏：筛选、按项目或**按状态分组**（需要输入 → 失败 → 待查看 → 工作中 → 已完成）、按最近活动/创建时间排序。
+- 项目图标、底部项目切换（可只保留常用项目，其余手动加回）。
+- 只读的文件和 Git 面板；本机项目可直接打开**本地终端**。
+- 本地笔记；界面 **English / 简体中文** 切换（设置 → 通用 → 语言，默认跟随系统）。
 
-## License
+**隐藏 / 未实现**
+- 额度用量显示、远端 PTY / relay / tunnel。
+- 删除对话、标签、更早历史分页。
+- 快速输入框、Monos、自动化、Inbox、多 Agent 编排等依赖原版本地执行的功能。
+- 权限选择器：新对话默认使用 provider 的完全访问模式，不在界面显示。
 
-[MIT](LICENSE). Provider names and logos are trademarks of their owners. See [NOTICE](NOTICE).
+## 致谢与许可
+
+- 上游 MonoCode（MIT），GPUI 相关见 [NOTICE](NOTICE)；Paseo SDK 及其依赖的许可随打包附带。
+- 中文词表来自 [hardbeat920/monocode#1073](https://github.com/hardbeat920/monocode/pull/1073)（kev17in，MIT）。
+- 本 fork 沿用 MIT 许可，见 [LICENSE](LICENSE)。

@@ -194,6 +194,9 @@ impl UsageFooter {
         }
     }
     fn refresh(&mut self, force: bool, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            return;
+        }
         if let Some(center) = crate::accounts::get(cx) {
             let key = self.key.clone();
             center.update(cx, |center, cx| center.refresh(key.clone(), force, cx));
@@ -862,6 +865,7 @@ impl Render for UsageFooter {
         let classic = self.classic;
         div()
             .id("usage-footer")
+            .debug_selector(|| "usage-footer".into())
             .role(Role::Group)
             .aria_label("Provider usage")
             .h(px(if classic { 28. } else { 30. }))

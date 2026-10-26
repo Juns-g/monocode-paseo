@@ -173,7 +173,7 @@ fn remote_catalog_response(value: &Value, providers: Vec<Kind>) -> Result<Remote
     })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     pub name: String,

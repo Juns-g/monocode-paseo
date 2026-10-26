@@ -13,6 +13,7 @@ mod history;
 mod mobile;
 mod mono;
 mod notifications;
+mod presets;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
@@ -24,7 +25,8 @@ use crate::{
     git_picker::{GitPicker, Mode as GitMode, Picked as GitPicked},
     input,
     pickers::{
-        ModelList, ModelPicked, cached_model_name, model_display_name, model_name, remember_model,
+        ModelList, ModelPicked, PresetPicked, cached_model_name, model_display_name, model_name,
+        remember_model,
     },
     popover::{
         Align, Anchor, AnchorSlot, Flyout, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, Side,
@@ -186,6 +188,7 @@ pub(crate) struct Conversation {
     classic_layout: bool,
     catalog: Vec<Model>,
     catalog_epoch: u64,
+    preset_epoch: u64,
     account_switching: bool,
     _usage_clock: gpui::Task<()>,
     _account_usage: Option<Subscription>,
@@ -460,6 +463,12 @@ impl Conversation {
 
     pub(crate) fn new(summary: Session, store: Database, cx: &mut Context<Self>) -> Self {
         let input = cx.new(input::Input::new);
+        let mut remote_state = remote::State::default();
+        if summary.cwd.starts_with("remote://") {
+            remote_state.unbound = locked(&store).ok()
+                .and_then(|store| store.remote_session(summary.id).ok().flatten())
+                .is_some_and(|remote| remote.session_id.is_none());
+        }
         // A new tab shows its folder's checkout from the first frame; the
         // load below confirms it rather than popping it in.
         let git = (!summary.has_messages)
@@ -622,8 +631,12 @@ impl Conversation {
             },
             project_appearance: Default::default(),
             classic_layout: false,
-            catalog: Vec::new(),
+            catalog: cx
+                .try_global::<crate::settings::Preferences>()
+                .map(|prefs| prefs.named_catalog(&summary.provider, Vec::new()))
+                .unwrap_or_default(),
             catalog_epoch: 0,
+            preset_epoch: 0,
             account_switching: false,
             _usage_clock: usage_clock,
             _account_usage: account_usage,
@@ -665,7 +678,7 @@ impl Conversation {
             response_menu: None,
             response_request: None,
             summary,
-            remote_state: remote::State::default(),
+            remote_state,
             remote_plans: remote_plans::State::default(),
         }
     }
@@ -1844,7 +1857,10 @@ impl Conversation {
                 let _ = this.update(cx, |this, cx| {
                     if Kind::from_id(&this.summary.provider) == kind && this.catalog_epoch == epoch
                     {
-                        this.catalog = models;
+                        this.catalog = cx
+                            .try_global::<crate::settings::Preferences>()
+                            .map(|prefs| prefs.named_catalog(kind.id(), models.clone()))
+                            .unwrap_or(models);
                         if this.is_remote() && this.model.is_none() {
                             this.model = this
                                 .catalog
@@ -1897,25 +1913,82 @@ impl Conversation {
         let provider = self.summary.provider.clone();
         let remote = self.is_remote();
         let title = (!self.summary.has_messages).then(|| self.summary.title.clone());
-        cx.background_executor()
-            .spawn(async move {
-                let saved = locked(&store).and_then(|s| {
-                    s.configure_agent(id, &provider, &settings)?;
-                    if let Some(title) = title
-                        && s.agent_settings(id)?
-                            .is_some_and(|saved| saved.revision == settings.revision)
-                    {
-                        s.title(id, &title)?;
-                    }
-                    Ok(())
-                });
-                if saved.is_ok() && remote {
-                    let _ = crate::runtime::remote::configure_saved(store, id);
+        let paseo = self.paseo_controls();
+        let work = cx.background_executor().spawn(async move {
+            let saved = locked(&store).and_then(|s| {
+                s.configure_agent(id, &provider, &settings)?;
+                if let Some(title) = title
+                    && s.agent_settings(id)?
+                        .is_some_and(|saved| saved.revision == settings.revision)
+                {
+                    s.title(id, &title)?;
                 }
-            })
-            .detach();
+                Ok(())
+            });
+            if saved.is_ok() && remote {
+                crate::runtime::remote::configure_saved(store, id)
+            } else {
+                saved
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = work.await
+                && paseo
+            {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = error;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
     fn menu_choice(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.paseo_controls() && (self.busy || self.stopping || self.remote_state.pending) {
+            self.status = "等待 Paseo 会话空闲后修改配置".into();
+            cx.notify();
+            return;
+        }
+        if self.paseo_controls() && id.starts_with("workspace:") {
+            if !self.paseo_workspace_draft() {
+                self.status = "已有 Paseo 对话不能在这里变更工作区归属".into();
+                cx.notify();
+                return;
+            }
+            let selected = if id == "workspace:paseo:new" {
+                None
+            } else if let Some(workspace) = id.strip_prefix("workspace:paseo:existing:") {
+                if !self.remote_state.workspace_choices.iter().any(|w| w["id"] == workspace) {
+                    self.status = "所选 Paseo 工作区已不可用，请重新打开新建页".into();
+                    cx.notify();
+                    return;
+                }
+                Some(workspace.to_owned())
+            } else {
+                return;
+            };
+            self.settings.remote_workspace_id = selected;
+            self.settings.new_worktree = false;
+            self.settings.worktree_cwd = None;
+            self.settings.worktree_removed = false;
+            self.save_settings(cx);
+            cx.notify();
+            return;
+        }
+        if id == "save-agent-preset" {
+            self.save_paseo_preset(cx);
+            return;
+        }
+        if let Some(id) = id.strip_prefix("agent-preset:") {
+            let preset = cx
+                .try_global::<crate::settings::Preferences>()
+                .and_then(|prefs| prefs.agent_presets.iter().find(|preset| preset.id == id))
+                .cloned();
+            if let Some(preset) = preset {
+                self.select_agent_preset(preset, cx);
+            }
+            return;
+        }
         if self.git_action_choice(id, cx) {
             return;
         }
@@ -2143,8 +2216,32 @@ impl Conversation {
         picked: &ModelPicked,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.apply_model_bundle(picked, None, cx)
+    }
+    fn apply_model_bundle(
+        &mut self,
+        picked: &ModelPicked,
+        preset: Option<&crate::settings::AgentPreset>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.editing_last_turn.pending() || self.status == "Preparing handoff…" {
             return false;
+        }
+        if self.paseo_controls() {
+            if self.busy || self.stopping || self.remote_state.pending {
+                self.status = "等待 Paseo 会话空闲后修改配置".into();
+                cx.notify();
+                return false;
+            }
+            let attached = locked(&self.store)
+                .ok()
+                .and_then(|s| s.remote_session(self.summary.id).ok().flatten())
+                .is_some_and(|s| s.session_id.is_some());
+            if attached && self.summary.provider != picked.0.id() {
+                self.status = "现有 Paseo agent 不能切换 provider；请新建会话".into();
+                cx.notify();
+                return false;
+            }
         }
         let changed_model = self.summary.provider != picked.0.id() || self.model != picked.1;
         if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
@@ -2226,7 +2323,10 @@ impl Conversation {
             self.completion.update(cx, |completion, cx| {
                 completion.set_provider(picked.0.id(), cx)
             });
-            self.catalog.clear();
+            self.catalog = cx
+                .try_global::<crate::settings::Preferences>()
+                .map(|prefs| prefs.named_catalog(picked.0.id(), Vec::new()))
+                .unwrap_or_default();
             if !self.summary.has_messages {
                 self.summary.title = format!("New {} session", picked.0.label());
             }
@@ -2246,11 +2346,27 @@ impl Conversation {
             })
             .detach();
         self.resolved_model = None;
-        self.settings.effort = preferred_effort(&self.summary.provider, cx);
+        self.settings.effort = if self.paseo_controls() {
+            self.catalog
+                .iter()
+                .find(|model| Some(&model.id) == picked.1.as_ref())
+                .and_then(|model| model.default_effort.clone())
+        } else {
+            preferred_effort(&self.summary.provider, cx)
+        };
         self.settings.fast = false;
         self.settings.thinking = None;
         self.settings.service_tier = None;
         self.settings.model_settings.clear();
+        if let Some(preset) = preset {
+            // Validated before entering the provider lifecycle; save one complete bundle.
+            if self.paseo_controls() {
+                preset.apply_paseo(&mut self.settings)
+            } else {
+                preset.apply(&mut self.settings)
+            }
+            .expect("validated agent preset");
+        }
         if changed_model && self.settings.usage_limit.is_some() && !self.busy {
             self.recover_usage_after_model_change(cx);
         }
@@ -2283,10 +2399,21 @@ impl Conversation {
         cx.notify();
     }
     fn toggle_menu(&mut self, kind: ComposerMenu, window: &mut Window, cx: &mut Context<Self>) {
+        if kind == ComposerMenu::Workspace && self.paseo_controls() && !self.paseo_workspace_draft() {
+            self.status = "已有 Paseo 对话不能在这里变更工作区归属".into();
+            cx.notify();
+            return;
+        }
+        if self.paseo_controls() && matches!(kind, ComposerMenu::Access | ComposerMenu::Add) {
+            self.status = "附件和工作区设置请在 Paseo 管理".into();
+            cx.notify();
+            return;
+        }
         if kind == ComposerMenu::Model
+            && !self.paseo_controls()
             && cx
                 .try_global::<crate::settings::Preferences>()
-                .is_some_and(|p| p.model_controls == "beside")
+                .is_some_and(|p| p.model_controls == "beside" && p.agent_presets.is_empty())
         {
             self.toggle_mono_models(window, cx);
             return;
@@ -2379,6 +2506,32 @@ impl Conversation {
                 ("Switch account", items, 250., MenuStyle::Explorer)
             }
             ComposerMenu::Workspace => {
+                if self.paseo_workspace_draft() {
+                    let mut items = vec![
+                        MenuItem::Header("Paseo 工作区归属".into()),
+                        MenuAction::new("workspace:paseo:new", "新建独立工作区")
+                            .description("创建新的独立对话，不作为当前对话的子任务")
+                            .icon("folder")
+                            .checked(self.settings.remote_workspace_id.is_none())
+                            .into(),
+                    ];
+                    if !self.remote_state.workspace_choices.is_empty() {
+                        items.push(MenuItem::Separator);
+                        items.push(MenuItem::Header("加入已有工作区（同项目）".into()));
+                        for workspace in &self.remote_state.workspace_choices {
+                            let Some(id) = workspace["id"].as_str() else { continue };
+                            items.push(MenuAction::new(
+                                format!("workspace:paseo:existing:{id}"),
+                                workspace["title"].as_str().unwrap_or(id).to_owned(),
+                            )
+                            .description(workspace["cwd"].as_str().unwrap_or(id).to_owned())
+                            .icon("folder")
+                            .checked(self.settings.remote_workspace_id.as_deref() == Some(id))
+                            .into());
+                        }
+                    }
+                    return ("Paseo workspace", items, 340., MenuStyle::Settings);
+                }
                 let picker = cx.new(|cx| {
                     GitPicker::new(
                         self.summary.cwd.clone().into(),
@@ -2406,18 +2559,18 @@ impl Conversation {
                     "Workspace",
                     vec![
                         MenuItem::Header("Workspace".into()),
-                        MenuAction::new("workspace:current", "Current checkout")
+                        MenuAction::new("workspace:current", crate::i18n::t("Current checkout"))
                             .icon("folder")
                             .checked(
                                 !self.settings.new_worktree && self.settings.worktree_cwd.is_none(),
                             )
                             .into(),
-                        MenuAction::new("workspace:new", "New worktree")
+                        MenuAction::new("workspace:new", crate::i18n::t("New worktree"))
                             .icon("folder-tree")
                             .checked(self.settings.new_worktree)
                             .into(),
                         MenuItem::Separator,
-                        MenuAction::new("workspace:existing", "Existing worktrees")
+                        MenuAction::new("workspace:existing", crate::i18n::t("Existing worktrees"))
                             .icon("folder-tree")
                             .flyout(Flyout {
                                 view: picker.into(),
@@ -2439,25 +2592,25 @@ impl Conversation {
                 let mut items = vec![MenuItem::Header("Add to message".into())];
                 items.extend(
                     [
-                        MenuAction::new("upload", "Upload file")
+                        MenuAction::new("upload", crate::i18n::t("Upload file"))
                             .icon("file-add")
                             .description("Attach files or images"),
-                        MenuAction::new("plan", "Plan mode")
+                        MenuAction::new("plan", crate::i18n::t("Plan mode"))
                             .icon("ai-idea")
                             .icon_color(tint(YELLOW_300, 0.8))
                             .description("Review a plan before building"),
-                        MenuAction::new("operator", "Operator")
+                        MenuAction::new("operator", crate::i18n::t("Operator"))
                             .disabled(self.is_remote())
                             .icon("cursor-magic")
                             .icon_color(tint(SKY_300, 0.8))
                             .description("Give this thread access to MonoCode"),
-                        MenuAction::new("orchestrator", "Orchestrator")
+                        MenuAction::new("orchestrator", crate::i18n::t("Orchestrator"))
                             .disabled(self.is_remote())
                             .icon("share")
                             .icon_color(tint(FUCHSIA_300, 0.65))
                             .badge("v1")
                             .description("Plan and coordinate agent work"),
-                        MenuAction::new("draft", "Draft")
+                        MenuAction::new("draft", crate::i18n::t("Draft"))
                             .icon("circle-dashed-hi")
                             .description("Save this message without starting the agent")
                             .disabled(self.busy || self.follow_ups.state.draft.is_some()),
@@ -2498,6 +2651,12 @@ impl Conversation {
                     )
                     .hide_providers(hidden)
                     .allow_provider_switch(true)
+                    .with_presets(self.paseo_controls().then_some(
+                        !(self.busy
+                            || self.stopping
+                            || self.account_switching
+                            || self.remote_state.pending),
+                    ))
                 });
                 events.push(cx.subscribe_in(
                     &list,
@@ -2506,6 +2665,14 @@ impl Conversation {
                         if this.apply_model_pick(picked, cx) {
                             this.close_menu(window, cx);
                         }
+                    },
+                ));
+                events.push(cx.subscribe_in(
+                    &list,
+                    window,
+                    |this, _, picked: &PresetPicked, window, cx| {
+                        this.favorite_preset_selected(&picked.0, cx);
+                        this.close_menu(window, cx);
                     },
                 ));
                 let focus = list.read(cx).search_focus(cx);
@@ -2517,25 +2684,29 @@ impl Conversation {
                 } else {
                     Vec::new()
                 };
+                let mut presets = self.agent_preset_items(cx);
+                let width = if presets.is_empty() { 250. } else { 360. };
+                if !presets.is_empty() {
+                    presets.push(MenuItem::Header("Agent / model and settings".into()));
+                    presets.append(&mut items);
+                    items = presets;
+                }
                 items.push(
-                    MenuAction::new("model", "Model")
+                    MenuAction::new("model", crate::i18n::t("Model"))
                         .value_image(provider.id())
-                        .value(self.model_info().map_or_else(
-                            || model_name(provider, self.model.as_deref()),
-                            |model| model_display_name(provider, &model.id, &model.name),
-                        ))
+                        .value(self.model_label())
                         .flyout(Flyout {
                             view: list.into(),
                             width: 310.,
                             padding: 0.,
-                            height: Some(442.),
-                            max_height: None,
+                            height: (!self.paseo_controls()).then_some(442.),
+                            max_height: self.paseo_controls().then_some(320.),
                             focus: Some(focus),
                             surface: None,
                         })
                         .into(),
                 );
-                ("Model and settings", items, 250., MenuStyle::Settings)
+                ("Model and settings", items, width, MenuStyle::Settings)
             }
             ComposerMenu::Recent => (
                 "Recently used models",
@@ -2603,7 +2774,11 @@ impl Conversation {
                 let name = if selected {
                     self.model_label()
                 } else {
-                    let name = cached_model_name(kind, model.as_deref());
+                    let name = cx
+                        .try_global::<crate::settings::Preferences>()
+                        .and_then(|prefs| prefs.configured_model_name(kind.id(), model.as_deref()))
+                        .map(|name| SharedString::from(name.to_owned()))
+                        .unwrap_or_else(|| cached_model_name(kind, model.as_deref()));
                     match name.strip_prefix("Claude ") {
                         Some(short) if kind == Kind::Claude => short.to_owned().into(),
                         _ => name,
@@ -2743,7 +2918,7 @@ impl Conversation {
             .child(self.background_shelf(window, cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
-            .when(self.settings.worktree_removed,|d|d.child(div().mb_2().p_3().rounded_lg().border_1().border_color(content(0.1)).flex().items_center().gap_3().text_size(px(12.)).child(div().flex_1().child("Worktree deleted. Select a branch or worktree to continue this conversation.")).child(tool_pill("reattach-worktree","Select worktree").child("Select worktree").on_click(cx.listener(|this,_,window,cx|this.open_git(GitMode::Worktree,window,cx))))))
+            .when(self.settings.worktree_removed,|d|d.child(div().mb_2().p_3().rounded_lg().border_1().border_color(content(0.1)).flex().items_center().gap_3().text_size(px(12.)).child(div().flex_1().child(crate::i18n::t("Worktree deleted. Select a branch or worktree to continue this conversation."))).child(tool_pill("reattach-worktree","Select worktree").child(crate::i18n::t("Select worktree")).on_click(cx.listener(|this,_,window,cx|this.open_git(GitMode::Worktree,window,cx))))))
             .when_some(self.settings.handoff.clone(), |d, handoff| {
                 d.child(
                     div()
@@ -2798,9 +2973,7 @@ impl Conversation {
             })
             .child(self.approval_shelf(window, cx))
             .child(
-                div()
-                    .id("composer-box")
-                    .debug_selector(|| "composer-box".into())
+                div().id("composer-box").debug_selector(|| "composer-box".into()).flex().flex_col()
                     .capture_action(cx.listener(|this, _: &input::Paste, _, cx| {
                         if this.paste_attachments(cx) {
                             cx.stop_propagation();
@@ -2812,8 +2985,6 @@ impl Conversation {
                     .border_color(composer_border(self.input.focus_handle(cx).is_focused(window)))
                     .shadow(composer_shadow())
                     .when(self.file_drag, |d| d.border_color(accent_color().opacity(0.6)))
-                    .flex()
-                    .flex_col()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
@@ -2825,20 +2996,10 @@ impl Conversation {
                     .child(composer_surface(radius))
                     .children(self.attachment_chips(cx))
                     .child(
-                        div()
-                            .px_3()
-                            .pt(px(14.))
-                            .pb(px(14.))
-                            .child(self.completion.clone()),
+                        div().px_3().pt(px(14.)).pb(px(14.)).child(self.completion.clone()),
                     )
                     .child(
-                        div()
-                            .debug_selector(|| "composer-toolbar".into())
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .pb(px(10.))
+                        div().debug_selector(|| "composer-toolbar".into()).flex().items_center().gap_1().px_2().pb(px(10.))
                             .child(
                                 tool_pill("composer-add", "Add files or choose a mode")
                                     .aria_expanded(self.menu_is(ComposerMenu::Add))
@@ -2907,7 +3068,7 @@ impl Conversation {
                                             .child(icon("chevron-down", 12.)),
                                     )
                                     .children(controls)
-                                    .child(
+                                    .when(!self.paseo_controls(), |d| d.child(
                                         tool_pill("composer-access", "Access")
                                             .aria_label(format!(
                                                 "Access, {}",
@@ -2942,7 +3103,7 @@ impl Conversation {
                                             )
                                             .child(pill_label(self.settings.access.label()))
                                             .child(icon("chevron-down", 12.)),
-                                    ),
+                                    )),
                             )
                             .child(self.action(has_value, cx)),
                     )
@@ -2960,14 +3121,29 @@ impl Conversation {
         let linked =
             self.git.as_ref().is_some_and(|s| s.linked) || self.settings.worktree_cwd.is_some();
         let new = draft && self.settings.new_worktree;
-        let label = if new {
-            "New worktree"
+        let paseo_draft = self.paseo_workspace_draft();
+        let label: SharedString = if paseo_draft {
+            self.settings.remote_workspace_id.as_deref().map(|id| {
+                let title = self.remote_state.workspace_choices.iter()
+                    .find(|w| w["id"] == id).and_then(|w| w["title"].as_str()).unwrap_or(id);
+                format!("加入：{title}")
+            }).unwrap_or_else(|| "新建独立工作区".into()).into()
+        } else if self.paseo_controls() {
+            "Paseo 工作区".into()
+        } else if new {
+            "New worktree".into()
         } else if linked {
-            "Worktree"
+            "Worktree".into()
         } else {
-            "Current checkout"
+            "Current checkout".into()
         };
-        let enabled = !self.busy && !self.preparing_worktree && self.git.is_some();
+        let enabled = !self.busy && !self.preparing_worktree
+            && if self.paseo_controls() {
+                !self.stopping && paseo_draft && self.loaded
+                    && self.remote_state.online && !self.remote_state.pending
+            } else {
+                self.git.is_some()
+            };
         // Still reading git is not unavailable: don't dim, then brighten.
         let dimmed = !enabled && (self.loaded || self.busy || self.preparing_worktree);
         let workspace = if draft {
@@ -2978,15 +3154,18 @@ impl Conversation {
                 } else {
                     "folder"
                 },
-                label.into(),
+                label.clone(),
             )
             .aria_label(format!("Workspace {label}"))
             .aria_expanded(self.menu_is(ComposerMenu::Workspace))
+            .when(paseo_draft, |d| d.debug_selector(|| "paseo-workspace-selector".into()))
             .child(self.workspace_anchor.probe())
             .when(dimmed, |d| d.opacity(0.4))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if enabled {
-                    this.refresh_git(cx);
+                    if !this.paseo_controls() {
+                        this.refresh_git(cx);
+                    }
                     this.toggle_menu(ComposerMenu::Workspace, window, cx);
                 }
             }))
@@ -3081,7 +3260,7 @@ impl Conversation {
                                 .aria_label("Cancel editing")
                                 .text_size(px(11.))
                                 .text_color(content(0.6))
-                                .child("Cancel edit")
+                                .child(crate::i18n::t("Cancel edit"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.cancel_edit_last_turn(cx);
                                 })),
@@ -3699,10 +3878,10 @@ impl Render for Conversation {
 
 // The composer's `h-6.5` toolbar pills share `bg-selection` and its hover.
 fn tool_pill(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
-    div()
+    let pill = div()
         .id(id)
         .role(Role::Button)
-        .aria_label(label)
+        .aria_label(crate::i18n::t(label))
         .group(id)
         .cursor_pointer()
         .relative()
@@ -3716,7 +3895,10 @@ fn tool_pill(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div>
         .bg(content(0.1))
         .text_color(content(1.))
         .hover(|s| s.bg(content(0.15)))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+    #[cfg(test)]
+    let pill = pill.debug_selector(move || id.into());
+    pill
 }
 /// `[data-composer-box]::before`: the frosted (or, in light themes, solid)
 /// surface inside the composer's border.
@@ -3756,7 +3938,7 @@ fn send_button(
     div()
         .id(id)
         .role(Role::Button)
-        .aria_label(label)
+        .aria_label(crate::i18n::t(label))
         .cursor_pointer()
         .flex_shrink_0()
         .size(px(26.))
@@ -3840,6 +4022,50 @@ pub(crate) fn git_branch(cwd: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+impl Conversation {
+    pub(crate) fn test_close_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menu(window, cx);
+    }
+    pub(crate) fn test_model_favorites(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ModelList> {
+        self.menu = None;
+        self.toggle_menu(ComposerMenu::Model, window, cx);
+        let menu = self.menu.as_ref().expect("model menu").menu.clone();
+        let list = menu
+            .read(cx)
+            .test_flyout("model")
+            .downcast::<ModelList>()
+            .expect("actual model picker");
+        list.update(cx, |list, cx| list.show_favorites(cx));
+        menu.update(cx, |menu, cx| menu.test_pick_action("model", window, cx));
+        list
+    }
+    pub(crate) fn install_paseo_test_snapshot(
+        &mut self,
+        snapshot: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let (history, turns) =
+            monocode_core::store::Store::project_remote_history(snapshot).unwrap();
+        self.loaded = true;
+        self.loading = false;
+        self.remote_state.online = true;
+        self.remote_state
+            .capabilities
+            .insert("paseo.configure".into());
+        self.settings.turns = turns.clone();
+        self.transcript.update(cx, |view, cx| {
+            view.paseo_mode();
+            view.set_turns(turns);
+            view.restore_history(history.rows, cx);
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::git_branch;
     #[test]
@@ -3869,6 +4095,136 @@ mod menu_tests {
     use gpui::{TestAppContext, WindowHandle, point};
     use monocode_core::store::Store;
     use std::sync::Mutex;
+    #[gpui::test]
+    fn paseo_favorites_apply_saved_bundle_via_real_model_picker(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            crate::popover::bind(cx);
+            cx.set_global(crate::settings::Preferences::default());
+        });
+        let window = conversation(cx);
+        let id = window
+            .update(cx, |c, _, cx| {
+                c.summary.cwd = "remote://paseo-fixture/fixture".into();
+                c.summary.provider = "hermes".into();
+                c.remote_state.capabilities.insert("paseo.configure".into());
+                c.catalog = vec![Model {
+                    id: "hermes:route:model".into(),
+                    name: "Friendly".into(),
+                    efforts: vec!["high".into()],
+                    ..Default::default()
+                }];
+                c.model = Some("hermes:route:model".into());
+                c.settings.effort = Some("high".into());
+                c.settings
+                    .model_settings
+                    .insert("paseo.flag".into(), "true".into());
+                c.menu_choice("save-agent-preset", cx);
+                let id = cx
+                    .global::<crate::settings::Preferences>()
+                    .agent_presets
+                    .last()
+                    .unwrap()
+                    .id
+                    .clone();
+                c.settings.effort = None;
+                c.settings.model_settings.clear();
+                id
+            })
+            .unwrap();
+        let picker = window
+            .update(cx, |c, w, cx| c.test_model_favorites(w, cx))
+            .unwrap();
+        picker.update(cx, |list, cx| list.test_pick_preset(&id, cx));
+        cx.run_until_parked();
+        window
+            .update(cx, |c, _, _| {
+                assert_eq!(c.model.as_deref(), Some("hermes:route:model"));
+                assert_eq!(c.settings.effort.as_deref(), Some("high"));
+                assert_eq!(
+                    c.settings
+                        .model_settings
+                        .get("paseo.flag")
+                        .map(String::as_str),
+                    Some("true")
+                );
+                let saved = locked(&c.store)
+                    .unwrap()
+                    .agent_settings(c.summary.id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.model.as_deref(), Some("hermes:route:model"));
+                assert_eq!(saved.effort.as_deref(), Some("high"));
+                assert_eq!(
+                    saved.model_settings.get("paseo.flag").map(String::as_str),
+                    Some("true")
+                );
+                c.busy = true;
+                c.settings.effort = None;
+            })
+            .unwrap();
+        let picker = window
+            .update(cx, |c, w, cx| c.test_model_favorites(w, cx))
+            .unwrap();
+        picker.update(cx, |list, cx| list.test_pick_preset(&id, cx));
+        cx.run_until_parked();
+        window
+            .update(cx, |c, _, _| {
+                assert!(c.settings.effort.is_none());
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn paseo_model_and_native_preset_choices_save_exact_bundle_and_hide_access(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let window = conversation(cx);
+        window
+            .update(cx, |c, _, cx| {
+                // Isolated local fixture storage; no Connections/socket/provider use.
+                c.summary.cwd = "remote://paseo-fixture/fixture".into();
+                c.summary.provider = "hermes".into();
+                c.remote_state.capabilities.insert("paseo.configure".into());
+                c.catalog = vec![Model {
+                    id: "hermes:route:model".into(),
+                    name: "Friendly".into(),
+                    efforts: vec!["high".into()],
+                    ..Default::default()
+                }];
+                c.model = Some("hermes:route:model".into());
+                c.settings.effort = Some("high".into());
+                c.settings
+                    .model_settings
+                    .insert("paseo.flag".into(), "true".into());
+                c.menu_choice("save-agent-preset", cx);
+                let preset = cx
+                    .global::<crate::settings::Preferences>()
+                    .agent_presets
+                    .last()
+                    .unwrap()
+                    .clone();
+                assert_eq!(preset.model, "route:model");
+                c.settings.effort = None;
+                c.settings.model_settings.clear();
+                c.menu_choice(&format!("agent-preset:{}", preset.id), cx);
+                assert_eq!(c.model.as_deref(), Some("hermes:route:model"));
+                assert_eq!(c.settings.effort.as_deref(), Some("high"));
+                assert_eq!(
+                    c.settings
+                        .model_settings
+                        .get("paseo.flag")
+                        .map(String::as_str),
+                    Some("true")
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("composer-access").is_none());
+        assert!(visual.debug_bounds("composer-model").is_some());
+    }
     #[gpui::test]
     fn combined_picker_paints_effort_and_beside_mode_moves_it_to_its_own_control(
         cx: &mut TestAppContext,
@@ -4472,6 +4828,100 @@ mod menu_tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn preset_menu_keyboard_saves_complete_bundle_and_rejects_unsupported_effort(
+        cx: &mut TestAppContext,
+    ) {
+        let window = conversation(cx);
+        window
+            .update(cx, |c, _, cx| {
+                cx.set_global(crate::settings::presets::tests::source_preferences());
+                c.catalog = vec![Model {
+                    id: "claude-opus-5-5".into(),
+                    name: "Claude Opus 5.5".into(),
+                    efforts: vec!["xhigh".into()],
+                    ..Default::default()
+                }];
+                c.settings.fast = true;
+                c.settings.service_tier = Some("fast".into());
+                c.settings.effort = Some("low".into());
+                c.settings.plan = true;
+            })
+            .unwrap();
+        open(window, ComposerMenu::Model, cx);
+        // Seven ordered presets occupy the first seven selectable rows.
+        cx.simulate_keystrokes(window.into(), "down down down down enter");
+        cx.run_until_parked();
+        window
+            .update(cx, |c, _, cx| {
+                assert!(c.menu.is_none());
+                assert_eq!(c.model.as_deref(), Some("claude-opus-5-5"));
+                let saved = locked(&c.store)
+                    .unwrap()
+                    .agent_settings(c.summary.id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.model.as_deref(), Some("claude-opus-5-5"));
+                assert_eq!(saved.access, AccessMode::FullAccess);
+                assert_eq!(saved.effort.as_deref(), Some("xhigh"));
+                assert!(!saved.fast && !saved.plan && saved.service_tier.is_none());
+                let revision = c.settings.revision;
+                c.menu_choice("agent-preset:hermes-gpt-6", cx);
+                assert_eq!(c.settings.revision, revision);
+                assert_eq!(c.summary.provider, "claude");
+                c.busy = true;
+                c.menu_choice("agent-preset:omp-gemini", cx);
+                assert_eq!(c.settings.revision, revision);
+                c.busy = false;
+                c.menu_choice("agent-preset:omp-gemini", cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |c, _, cx| {
+                let store = locked(&c.store).unwrap();
+                let saved = store.agent_settings(c.summary.id).unwrap().unwrap();
+                assert_eq!(
+                    store
+                        .sessions()
+                        .unwrap()
+                        .into_iter()
+                        .find(|session| session.id == c.summary.id)
+                        .unwrap()
+                        .provider,
+                    "omp"
+                );
+                assert_eq!(
+                    saved.model.as_deref(),
+                    Some("cpa-gemini/gemini-3.8-flash-high")
+                );
+                assert_eq!(saved.access, AccessMode::FullAccess);
+                assert!(saved.effort.is_none() && saved.service_tier.is_none() && !saved.fast);
+                drop(store);
+                c.summary.provider = "codex".into();
+                c.catalog = vec![Model {
+                    id: "gpt-6.1-sol".into(),
+                    efforts: vec!["high".into()],
+                    ..Default::default()
+                }];
+                c.menu_choice("agent-preset:codex-gpt-6", cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |c, _, _| {
+                let saved = locked(&c.store)
+                    .unwrap()
+                    .agent_settings(c.summary.id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.service_tier.as_deref(), Some("default"));
+                assert_eq!(saved.effort.as_deref(), Some("high"));
+                assert!(!saved.fast);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

@@ -149,6 +149,9 @@ fn string(params: &Value, key: &str) -> Option<String> {
 
 impl Shell {
     pub(super) fn init_mobile_host(&mut self, cx: &mut Context<Self>) {
+        if crate::paseo_host::active() {
+            return;
+        }
         // GPUI's deterministic executor cannot be woken by the link's threads.
         if cx.is_test() {
             return;
@@ -1217,6 +1220,10 @@ impl Shell {
             Ok(prepared) => prepared,
             Err(error) => return finish(self, request, Err(error)),
         };
+        let preset = self
+            .workspace
+            .preferences
+            .new_chat_preset(kind.id(), model.as_deref());
         let effort = crate::conversation::preferred_effort(kind.id(), cx);
         let mut chosen_settings = model_settings(&params);
         let stage = self.stage_mobile_attachments(&params, cx);
@@ -1242,7 +1249,14 @@ impl Shell {
             );
             settings.access = access;
             settings.account = account;
-            if let Some(effort) = chosen_settings.remove("effort").or(effort) {
+            if let Some(effort) = effort {
+                settings.effort = Some(effort);
+            }
+            if let Some(preset) = preset {
+                preset.apply(&mut settings)?;
+                settings.access = access;
+            }
+            if let Some(effort) = chosen_settings.remove("effort") {
                 settings.effort = Some(effort);
             }
             if let Some(fast) = chosen_settings.remove("fast") {

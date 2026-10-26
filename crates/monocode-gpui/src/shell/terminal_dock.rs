@@ -181,7 +181,8 @@ impl Shell {
     pub(super) fn terminal_in_panel(&self, cx: &App) -> bool {
         self.workspace.preferences.terminal_in_panel
             && !self.workspace.classic_layout
-            && !self.workspace.project.starts_with("remote://")
+            && (!self.workspace.project.starts_with("remote://")
+                || self.allowed_terminal_cwd(cx).is_ok())
             && !self.mono_active(cx)
             && self.git.read(cx).available()
     }
@@ -205,7 +206,9 @@ impl Shell {
         {
             return;
         }
-        let cwd = self.terminal_cwd(cx);
+        let Ok(cwd) = self.allowed_terminal_cwd(cx) else {
+            return;
+        };
         let dock = self.workspace.docks.entry(project.clone()).or_default();
         dock.add(cwd.clone());
         // The dock stays shut until the terminal moves back out of the panel.
@@ -311,8 +314,8 @@ impl Shell {
             .get(&self.workspace.project)
             .map_or(0, |d| d.terminals.len());
         vec![
-            MenuAction::new("close", "Close").into(),
-            MenuAction::new("close-others", "Close Others")
+            MenuAction::new("close", crate::i18n::t("Close")).into(),
+            MenuAction::new("close-others", crate::i18n::t("Close Others"))
                 .disabled(count < 2 || ix >= count)
                 .into(),
         ]
@@ -897,7 +900,11 @@ impl Shell {
     /// UsageFooter's right side: the running-terminal chip, else the
     /// Terminal button.
     pub(super) fn terminal_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.app_view_open() || self.workspace.project.is_empty() {
+        if self.app_view_open()
+            || self.workspace.project.is_empty()
+            || (crate::paseo_host::project_ui(&self.workspace.preferences)
+                && self.allowed_terminal_cwd(cx).is_err())
+        {
             self.live_mark = None;
             return None;
         }
@@ -965,7 +972,7 @@ impl Shell {
                                 }
                             })
                             .child(icon("terminal", 14.))
-                            .child("Terminal")
+                            .child(crate::i18n::t("Terminal"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                             ),

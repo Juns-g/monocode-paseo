@@ -154,6 +154,44 @@ mod tests {
     }
 
     #[test]
+    fn prototype_preferences_and_pending_wire_import_unchanged_in_isolated_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let prototype = dir.path().join("Monocode Paseo Prototype");
+        std::fs::create_dir(&prototype).unwrap();
+        let official = dir.path().join("Monocode");
+        let path = prototype.join("monocode.db");
+        drop(Store::open_monocode(&path).unwrap());
+        std::fs::remove_file(prototype.join("monocode.db.gpui.sqlite3")).unwrap();
+        let workspace = serde_json::json!({"preferences":{
+            "agent_presets":[{"id":"saved","name":"Synthetic","provider":"hermes","model":"exact","modeId":"dont_ask"}],
+            "paseo_project_selection":{"defaultNames":["日常","Bots"],"added":["remote://fixture/added"]},
+            "future":{"keep":true}},"tabs":[1]}).to_string();
+        let wire = r#"{"outbox":[{"type":"send","commandId":"unknown","modelSettings":{"z":"last","a":"first"}}]}"#;
+        let values = BTreeMap::from([
+            ("workspace", workspace.as_str()),
+            ("remote-sessions.v1", wire),
+        ]);
+        let legacy = serde_json::to_vec(&values).unwrap();
+        let old = prototype.join("monocode.db.gpui.json");
+        std::fs::write(&old, &legacy).unwrap();
+        let store = Store::open_monocode(&path).unwrap();
+        assert_eq!(store.setting("workspace").unwrap().unwrap(), workspace);
+        assert_eq!(store.setting("remote-sessions.v1").unwrap().unwrap(), wire);
+        assert!(prototype.join("monocode.db.gpui.sqlite3").exists());
+        store.save_setting("only-new", "current").unwrap();
+        drop(store);
+        let store = Store::open_monocode(&path).unwrap();
+        assert_eq!(store.setting("workspace").unwrap().unwrap(), workspace);
+        assert_eq!(store.setting("remote-sessions.v1").unwrap().unwrap(), wire);
+        assert_eq!(
+            store.setting("only-new").unwrap().as_deref(),
+            Some("current")
+        );
+        assert_eq!(std::fs::read(&old).unwrap(), legacy);
+        assert!(!official.exists());
+    }
+
+    #[test]
     fn small_updates_do_not_rewrite_large_cached_results_and_unchanged_saves_do_not_write() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_monocode(&dir.path().join("monocode.db")).unwrap();

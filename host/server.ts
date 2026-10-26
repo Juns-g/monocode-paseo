@@ -135,6 +135,7 @@ export function createHostServer(
   engine: HostEngine,
   providers: RemoteProvider[],
   lifecycle?: (request: IncomingMessage, response: ServerResponse) => void,
+  backend?: { request(method: string, params: Record<string, unknown>): Promise<{ result: unknown } | null> },
 ) {
   const catalogs = new Map<
     string,
@@ -252,7 +253,10 @@ export function createHostServer(
             ? (input.params as Record<string, unknown>)
             : {};
         let result: unknown;
-        switch (input.method) {
+        const adapted = backend ? await backend.request(String(input.method), params) : null;
+        if (adapted) {
+          result = adapted.result;
+        } else switch (input.method) {
           case "environment.describe":
             result = {
               protocolVersion: HOST_PROTOCOL_VERSION,

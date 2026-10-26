@@ -2037,6 +2037,48 @@ mod tests {
         assert_eq!(row["params"]["approvalsReviewer"], "user");
     }
     #[test]
+    fn preset_full_access_high_uses_normal_codex_tier_on_start_resume_and_turn() {
+        for resume in [false, true] {
+            let mut p = protocol(Kind::Codex);
+            p.request.model = Some("gpt-6.1-sol".into());
+            p.request.settings.access = AccessMode::FullAccess;
+            p.request.settings.effort = Some("high".into());
+            p.request.settings.service_tier = Some("default".into());
+            if resume {
+                p.request.provider_id = Some("thread".into());
+            }
+            let mut out = Vec::new();
+            p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+            let rows: Vec<Value> = String::from_utf8_lossy(&out)
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let start = &rows[1];
+            assert_eq!(
+                start["method"],
+                if resume {
+                    "thread/resume"
+                } else {
+                    "thread/start"
+                }
+            );
+            assert_eq!(start["params"]["sandbox"], "danger-full-access");
+            assert!(start["params"].get("serviceTier").is_none());
+            out.clear();
+            p.frame(
+                json!({"id":2,"result":{"thread":{"id":"thread"}}}),
+                &mut out,
+            )
+            .unwrap();
+            let turn: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(turn["params"]["sandboxPolicy"]["type"], "dangerFullAccess");
+            assert_eq!(turn["params"]["effort"], "high");
+            assert!(turn["params"].get("serviceTier").is_none());
+        }
+        assert_eq!(AccessMode::FullAccess.claude(), "bypassPermissions");
+    }
+
+    #[test]
     fn codex_tool_deltas_settle_to_one_completed_snapshot() {
         let mut p = protocol(Kind::Codex);
         let mut out = Vec::new();

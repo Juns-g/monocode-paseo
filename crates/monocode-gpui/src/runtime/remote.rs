@@ -11,6 +11,87 @@ use std::{
     io::Read,
 };
 
+/// Network runs without Store ownership; an unchanged directory never acquires
+/// the bulk-import lock. Contended refreshes yield to explicit UI/send operations.
+pub(crate) struct ProjectIndex {
+    pub(crate) project: String,
+    pub(crate) presentation: HashMap<i64, serde_json::Value>,
+    pub(crate) started_by: HashMap<i64, i64>,
+    pub(crate) summaries: Vec<(Session, bool, bool, bool)>,
+    pub(crate) retained: HashSet<i64>,
+    pub(crate) revision: Option<String>,
+    pub(crate) lock_ms: f64,
+    pub(crate) structural_revision: Option<String>,
+}
+pub(crate) fn refresh_project_index(
+    store: &Database,
+    client: &monocode_core::remote::Connections,
+    project_key: &str,
+    revision: Option<&str>,
+    conditional: bool,
+) -> Result<Option<ProjectIndex>, String> {
+    let project = {
+        let guard = match store.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("Native session store unavailable".into()),
+        };
+        guard
+            .remote_projects()?
+            .into_values()
+            .find(|p| p.key == project_key)
+            .ok_or("Remote project identity is missing")?
+    };
+    let machine = client.machine_for_environment(&project.environment_id)?;
+    let mut params = json!({"projectId":project.project_id});
+    if conditional {
+        params["withRevision"] = json!(true);
+        params["revision"] = json!(revision);
+    }
+    let response = client.request(&machine.id, "sessions.list", params)?;
+    if response["unchanged"] == true {
+        if !conditional || revision.is_none() || response["revision"].as_str() != revision {
+            return Err("Invalid unchanged project revision".into());
+        }
+        return Ok(None);
+    }
+    let values = response
+        .as_array()
+        .or_else(|| response["values"].as_array())
+        .ok_or("Invalid remote session list")?;
+    let guard = match store.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(_) => return Err("Native session store unavailable".into()),
+    };
+    let started = std::time::Instant::now();
+    let registered = guard.sync_remote_summaries(&project, values)?;
+    let started_by = guard.started_links()?;
+    let presentation=registered.iter().zip(values).map(|(r,v)|(r.summary.id,serde_json::json!({"bucket":v["paseoBucket"],"enteredAt":v["paseoStatusEnteredAt"],"createdAt":v["createdAt"]}))).collect();
+    let summaries = registered
+        .into_iter()
+        .zip(values)
+        .map(|(r, v)| (r.summary, r.running, r.needs_input, v["draft"] == true))
+        .collect();
+    let retained = guard
+        .sessions()?
+        .into_iter()
+        .filter(|s| s.cwd == project.key)
+        .map(|s| s.id)
+        .collect();
+    let lock_ms = started.elapsed().as_secs_f64() * 1000.;
+    Ok(Some(ProjectIndex {
+        project: project.key,
+        presentation,
+        started_by,
+        summaries,
+        retained,
+        revision: response["revision"].as_str().map(str::to_owned),
+        lock_ms,
+        structural_revision: response["structuralRevision"].as_str().map(str::to_owned),
+    }))
+}
+
 fn update(status: impl Into<String>, finished: bool) -> Update {
     Update {
         worktree_cwd: None,
@@ -569,6 +650,12 @@ pub(crate) fn run_with_client(
                 create["model"] = json!(host_model(&summary.provider, settings.model.as_deref())?);
                 create["modelSettings"] = json!(model_settings(&summary.provider, &settings));
                 create["runtimeMode"] = json!(settings.access.id());
+                if binding.project.project_id.starts_with("paseo:") {
+                    create["firstAgentContext"] = json!({"prompt":prompt,"attachments":[]});
+                    if let Some(workspace) = &settings.remote_workspace_id {
+                        create["workspaceId"] = json!(workspace);
+                    }
+                }
                 if let Some(path) = &settings.worktree_cwd {
                     let remote = monocode_core::remote::parse_remote_path(path)
                         .ok_or("Invalid remote worktree")?;
@@ -701,17 +788,27 @@ pub(crate) fn run_with_client(
             seen_questions = question_ids;
             // Keep the selected desktop handle when creation's receipt binds a
             // new host session. Metadata refreshes find this binding by host ID.
-            binding.running = running;
-            binding.needs_input = !seen_approvals.is_empty() || !seen_questions.is_empty();
-            binding.summary.title = snapshot["session"]["title"]
+            let needs_input = !seen_approvals.is_empty() || !seen_questions.is_empty();
+            let title = snapshot["session"]["title"]
                 .as_str()
                 .unwrap_or(&binding.summary.title)
-                .into();
-            binding.summary.provider_id = next.provider_id.clone();
-            binding.summary.updated_at = snapshot["updatedAt"]
+                .to_owned();
+            let updated_at = snapshot["updatedAt"]
                 .as_u64()
                 .unwrap_or(binding.summary.updated_at);
-            journal(&store, &binding)?;
+            let metadata_changed = binding.running != running
+                || binding.needs_input != needs_input
+                || binding.summary.title != title
+                || binding.summary.provider_id != next.provider_id
+                || binding.summary.updated_at != updated_at;
+            binding.running = running;
+            binding.needs_input = needs_input;
+            binding.summary.title = title;
+            binding.summary.provider_id = next.provider_id.clone();
+            binding.summary.updated_at = updated_at;
+            if metadata_changed {
+                journal(&store, &binding)?;
+            }
             tx.send_blocking(next).map_err(|_| "Window closed")?;
             last_revision = revision;
             if !running {
@@ -791,3 +888,5 @@ pub(crate) fn run_with_client(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::Host as TestHost;

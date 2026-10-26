@@ -36,7 +36,7 @@ pub(super) fn page_header(title: &'static str, description: &'static str) -> Div
                 .line_height(px(25.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(content(1.))
-                .child(title),
+                .child(crate::i18n::t(title)),
         )
         .child(
             div()
@@ -45,7 +45,7 @@ pub(super) fn page_header(title: &'static str, description: &'static str) -> Div
                 .text_size(px(13.))
                 .line_height(px(21.125))
                 .text_color(content(0.45))
-                .child(description),
+                .child(crate::i18n::t(description)),
         )
 }
 
@@ -447,7 +447,7 @@ impl SettingsView {
                                 .hover(|s| s.text_color(content(1.)))
                         }
                     })
-                    .child(text.to_owned())
+                    .child(crate::i18n::t(text))
                     .on_click(cx.listener(move |this, _, _, cx| change(this, option, cx)))
             }))
             .into_any_element()

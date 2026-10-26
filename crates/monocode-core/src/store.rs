@@ -52,6 +52,7 @@ pub struct Store {
     conn: Connection,
     path: std::path::PathBuf,
     shared: Option<shared::Shared>,
+    remote_status: std::cell::RefCell<remote::StatusCache>,
 }
 impl Store {
     pub fn reset_provider_id_if(&self, id: i64, expected: Option<&str>) -> Result<(), String> {
@@ -177,6 +178,7 @@ impl Store {
             conn,
             path: path.into(),
             shared: None,
+            remote_status: Default::default(),
         })
     }
     /// The selected desktop or isolated-development database.
@@ -208,9 +210,38 @@ impl Store {
             return self.shared_save_setting(key, value);
         }
 
-        self.conn.execute("INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])
+        self.conn.execute("INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE native_settings.value IS NOT excluded.value", params![key,value])
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+    /// Commit related sidecar keys in one transaction.
+    fn patch_settings(&self, values: &[(String, String)], remove: &[String]) -> Result<(), String> {
+        if self.shared.is_some() {
+            return self.shared_patch_settings(values, remove);
+        }
+        let changed = values
+            .iter()
+            .filter_map(|(key, value)| match self.setting(key) {
+                Ok(old) if old.as_ref() == Some(value) => None,
+                result => Some(result.map(|_| (key, value))),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if changed.is_empty() && remove.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        for (key, value) in changed {
+            transaction.execute("INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map_err(|e|e.to_string())?;
+        }
+        for key in remove {
+            transaction
+                .execute("DELETE FROM native_settings WHERE key=?1", [key])
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())
     }
     pub fn ui_state(&self) -> Result<Option<String>, String> {
         if self.shared.is_some() {
@@ -367,7 +398,7 @@ impl Store {
         if id < 0 || self.remote_session(id)?.is_some() {
             return self.save_setting(
                 &format!("remote-agent:{id}"),
-                &serde_json::to_string(settings).map_err(|e| e.to_string())?,
+                &remote::encode_settings(settings)?,
             );
         }
         if self.shared.is_some() {
@@ -456,7 +487,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
     }
-    /// Each session another one started through the app CLI, and its caller.
+    /// Each local or host-owned session another session started, and its caller.
     pub fn started_links(&self) -> Result<std::collections::HashMap<i64, i64>, String> {
         let mut links = if self.shared.is_some() {
             self.shared_started_links()?
@@ -469,6 +500,7 @@ impl Store {
             .map(|(child, value)| Ok((child, value.trim().parse().map_err(|_| "Invalid caller")?)))
             .collect::<Result<_, String>>()?;
         links.extend(saved);
+        links.extend(self.remote_started_links()?);
         Ok(links)
     }
     pub fn save_started_link(&self, child: i64, caller: i64) -> Result<(), String> {
@@ -584,6 +616,7 @@ impl Store {
             conn,
             path: self.path.clone(),
             shared: None,
+            remote_status: Default::default(),
         }))
     }
     /// Stream saved message bodies without loading conversations into the UI.

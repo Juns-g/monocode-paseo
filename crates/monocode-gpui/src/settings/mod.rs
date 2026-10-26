@@ -11,6 +11,7 @@ mod notification_preferences;
 mod pages;
 mod palettes;
 mod preferences;
+pub(crate) mod presets;
 mod skill_document;
 pub(crate) use palettes::palette;
 pub(crate) mod widgets;
@@ -19,6 +20,7 @@ pub(crate) use keymap::apply as apply_keybindings;
 pub(crate) use model::Section;
 pub(crate) use pages::command_shortcut;
 pub(crate) use preferences::{ModelChoice, Preferences, UI_SCALE_PERCENTS};
+pub(crate) use presets::{AgentPreset, ConfiguredAgent};
 
 use crate::{
     input::{self, Input},
@@ -520,6 +522,7 @@ impl SettingsView {
     /// Change preferences and tell the shell to keep them.
     fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Preferences)) {
         change(&mut self.prefs);
+        crate::i18n::configure(&self.prefs);
         self.notification_deadline(cx);
         cx.emit(SettingsEvent::Changed(Box::new(self.prefs.clone())));
         cx.notify();
@@ -605,7 +608,7 @@ impl SettingsView {
                         div()
                             .flex_shrink_0()
                             .text_color(content(0.45))
-                            .child("Settings"),
+                            .child(crate::i18n::t("Settings")),
                     )
                     .child(div().flex_shrink_0().text_color(content(0.25)).child("/"))
                     .child(
@@ -613,7 +616,7 @@ impl SettingsView {
                             .min_w_0()
                             .truncate()
                             .text_color(content(1.))
-                            .child(self.section.label()),
+                            .child(crate::i18n::t(self.section.label())),
                     ),
             )
             .child(

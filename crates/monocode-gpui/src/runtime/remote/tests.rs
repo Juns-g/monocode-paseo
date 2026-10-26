@@ -28,15 +28,21 @@ impl Drop for Directory {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-struct Host {
-    client: Arc<Connections>,
+pub(crate) struct Host {
+    pub(crate) client: Arc<Connections>,
     machine: Machine,
     stopped: Arc<AtomicBool>,
     server: Option<thread::JoinHandle<()>>,
     _directory: Directory,
 }
 impl Host {
-    fn new(mut handler: impl FnMut(Value) -> Option<Value> + Send + 'static) -> Self {
+    fn new(handler: impl FnMut(Value) -> Option<Value> + Send + 'static) -> Self {
+        Self::with_capabilities(Vec::new(), handler)
+    }
+    pub(crate) fn with_capabilities(
+        capabilities: Vec<&'static str>,
+        mut handler: impl FnMut(Value) -> Option<Value> + Send + 'static,
+    ) -> Self {
         let directory = Directory::new();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -83,7 +89,7 @@ impl Host {
                             .contains(&json!("devin"))
                     );
                     Some(
-                        json!({"protocolVersion":1,"environmentId":"env","name":"Fixture","providers":["codex"]}),
+                        json!({"protocolVersion":1,"environmentId":"env","name":"Fixture","providers":["codex"],"capabilities":capabilities}),
                     )
                 } else {
                     assert_eq!(payload["environmentId"], "env");
@@ -795,4 +801,53 @@ fn host_context_and_latest_turn_metrics_use_actual_session_fields() {
     let (context, metrics) = accounting(&value);
     assert_eq!(context.unwrap().window, None);
     assert!(metrics.is_none());
+}
+
+#[test]
+fn paseo_draft_journals_naming_context_and_explicit_workspace_without_sending_twice() {
+    for selected in [None, Some("chosen-workspace")] {
+        let dir = Directory::new();
+        let store = dir.store();
+        let mut binding = binding(&store);
+        binding.project.project_id = "paseo:/host/repo".into();
+        journal(&store, &binding).unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = commands.clone();
+        let host = Host::new(move |request| {
+            if request["method"] == "commands.dispatch" {
+                let command = request["params"].clone();
+                recorded.lock().unwrap().push(command.clone());
+                Some(receipt(&command))
+            } else {
+                let mut value = snapshot("idle", 2);
+                value["projectId"] = json!("paseo:/host/repo");
+                Some(json!({"kind":"snapshot","value":value}))
+            }
+        });
+        let settings: Settings = serde_json::from_value(json!({
+            "model":"codex:fixture-model", "remote_workspace_id":selected
+        })).unwrap();
+        locked(&store).unwrap().save_agent_settings(binding.summary.id, &settings).unwrap();
+        let saved = locked(&store).unwrap().agent_settings(binding.summary.id).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&saved).unwrap()["remote_workspace_id"], json!(selected));
+        if selected.is_none() {
+            assert!(serde_json::to_value(&saved).unwrap().get("remote_workspace_id").is_none());
+        }
+        let (tx, rx) = async_channel::unbounded();
+        let (_controls_tx, controls) = std::sync::mpsc::channel();
+        run_with_client(host.client.clone(), binding.summary.clone(), "Name this new task".into(),
+            saved, controls, store.clone(), Arc::new(AtomicBool::new(false)), tx);
+        let result = receive(&rx);
+        assert!(result.finished, "{}", result.status);
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert_eq!(commands[0]["type"], "create");
+        assert_eq!(commands[0]["workspaceId"], json!(selected));
+        assert_eq!(commands[0]["firstAgentContext"], json!({"prompt":"Name this new task","attachments":[]}));
+        assert!(commands[0].get("initialPrompt").is_none());
+        assert_eq!(commands[1]["type"], "send");
+        assert_eq!(commands[1]["sessionId"], "host-session");
+        assert_eq!(commands[1]["text"], "Name this new task");
+        assert_ne!(commands[0]["commandId"], commands[1]["commandId"]);
+    }
 }
