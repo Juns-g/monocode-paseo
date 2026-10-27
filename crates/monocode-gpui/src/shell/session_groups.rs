@@ -375,10 +375,13 @@ impl Shell {
             self.selected_sessions.clear();
         }
     }
-    pub(super) fn select_sidebar_session(
+    /// A click on a session row. With previews on, a single click opens the
+    /// conversation as the preview tab and a double click keeps its tab.
+    pub(super) fn select_sidebar_session_clicked(
         &mut self,
         id: i64,
         modifiers: gpui::Modifiers,
+        click_count: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -415,7 +418,12 @@ impl Shell {
         } else {
             self.selected_sessions.clear();
             self.selection_anchor = Some(id);
-            self.open(id, window, cx);
+            if click_count < 2 {
+                self.open_previewing(id, window, cx);
+            } else {
+                self.open(id, window, cx);
+                self.pin_session_tab(id, cx);
+            }
         }
         if modifiers.shift || additive {
             window.focus(&self.sidebar_focus, cx);
@@ -2097,21 +2105,23 @@ mod tests {
                         assert!(!action.disabled, "{} must be usable", action.label);
                     }
                 }
-                shell.select_sidebar_session(
+                shell.select_sidebar_session_clicked(
                     a,
                     gpui::Modifiers {
                         platform: true,
                         ..Default::default()
                     },
+                    1,
                     w,
                     cx,
                 );
-                shell.select_sidebar_session(
+                shell.select_sidebar_session_clicked(
                     b,
                     gpui::Modifiers {
                         shift: true,
                         ..Default::default()
                     },
+                    1,
                     w,
                     cx,
                 );

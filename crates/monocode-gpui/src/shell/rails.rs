@@ -579,7 +579,13 @@ impl Shell {
                     if std::mem::take(&mut this.skip_session_click) {
                         return;
                     }
-                    this.select_sidebar_session(id, event.modifiers(), window, cx);
+                    this.select_sidebar_session_clicked(
+                        id,
+                        event.modifiers(),
+                        event.click_count(),
+                        window,
+                        cx,
+                    );
                 }),
             )
             .on_mouse_down(

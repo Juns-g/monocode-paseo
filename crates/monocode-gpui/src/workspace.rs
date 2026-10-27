@@ -69,6 +69,9 @@ pub(crate) struct Workspace {
     pub window: crate::window_state::WindowState,
     pub tabs: Vec<i64>,
     pub title_order: Vec<TitleTab>,
+    /// The tab (by key) a sidebar click opened as a preview: shown in italics
+    /// and replaced by the next preview until it is pinned or restructured.
+    pub preview_tab: Option<i64>,
     pub scope_focus: HashMap<String, TitleTab>,
     /// Sidebar narrowing belongs to this run. Reopen on the full project,
     /// while saved conversations retain their own execution directories.
@@ -293,6 +296,7 @@ impl Default for Workspace {
             window: Default::default(),
             tabs: Vec::new(),
             title_order: Vec::new(),
+            preview_tab: None,
             scope_focus: HashMap::new(),
             worktree_focus: HashMap::new(),
             tab_workspaces: HashMap::new(),
@@ -467,6 +471,9 @@ impl Workspace {
                 layout.first_leaf()
             };
             state.tabs.push(key);
+            if state.preview_tab == Some(tab) {
+                state.preview_tab = (!layout.is_split()).then_some(key);
+            }
             for entry in state
                 .title_order
                 .iter_mut()
@@ -485,6 +492,9 @@ impl Workspace {
         }
         state.settle_mono_panes();
         state.normalize_title_order();
+        if state.preview_tab.is_some_and(|tab| !state.plain_tab(tab)) {
+            state.preview_tab = None;
+        }
         if state
             .desktop_project_preferences
             .as_ref()
@@ -618,11 +628,54 @@ impl Workspace {
         }
         self.active = Some(id);
     }
+    /// Open a session as the preview tab. A session that already has a tab
+    /// just activates it, keeping that tab's state. Otherwise a lone preview
+    /// tab is replaced in place; the replaced key is returned.
+    pub fn open_preview(&mut self, id: i64) -> Option<i64> {
+        if self.tab_of(id).is_some() {
+            self.open(id);
+            return None;
+        }
+        let old = self.preview_tab.filter(|tab| self.plain_tab(*tab));
+        let Some(old) = old else {
+            self.open(id);
+            self.preview_tab = Some(id);
+            return None;
+        };
+        let ix = self.tabs.iter().position(|t| *t == old).unwrap_or(0);
+        self.tabs[ix] = id;
+        self.tab_workspaces.remove(&old);
+        for entry in self
+            .title_order
+            .iter_mut()
+            .chain(self.scope_focus.values_mut())
+        {
+            if *entry == TitleTab::Session(old) {
+                *entry = TitleTab::Session(id);
+            }
+        }
+        self.project_focus.retain(|_, focus| *focus != old);
+        self.preview_tab = Some(id);
+        self.active = Some(id);
+        Some(old)
+    }
+    /// Make a preview tab permanent. True when `tab` was the preview.
+    pub fn pin_tab(&mut self, tab: i64) -> bool {
+        self.preview_tab.take_if(|preview| *preview == tab).is_some()
+    }
+    /// A tab holding one conversation and nothing else.
+    fn plain_tab(&self, tab: i64) -> bool {
+        self.tabs.contains(&tab)
+            && !self.layouts.contains_key(&tab)
+            && !self.mono_panes.contains_key(&tab)
+            && !self.reviews.get(&tab).is_some_and(|r| !r.tabs.is_empty())
+    }
     /// Close the whole title tab holding `id`; its sessions keep running.
     pub fn close(&mut self, id: i64) {
         let Some(tab) = self.tab_of(id) else {
             return;
         };
+        self.pin_tab(tab);
         let ix = self.tabs.iter().position(|t| *t == tab).unwrap_or(0);
         let layout = self.layout(tab);
         self.tabs.remove(ix);
@@ -696,6 +749,9 @@ impl Workspace {
                 .unwrap_or(leaves[0])
         };
         self.tabs[ix] = key;
+        if self.preview_tab == Some(tab) {
+            self.preview_tab = (!layout.is_split()).then_some(key);
+        }
         if key != tab
             && let Some(scope) = self.tab_workspaces.remove(&tab)
         {
@@ -799,6 +855,7 @@ impl Workspace {
         }
         let incoming = self.layout(source);
         let focus = self.tab_focus(source);
+        self.pin_tab(source);
         self.tabs.retain(|t| *t != source);
         self.tab_workspaces.remove(&source);
         self.title_order
@@ -856,6 +913,7 @@ impl Workspace {
                 Some(tab) if self.layout(tab).is_split() => continue,
                 Some(tab) => {
                     let mono = self.mono_panes[&pane].clone();
+                    self.pin_tab(tab);
                     self.tabs.retain(|t| *t != tab);
                     self.tab_workspaces.remove(&tab);
                     self.layouts.remove(&tab);
@@ -1167,6 +1225,95 @@ mod tests {
         assert_eq!(s.active, None);
         s.open(1);
         assert_eq!(s.tabs, vec![1]);
+    }
+    #[test]
+    fn a_preview_tab_is_replaced_in_place_until_it_is_pinned() {
+        let mut s = Workspace::default();
+        s.open(1);
+        s.open(2);
+        assert_eq!(s.open_preview(3), None);
+        assert_eq!((s.tabs.clone(), s.preview_tab), (vec![1, 2, 3], Some(3)));
+        s.open(2);
+        s.tab_workspaces.insert(3, "/scope".into());
+        s.project_focus.insert("/p".into(), 3);
+        s.scope_focus.insert("/p".into(), TitleTab::Session(3));
+        // The next preview takes the old one's slot, key and focus records.
+        assert_eq!(s.open_preview(4), Some(3));
+        assert_eq!(s.tabs, [1, 2, 4]);
+        assert_eq!(
+            s.title_order,
+            [
+                TitleTab::Session(1),
+                TitleTab::Session(2),
+                TitleTab::Session(4)
+            ]
+        );
+        assert_eq!((s.active, s.preview_tab), (Some(4), Some(4)));
+        assert!(s.tab_workspaces.is_empty() && s.project_focus.is_empty());
+        assert_eq!(s.scope_focus["/p"], TitleTab::Session(4));
+        // A permanent tab stays permanent, and re-clicking the preview keeps it.
+        assert_eq!(s.open_preview(2), None);
+        assert_eq!((s.active, s.preview_tab), (Some(2), Some(4)));
+        assert_eq!(s.open_preview(4), None);
+        assert_eq!((s.tabs.len(), s.preview_tab), (3, Some(4)));
+        // Pinning makes the next preview a new tab.
+        assert!(s.pin_tab(4));
+        assert!(!s.pin_tab(4));
+        assert_eq!(s.open_preview(5), None);
+        assert_eq!((s.tabs.clone(), s.preview_tab), (vec![1, 2, 4, 5], Some(5)));
+        // Closing the preview forgets it.
+        s.close(5);
+        assert_eq!(s.preview_tab, None);
+        assert_eq!(s.open_preview(6), None);
+        assert_eq!(s.tabs, [1, 2, 4, 6]);
+    }
+    #[test]
+    fn splitting_or_adding_panes_pins_the_preview_tab() {
+        let mut s = Workspace::default();
+        s.open(1);
+        s.open_preview(2);
+        s.split(3, SplitDir::Right);
+        assert_eq!(s.preview_tab, None, "a split tab is structural");
+        s.open_preview(4);
+        s.open_preview(5);
+        assert_eq!(s.tabs, [1, 2, 5]);
+        assert_eq!(s.preview_tab, Some(5));
+        // Dropping the preview tab on another pane pins it away.
+        s.place_tab(5, 1, Edge::Bottom);
+        assert_eq!(s.preview_tab, None);
+        // A preview whose tab holds a review pane is never replaced.
+        s.open_preview(6);
+        s.reviews.insert(
+            6,
+            crate::review::ReviewState {
+                tabs: vec![crate::review::ReviewTab::File {
+                    cwd: "/p".into(),
+                    path: "a".into(),
+                }],
+                ..Default::default()
+            },
+        );
+        s.open_preview(7);
+        assert_eq!(s.tabs.last(), Some(&7));
+        assert!(s.tabs.contains(&6));
+    }
+    #[test]
+    fn the_preview_flag_round_trips_and_is_dropped_when_its_tab_is_not_plain() {
+        let mut s = Workspace::default();
+        s.open(1);
+        s.open_preview(2);
+        let json = serde_json::to_string(&s).unwrap();
+        let sessions = [(1, "/p".to_string()), (2, "/p".to_string())];
+        let restored = Workspace::restore(Some(&json), &sessions, "/p");
+        assert_eq!((restored.tabs.clone(), restored.preview_tab), (vec![1, 2], Some(2)));
+        // Snapshots from before preview tabs have none.
+        let mut value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        value.as_object_mut().unwrap().remove("preview_tab");
+        let old = Workspace::restore(Some(&value.to_string()), &sessions, "/p");
+        assert_eq!(old.preview_tab, None);
+        // A preview whose session vanished is forgotten.
+        let missing = Workspace::restore(Some(&json), &sessions[..1], "/p");
+        assert_eq!((missing.tabs, missing.preview_tab), (vec![1], None));
     }
     #[test]
     fn split_tabs_place_detach_and_close_panes_without_losing_sessions() {

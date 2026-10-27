@@ -19,6 +19,80 @@ impl Shell {
             view.update(cx, |view, cx| view.nudge_remote_observation(cx));
         }
     }
+    /// Paseo only: the host's state bucket restores the marks the RAM-only
+    /// `busy_sessions`/`unseen_finished` lose on restart. Attention and failure
+    /// both show as Done; they enter `unseen_finished` only on a bucket change
+    /// (or first sighting), so a later poll cannot undo the user clearing them.
+    /// Returns whether `unseen_finished` changed.
+    fn apply_remote_bucket(&mut self, id: i64, previous: Option<&str>, cx: &App) -> bool {
+        let Some(bucket) = self
+            .remote_details
+            .get(&id)
+            .and_then(|details| details["bucket"].as_str())
+        else {
+            return false;
+        };
+        if previous == Some(bucket) {
+            return false;
+        }
+        match bucket {
+            "attention" | "failed" => {
+                if !self.session_summaries.contains_key(&id) {
+                    return false;
+                }
+                let focused = !self.app_view_open()
+                    && self.workspace.active == Some(self.workspace.session_for_pane(id));
+                let archived = self.session_metadata(id, cx).summary.archived;
+                // A live busy view is authoritative over a stale index.
+                let live_busy = self.sessions.get(&id).is_some_and(|view| view.read(cx).busy);
+                !focused && !archived && !live_busy && self.unseen_finished.insert(id)
+            }
+            "done" if matches!(previous, Some("attention" | "failed")) => {
+                self.unseen_finished.remove(&id)
+            }
+            _ => false,
+        }
+    }
+    /// One polled row: bucket transitions first so the mark refresh sees them.
+    pub(super) fn apply_remote_row(
+        &mut self,
+        id: i64,
+        previous: Option<&str>,
+        running: bool,
+        waiting: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let unseen = self.apply_remote_bucket(id, previous, cx);
+        self.apply_remote_mark(id, running, waiting, cx);
+        if unseen {
+            self.refresh_session_mark(id, cx);
+        }
+    }
+    /// A focused Paseo attention row has been seen: acknowledge it on the host
+    /// and clear it locally, so a turn finishing under the user's eyes never
+    /// lands in Attention. The next poll replaces the optimistic bucket.
+    pub(super) fn remote_row_focused(&mut self, id: i64, cx: &mut Context<Self>) {
+        let id = self.workspace.session_for_pane(id);
+        if self.app_view_open()
+            || self.workspace.active != Some(id)
+            || self.remote_details.get(&id).and_then(|d| d["bucket"].as_str()) != Some("attention")
+        {
+            return;
+        }
+        let Some(view) = self.sessions.get(&id).cloned() else {
+            return;
+        };
+        if !view.update(cx, |view, cx| view.mark_remote_viewed(cx)) {
+            return;
+        }
+        if let Some(details) = self.remote_details.get_mut(&id) {
+            details["bucket"] = "done".into();
+        }
+        self.unseen_finished.remove(&id);
+        self.refresh_session_mark(id, cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
     pub(super) fn refresh_remote_projects(&mut self, cx: &mut Context<Self>) {
         if self.remote_refreshing || !self.workspace.project.starts_with("remote://") {
             return;
@@ -44,6 +118,14 @@ impl Shell {
                 this.remote_refreshing = false;
                 match result {
                     Ok(Some(index)) => {
+                        let previous: HashMap<i64, Option<String>> = index
+                            .presentation
+                            .keys()
+                            .map(|id| {
+                                let bucket = this.remote_details.get(id);
+                                (*id, bucket.and_then(|d| d["bucket"].as_str()).map(str::to_owned))
+                            })
+                            .collect();
                         this.remote_details.extend(index.presentation);
                         let project = index.project;
                         if let Some(revision) = index.revision {
@@ -107,7 +189,11 @@ impl Shell {
                                 });
                             }
                             this.session_summaries.insert(id, summary);
-                            this.apply_remote_mark(id, running, waiting, cx);
+                            let before = previous.get(&id).and_then(|b| b.as_deref());
+                            this.apply_remote_row(id, before, running, waiting, cx);
+                        }
+                        if let Some(active) = this.workspace.active {
+                            this.remote_row_focused(active, cx);
                         }
                         if this.workspace.project == project {
                             this.invalidate_chrome(cx);

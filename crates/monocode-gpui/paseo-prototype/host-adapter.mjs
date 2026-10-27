@@ -10,6 +10,7 @@ import {SyncTransfers} from '../../../host/sync-transfer.ts';
 
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
+const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume and never answer (its own wait is 60 s).
 export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','sessions.no-delete','sessions.list-revision',
   'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
@@ -122,6 +123,9 @@ export class PaseoHost {
     this.statuses=new Map();this.entries=new Map();this.projects=new Map();this.histories=new Map();this.numbers=new Map();
     this.numberPath=join(directory,'paseo-permission-ids.json');
     try{this.numbers=new Map(JSON.parse(readFileSync(this.numberPath,'utf8')));}catch(e){if(e.code!=='ENOENT')throw e;}
+    // Local overlay: agentId -> updatedAt (ms) of the attention episode the user already viewed. Paseo storage is never written.
+    this.seenPath=join(directory,'paseo-seen-attention.json');this.seen=new Map();this.clearing=new Map();this.clearTimeoutMs=CLEAR_ATTENTION_TIMEOUT_MS;
+    try{for(const [id,at] of JSON.parse(readFileSync(this.seenPath,'utf8')))if(typeof id==='string'&&Number.isFinite(at))this.seen.set(id,at);}catch{}
     this.transfers=new SyncTransfers();
     this.directoryAt=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
   }
@@ -136,6 +140,14 @@ export class PaseoHost {
   identity(){const observed=this.client.getLastServerInfoMessage()?.serverId;if(!this.connected||!observed||(this.serverId&&observed!==this.serverId))throw Error('Paseo disconnected or daemon identity changed');this.serverId??=observed;}
   control(agent){const c=new Controller(this.client,()=>{});c.connected=this.connected;c.selected=agent;c.selectedServer=this.serverId;c.invalidate=()=>{};return c;}
   number(agent,id){const key=JSON.stringify([agent,id]);if(!this.numbers.has(key)){this.numbers.set(key,this.numbers.size+1);const temp=this.numberPath+'.tmp';writeFileSync(temp,JSON.stringify([...this.numbers]),{mode:0o600});renameSync(temp,this.numberPath);}return this.numbers.get(key);}
+  saveSeen(){try{const temp=this.seenPath+'.tmp';writeFileSync(temp,JSON.stringify([...this.seen]),{mode:0o600});renameSync(temp,this.seenPath);}catch{}}
+  // Bounded, single-flight, never fatal: a late rejection is absorbed by the stored promise.
+  async clearAttention(control,agent){
+    if(this.clearing.has(agent.id))return;
+    const work=control.dispatch({serverId:this.serverId,agentId:agent.id,op:'clearAttention'}).then(()=>{},()=>{});
+    this.clearing.set(agent.id,work);work.then(()=>{this.clearing.delete(agent.id);this.invalidate();});
+    let timer;try{await Promise.race([work,new Promise(done=>{timer=setTimeout(done,this.clearTimeoutMs);})]);}finally{clearTimeout(timer);}
+  }
   invalidate(){for(const h of this.histories.values()){h.dirty=true;h.generation=(h.generation??0)+1;}this.directoryAt=0;}
   async directory(force=false){
     this.identity();if(!force && Date.now()-this.directoryAt<2500)return;
@@ -200,8 +212,14 @@ export class PaseoHost {
       for(const e of entries.values()){
         const bucket=deriveAgentStateBucket({...e.agent,status:e.agent.status==='error'?'error':e.agent.activeTurn?'running':e.agent.status,pendingPermissionCount:e.agent.pendingPermissions?.length??0});
         const old=this.statuses.get(e.agent.id);const entered=old?.bucket===bucket?old.entered:stamp(e.agent.updatedAt)||Date.now();
-        this.statuses.set(e.agent.id,{bucket,entered});e.paseoBucket=bucket;e.paseoStatusEnteredAt=entered;
+        this.statuses.set(e.agent.id,{bucket,entered});e.paseoStatusEnteredAt=entered;
+        // updatedAt is stable while idle and advances on a newer finish, which makes attention reappear.
+        e.paseoBucket=bucket==='attention'&&stamp(e.agent.updatedAt)<=(this.seen.get(e.agent.id)??-1)?'done':bucket;
       }
+      // Drop episodes Paseo no longer reports as attention (cleared, resumed, gone); the file changes only then.
+      let pruned=false;
+      for(const id of [...this.seen.keys()])if(this.statuses.get(id)?.bucket!=='attention'||!entries.has(id)){this.seen.delete(id);pruned=true;}
+      if(pruned)this.saveSeen();
       this.entries=entries;this.projects=projects;this.directoryAt=Date.now();
     })();
     try{await this.directoryWork;}finally{this.directoryWork=null;}
@@ -373,7 +391,10 @@ export class PaseoHost {
     if(c.type==='view'){
       if(!c.commandId||typeof c.commandId!=='string')throw Error('Missing command identity');
       if(agent.requiresAttention && agent.attentionReason!=='permission' && !agent.pendingPermissions?.length){
-        await control.dispatch({serverId:this.serverId,agentId:agent.id,op:'clearAttention'});this.invalidate();
+        // Record the viewed episode first so the index shows `done` even if the daemon clear hangs or fails.
+        const at=stamp(agent.updatedAt);
+        if(this.seen.get(agent.id)!==at){this.seen.set(agent.id,at);this.saveSeen();}
+        this.invalidate();await this.clearAttention(control,agent);
       }
       return {commandId:c.commandId,sessionId:agent.id,revision:this.revision};
     }

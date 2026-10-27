@@ -417,6 +417,180 @@ mod tests {
             .unwrap();
     }
 
+    /// The first summary is the open tab; the rest are unopened host rows.
+    fn paseo_rows(cx: &mut TestAppContext, rows: usize) -> (gpui::WindowHandle<Shell>, Vec<i64>) {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mut summaries = Vec::new();
+        for i in 0..=rows {
+            let mut session = store.create("codex", "/work/paseo").unwrap();
+            session.title = format!("Paseo {i}");
+            session.has_messages = true;
+            summaries.push(session);
+        }
+        let ids = summaries[1..].iter().map(|s| s.id).collect();
+        let mut workspace = Workspace::default();
+        workspace.open(summaries[0].id);
+        let saved = serde_json::to_string(&workspace).unwrap();
+        let database = Arc::new(Mutex::new(store));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| Shell::new(database, summaries, "/work/paseo".into(), Some(saved), cx))
+            })
+            .unwrap()
+        });
+        (window, ids)
+    }
+    /// What a poll does for one row: the new index entry, then the transitions.
+    fn poll_row(
+        shell: &mut Shell,
+        id: i64,
+        bucket: serde_json::Value,
+        (running, waiting): (bool, bool),
+        cx: &mut Context<Shell>,
+    ) {
+        let previous = shell
+            .remote_details
+            .get(&id)
+            .and_then(|details| details["bucket"].as_str())
+            .map(str::to_owned);
+        shell
+            .remote_details
+            .insert(id, serde_json::json!({ "bucket": bucket }));
+        shell.apply_remote_row(id, previous.as_deref(), running, waiting, cx);
+    }
+    fn mark(shell: &Shell, id: i64, cx: &App) -> Option<MarkState> {
+        shell.session_marks.get(&id).map(|mark| mark.read(cx).state())
+    }
+
+    #[gpui::test]
+    fn cold_start_host_buckets_restore_marks_without_materializing(cx: &mut TestAppContext) {
+        let (window, ids) = paseo_rows(cx, 5);
+        window
+            .update(cx, |shell, _, cx| {
+                let chats = shell.sessions.len();
+                let [running, input, attention, failed, done] = ids[..] else {
+                    unreachable!()
+                };
+                poll_row(shell, running, "running".into(), (true, false), cx);
+                poll_row(shell, input, "needs_input".into(), (true, true), cx);
+                poll_row(shell, attention, "attention".into(), (false, false), cx);
+                poll_row(shell, failed, "failed".into(), (false, false), cx);
+                poll_row(shell, done, "done".into(), (false, false), cx);
+                assert!(mark(shell, running, cx) == Some(MarkState::Working));
+                assert!(mark(shell, input, cx) == Some(MarkState::Working));
+                assert!(shell.tab_marks[&input].read(cx).state() == MarkState::Attention);
+                for id in [attention, failed] {
+                    assert!(mark(shell, id, cx) == Some(MarkState::Done));
+                    assert!(shell.unseen_finished.contains(&id));
+                    assert!(!shell.busy_sessions.contains(&id));
+                }
+                assert!(!shell.session_marks.contains_key(&done));
+                assert!(!shell.unseen_finished.contains(&done));
+                assert!(!shell.unseen_finished.contains(&running));
+                assert_eq!(shell.sessions.len(), chats);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn attention_is_added_once_and_cleared_by_the_host(cx: &mut TestAppContext) {
+        let (window, ids) = paseo_rows(cx, 3);
+        window
+            .update(cx, |shell, _, cx| {
+                let [attention, failed, archived] = ids[..] else {
+                    unreachable!()
+                };
+                poll_row(shell, attention, "attention".into(), (false, false), cx);
+                poll_row(shell, failed, "failed".into(), (false, false), cx);
+                // The user cleared it; the same bucket on the next poll must not return.
+                shell.unseen_finished.remove(&attention);
+                shell.refresh_session_mark(attention, cx);
+                poll_row(shell, attention, "attention".into(), (false, false), cx);
+                assert!(!shell.unseen_finished.contains(&attention));
+                assert!(mark(shell, attention, cx) == Some(MarkState::Idle));
+                // Cleared on the Paseo side.
+                poll_row(shell, failed, "done".into(), (false, false), cx);
+                assert!(!shell.unseen_finished.contains(&failed));
+                assert!(mark(shell, failed, cx) == Some(MarkState::Idle));
+                // Archived rows never become unseen.
+                shell.session_summaries.get_mut(&archived).unwrap().archived = true;
+                poll_row(shell, archived, "attention".into(), (false, false), cx);
+                assert!(!shell.unseen_finished.contains(&archived));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn attention_does_not_mark_a_focused_row_or_override_a_busy_view(cx: &mut TestAppContext) {
+        let (window, ids) = paseo_rows(cx, 2);
+        window
+            .update(cx, |shell, _, cx| {
+                let [focused, busy] = ids[..] else {
+                    unreachable!()
+                };
+                shell.workspace.active = Some(focused);
+                poll_row(shell, focused, "attention".into(), (false, false), cx);
+                assert!(!shell.unseen_finished.contains(&focused));
+                let view = shell.ensure_session(busy, cx).unwrap();
+                view.update(cx, |view, _| view.busy = true);
+                poll_row(shell, busy, "attention".into(), (false, false), cx);
+                assert!(!shell.unseen_finished.contains(&busy));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn rows_without_a_paseo_bucket_ignore_attention_transitions(cx: &mut TestAppContext) {
+        let (window, ids) = paseo_rows(cx, 1);
+        window
+            .update(cx, |shell, _, cx| {
+                let id = ids[0];
+                shell.remote_details.insert(id, serde_json::json!({ "bucket": null }));
+                shell.apply_remote_row(id, Some("attention"), false, false, cx);
+                shell.apply_remote_row(id, None, false, false, cx);
+                assert!(!shell.unseen_finished.contains(&id));
+                assert!(!shell.session_marks.contains_key(&id));
+                shell.workspace.active = Some(id);
+                shell.remote_row_focused(id, cx);
+                assert!(shell.remote_details[&id]["bucket"].is_null());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn focusing_an_attention_row_clears_it_locally(cx: &mut TestAppContext) {
+        let (window, ids) = paseo_rows(cx, 2);
+        window
+            .update(cx, |shell, _, cx| {
+                let [id, other] = ids[..] else {
+                    unreachable!()
+                };
+                poll_row(shell, id, "attention".into(), (false, false), cx);
+                poll_row(shell, other, "attention".into(), (false, false), cx);
+                assert!(shell.unseen_finished.contains(&id));
+                // Not focused, or focused without a loaded view: nothing happens.
+                shell.remote_row_focused(id, cx);
+                shell.workspace.active = Some(id);
+                shell.remote_row_focused(id, cx);
+                shell.ensure_session(id, cx).unwrap();
+                shell.remote_row_focused(id, cx);
+                assert_eq!(shell.remote_details[&id]["bucket"], "attention");
+                assert!(shell.unseen_finished.contains(&id));
+                shell.sessions[&id].update(cx, |view, _| view.mark_paseo_loaded_for_test());
+                shell.remote_row_focused(id, cx);
+                assert_eq!(shell.remote_details[&id]["bucket"], "done");
+                assert!(!shell.unseen_finished.contains(&id));
+                assert!(mark(shell, id, cx) == Some(MarkState::Idle));
+                // Other rows are untouched, and a done row stays a no-op.
+                assert_eq!(shell.remote_details[&other]["bucket"], "attention");
+                assert!(shell.unseen_finished.contains(&other));
+                shell.remote_row_focused(id, cx);
+                assert_eq!(shell.remote_details[&id]["bucket"], "done");
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
     #[gpui::test]
     fn inactive_history_cache_has_a_count_bound_and_reopens_evicted_history(
         cx: &mut TestAppContext,

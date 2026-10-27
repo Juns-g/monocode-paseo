@@ -121,6 +121,8 @@ struct OpenMenu {
 }
 use response_menu::ResponseMenu;
 pub(crate) struct SessionChanged;
+/// The user sent or queued a message; a preview tab holding it becomes permanent.
+pub(crate) struct UserSubmitted;
 pub(crate) struct ChooseFolder(pub(crate) AnchorSlot);
 /// The review card asked to open the session's recorded changes.
 pub(crate) struct OpenSessionChanges(pub(crate) crate::review::ReviewTab);
@@ -957,6 +959,7 @@ impl Conversation {
             || self.settings.pending_provider_switch.is_some()
             || (!self.follow_ups.state.messages.is_empty() && !self.follow_ups.state.paused)
         {
+            cx.emit(UserSubmitted);
             self.enqueue_follow_up(prompt, mode.map(str::to_owned), cx);
             if self.stopping || self.settings.pending_provider_switch.is_some() {
                 // A fresh Send continues the conversation, while older queued
@@ -982,6 +985,7 @@ impl Conversation {
         self.planning_orchestration = self.settings.orchestrator;
         self.orchestration_plan = None;
         self.orchestration_error = None;
+        cx.emit(UserSubmitted);
         self.launch_prompt(prompt, cx);
         if self.busy && mode.is_some() {
             self.clear_submitted_mode(cx);
@@ -1502,6 +1506,7 @@ impl Conversation {
 }
 
 impl EventEmitter<SessionChanged> for Conversation {}
+impl EventEmitter<UserSubmitted> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
 impl EventEmitter<Transfer> for Conversation {}
@@ -4818,6 +4823,49 @@ mod menu_tests {
                 assert_eq!(c.input.read(cx).content, "operator New draft");
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn sending_or_queueing_a_message_announces_a_user_submission(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        let submitted = std::rc::Rc::new(std::cell::Cell::new(0));
+        window
+            .update(cx, |view, _, cx| {
+                let count = submitted.clone();
+                cx.subscribe(&cx.entity(), move |_, _, _: &UserSubmitted, _| {
+                    count.set(count.get() + 1)
+                })
+                .detach();
+                // An unsupported synthetic provider stops before any CLI I/O.
+                view.summary.provider = "fixture".into();
+                view.loaded = true;
+                view.send(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(submitted.get(), 0, "an empty composer sends nothing");
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |i, cx| i.set_text("a first message".into(), cx));
+                view.send(cx);
+                assert!(view.busy);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(submitted.get(), 1);
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |i, cx| i.set_text("a queued message".into(), cx));
+                view.busy = true;
+                view.follow_ups.state.paused = true;
+                view.send(cx);
+                assert_eq!(view.follow_ups.state.messages.len(), 1);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(submitted.get(), 2);
     }
 
     #[gpui::test]

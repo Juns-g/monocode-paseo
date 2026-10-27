@@ -33,6 +33,18 @@ impl Shell {
         }
     }
 
+    /// Make the conversation's preview tab permanent.
+    pub(super) fn pin_session_tab(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self
+            .workspace
+            .tab_of(id)
+            .is_some_and(|tab| self.workspace.pin_tab(tab))
+        {
+            self.persist(cx);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn click_mono_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.skip_tab_click) {
             return;
@@ -348,6 +360,9 @@ impl Shell {
             return;
         };
         let entry = visible.remove(from);
+        if let TitleTab::Session(key) = &entry {
+            self.workspace.pin_tab(*key);
+        }
         visible.insert(to.min(visible.len()), entry);
         let set: HashSet<_> = visible.iter().cloned().collect();
         let mut ordered = visible.into_iter();
@@ -758,12 +773,13 @@ mod interaction_tests {
         window
             .update(cx, |shell, w, cx| {
                 for id in [other, session] {
-                    shell.select_sidebar_session(
+                    shell.select_sidebar_session_clicked(
                         id,
                         Modifiers {
                             platform: true,
                             ..Default::default()
                         },
+                        1,
                         w,
                         cx,
                     );
@@ -882,6 +898,131 @@ mod interaction_tests {
                 assert_eq!(shell.visible_tabs(cx), [mono, TitleTab::Session(first)]);
                 assert_eq!(shell.workspace.active, Some(first));
                 assert!(!shell.mono_active(cx));
+            })
+            .unwrap();
+    }
+
+    fn add_idle(shell: &mut Shell, cx: &mut Context<Shell>) -> i64 {
+        let summary = locked(&shell.store)
+            .unwrap()
+            .create("codex", &shell.workspace.project)
+            .unwrap();
+        let id = summary.id;
+        shell.add(summary, cx);
+        id
+    }
+    fn click(shell: &mut Shell, id: i64, count: usize, w: &mut Window, cx: &mut Context<Shell>) {
+        shell.select_sidebar_session_clicked(id, Modifiers::default(), count, w, cx);
+    }
+
+    #[gpui::test]
+    fn single_sidebar_clicks_share_one_preview_tab(cx: &mut TestAppContext) {
+        let (window, _, first) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.preview_tabs = true;
+                let (a, b) = (add_idle(shell, cx), add_idle(shell, cx));
+                let base = shell.workspace.tabs.clone();
+                click(shell, a, 1, w, cx);
+                assert_eq!(shell.workspace.tabs, [base.clone(), vec![a]].concat());
+                assert_eq!(shell.workspace.preview_tab, Some(a));
+                shell.sessions[&a].update(cx, |chat, _| chat.busy = true);
+                click(shell, b, 1, w, cx);
+                assert_eq!(shell.workspace.tabs, [base.clone(), vec![b]].concat());
+                assert_eq!(shell.workspace.preview_tab, Some(b));
+                assert_eq!(shell.workspace.active, Some(b));
+                assert_eq!(
+                    shell.visible_tabs(cx).last(),
+                    Some(&TitleTab::Session(b)),
+                    "the preview keeps its slot in the strip"
+                );
+                // The replaced conversation is only hidden; it keeps running.
+                assert!(shell.sessions[&a].read(cx).busy);
+                assert!(shell.session_summaries.contains_key(&a));
+                // Re-clicking a conversation that has a tab changes nothing.
+                click(shell, first, 1, w, cx);
+                assert_eq!(shell.workspace.preview_tab, Some(b));
+                assert_eq!(shell.workspace.tabs.len(), base.len() + 1);
+                // Back reopens the replaced conversation as the preview again.
+                shell.visit(-1, w, cx);
+                shell.visit(-1, w, cx);
+                assert_eq!(shell.workspace.active, Some(a));
+                assert_eq!(shell.workspace.tabs, [base, vec![a]].concat());
+                assert_eq!(shell.workspace.preview_tab, Some(a));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_row_keeps_its_tab(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.preview_tabs = true;
+                let (a, b) = (add_idle(shell, cx), add_idle(shell, cx));
+                let base = shell.workspace.tabs.len();
+                click(shell, a, 1, w, cx);
+                click(shell, a, 2, w, cx);
+                assert_eq!(shell.workspace.preview_tab, None);
+                click(shell, b, 1, w, cx);
+                assert_eq!(shell.workspace.tabs.len(), base + 2);
+                assert_eq!(shell.workspace.tabs[base..], [a, b]);
+                assert_eq!(shell.workspace.preview_tab, Some(b));
+                // Dragging a preview tab into a new slot also keeps it.
+                shell.reorder_title_tab(&TitleTab::Session(b), 0, cx);
+                assert_eq!(shell.workspace.preview_tab, None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn sending_a_message_makes_the_preview_permanent(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let a = window
+            .update(cx, |shell, w, cx| {
+                shell.preview_tabs = true;
+                let (a, b) = (add_idle(shell, cx), add_idle(shell, cx));
+                click(shell, a, 1, w, cx);
+                // A conversation that is not the preview leaves it alone.
+                shell.sessions[&b].update(cx, |_, cx| cx.emit(UserSubmitted));
+                a
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.workspace.preview_tab, Some(a));
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&a].update(cx, |_, cx| cx.emit(UserSubmitted));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.workspace.preview_tab, None);
+                let next = add_idle(shell, cx);
+                click(shell, next, 1, w, cx);
+                assert!(shell.workspace.tabs.contains(&a));
+                assert_eq!(shell.workspace.preview_tab, Some(next));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn without_previews_every_click_opens_a_permanent_tab(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                assert!(!shell.preview_tabs, "only the Paseo prototype previews");
+                let (a, b) = (add_idle(shell, cx), add_idle(shell, cx));
+                let base = shell.workspace.tabs.len();
+                click(shell, a, 1, w, cx);
+                click(shell, b, 1, w, cx);
+                assert_eq!(shell.workspace.tabs[base..], [a, b]);
+                assert_eq!(shell.workspace.preview_tab, None);
             })
             .unwrap();
     }

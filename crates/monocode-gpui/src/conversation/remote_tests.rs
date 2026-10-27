@@ -805,6 +805,69 @@ fn paseo_history_installs_before_view_acknowledgement(cx: &mut TestAppContext) {
     barrier.store(true, Ordering::Relaxed);
 }
 
+#[gpui::test]
+fn marking_a_loaded_paseo_view_acknowledges_it_once(cx: &mut TestAppContext) {
+    // The view barrier fixture advertises Paseo; a released barrier never blocks.
+    let host = HostFixture::with_view_barrier(false, false, Some(Arc::new(AtomicBool::new(true))));
+    let views = || {
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["params"]["type"] == "view")
+            .count()
+    };
+    // Unloaded views never acknowledge.
+    let unloaded = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(host.summary.clone(), host.store.clone(), cx);
+            view.remote_state.client = Some(host.client.clone());
+            view.remote_state.capabilities.insert("paseo.configure".into());
+            view
+        })
+    });
+    assert!(!cx.update(|cx| unloaded.update(cx, |view, cx| view.mark_remote_viewed(cx))));
+    cx.run_until_parked();
+    assert_eq!(views(), 0);
+
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    // The initial open acknowledged once; wait for that request to land.
+    for _ in 0..1000 {
+        cx.run_until_parked();
+        if views() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(views(), 1);
+    // A repeat right after the initial acknowledgement is throttled.
+    assert!(!cx.update(|cx| view.update(cx, |view, cx| view.mark_remote_viewed(cx))));
+    cx.update(|cx| view.update(cx, |view, _| view.remote_state.viewed_at = None));
+    // One request in flight at a time.
+    let (first, second) = cx.update(|cx| {
+        view.update(cx, |view, cx| (view.mark_remote_viewed(cx), view.mark_remote_viewed(cx)))
+    });
+    assert!(first && !second);
+    for _ in 0..1000 {
+        cx.run_until_parked();
+        if views() == 2 && !cx.update(|cx| view.read(cx).remote_state.viewing) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(views(), 2);
+    assert!(!cx.update(|cx| view.read(cx).remote_state.viewing));
+    assert!(
+        !host
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["params"]["type"] == "send")
+    );
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "Requires Metal; same real Conversation, synthetic history, no daemon or OS window"]

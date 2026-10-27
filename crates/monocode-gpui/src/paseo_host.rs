@@ -33,18 +33,8 @@ pub(crate) fn terminal_path(
 ) -> Result<String, &'static str> {
     let refused = "Terminals are not available on remote projects.";
     let binding = monocode_core::remote::parse_remote_path(project).ok_or(refused)?;
-    let authority = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .and_then(|s| s.split('/').next())
-        .unwrap_or("");
-    let loopback = authority
-        .parse::<std::net::SocketAddr>()
-        .is_ok_and(|a| a.ip().is_loopback())
-        || authority
-            .strip_prefix("localhost:")
-            .is_some_and(|port| port.parse::<u16>().is_ok());
-    if !enabled || expected.is_empty() || binding.environment_id != expected || !loopback {
+    if !enabled || expected.is_empty() || binding.environment_id != expected || !loopback(endpoint)
+    {
         return Err(refused);
     }
     let path = if let Some(remote) = monocode_core::remote::parse_remote_path(cwd) {
@@ -62,6 +52,29 @@ pub(crate) fn terminal_path(
     path.canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|_| "Project folder not found on this Mac")
+}
+
+/// The Paseo daemon shares this Mac only behind a loopback endpoint.
+fn loopback(endpoint: &str) -> bool {
+    let authority = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .and_then(|s| s.split('/').next())
+        .unwrap_or("");
+    authority
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.ip().is_loopback())
+        || authority
+            .strip_prefix("localhost:")
+            .is_some_and(|port| port.parse::<u16>().is_ok())
+}
+
+/// A file link in a Paseo conversation names a `remote://` path on the
+/// loopback host, which is this Mac; other remote hosts keep their paths.
+pub(crate) fn local_file(enabled: bool, expected: &str, endpoint: &str, raw: &str) -> Option<String> {
+    let remote = monocode_core::remote::parse_remote_path(raw)?;
+    (enabled && !expected.is_empty() && remote.environment_id == expected && loopback(endpoint))
+        .then_some(remote.host_path)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -661,6 +674,15 @@ mod tests {
             .unwrap_err(),
             "Project folder not found on this Mac"
         );
+        let link = format!("remote://fixture{cwd}/src/main.rs:12:1");
+        assert_eq!(
+            local_file(true, "fixture", "http://127.0.0.1:1234", &link).unwrap(),
+            format!("{cwd}/src/main.rs:12:1")
+        );
+        assert!(local_file(false, "fixture", "http://127.0.0.1:1234", &link).is_none());
+        assert!(local_file(true, "other", "http://127.0.0.1:1234", &link).is_none());
+        assert!(local_file(true, "fixture", "http://example.invalid:1234", &link).is_none());
+        assert!(local_file(true, "fixture", "http://127.0.0.1:1234", "/plain/path").is_none());
         assert_eq!(
             StatusBucket::ALL.map(StatusBucket::label),
             ["Needs input", "Failed", "Attention", "Working", "Done"]

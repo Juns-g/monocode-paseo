@@ -693,10 +693,18 @@ pub(crate) fn resolve_file_links(row: &mut MarkdownRow, base: &str) {
 }
 
 fn open_link(url: &str, window: &mut Window, cx: &mut App) {
-    if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:") {
-        cx.open_url(url);
-    } else if !url.starts_with('#') && (!url.contains("://") || url.starts_with("file://")) {
+    // A remote conversation resolves file links against its `remote://` cwd.
+    let file = !url.starts_with("mailto:")
+        && (!url.contains("://")
+            || url.starts_with("file://")
+            || url.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX));
+    if url.starts_with('#') {
+        // An in-page anchor has nowhere to go in a transcript or a preview.
+    } else if file {
         window.dispatch_action(Box::new(crate::file_editor::OpenPath(url.into())), cx);
+    } else {
+        // Web, mail and any other scheme (an app's deep link) are the system's.
+        cx.open_url(url);
     }
 }
 

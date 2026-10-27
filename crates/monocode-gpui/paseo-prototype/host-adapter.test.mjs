@@ -650,3 +650,72 @@ test('view attention is identity-checked and idempotent without durable command 
     console.log(JSON.stringify({viewOperations:220,journalWrites:saves,journalEntries:Object.keys(f.host.attempts.values).length,elapsedMs:performance.now()-started}));
   }finally{f.close();}
 });
+
+const bucketOf=async(host,id='a')=>(await host.request('sessions.list',{projectId:'paseo:/fixture'})).result.find(v=>v.id===id).paseoBucket;
+const seenFile=f=>join(f.directory,'paseo-seen-attention.json');
+const readSeen=f=>{try{return JSON.parse(readFileSync(seenFile(f),'utf8'));}catch(e){if(e.code==='ENOENT')return null;throw e;}};
+
+test('view with a clear that never answers returns within the bound and lists done without journal writes',async()=>{
+  const f=fixture();try{
+    await f.host.directory();f.a.requiresAttention=true;f.a.attentionReason='finished';f.host.clearTimeoutMs=50;
+    await f.host.directory(true);assert.equal(await bucketOf(f.host),'attention');
+    const before=(await f.host.request('sessions.list',{projectId:'paseo:/fixture',withRevision:true})).result;
+    let clears=0;f.client.clearAgentAttention=()=>{clears++;return new Promise(()=>{});};
+    let saves=0;const save=f.host.attempts.save.bind(f.host.attempts);f.host.attempts.save=()=>{saves++;save();};
+    const started=performance.now();
+    const receipt=await f.host.command({type:'view',commandId:'hang-1',sessionId:'a'});
+    assert.ok(performance.now()-started<2000);assert.equal(receipt.sessionId,'a');
+    await f.host.command({type:'view',commandId:'hang-2',sessionId:'a'});assert.equal(clears,1);
+    assert.equal(await bucketOf(f.host),'done');assert.equal(saves,0);assert.equal(Object.keys(f.host.attempts.values).length,0);
+    const after=(await f.host.request('sessions.list',{projectId:'paseo:/fixture',withRevision:true})).result;
+    assert.notEqual(after.revision,before.revision);assert.equal(after.structuralRevision,before.structuralRevision);
+    assert.deepEqual(readSeen(f),[['a',Date.parse(f.a.updatedAt)]]);
+  }finally{f.close();}
+});
+test('a rejecting clear is non-fatal and leaves no unhandled rejection',async()=>{
+  const f=fixture();try{
+    await f.host.directory();f.a.requiresAttention=true;f.a.attentionReason='finished';
+    const unhandled=[];const listener=error=>unhandled.push(error);process.on('unhandledRejection',listener);
+    let reject;f.host.clearTimeoutMs=20;f.client.clearAgentAttention=()=>new Promise((_,r)=>{reject=r;});
+    await f.host.command({type:'view',commandId:'late-reject',sessionId:'a'});
+    reject(Error('late failure'));await new Promise(r=>setTimeout(r,20));process.off('unhandledRejection',listener);
+    assert.deepEqual(unhandled,[]);assert.equal(await bucketOf(f.host),'done');
+  }finally{f.close();}
+});
+test('seen overlay survives restart, reappears on a newer finish and is pruned when attention ends',async()=>{
+  const f=fixture();try{
+    await f.host.directory();f.a.requiresAttention=true;f.a.attentionReason='finished';f.host.clearTimeoutMs=20;
+    f.client.clearAgentAttention=()=>new Promise(()=>{});
+    await f.host.command({type:'view',commandId:'seen',sessionId:'a'});
+    const restarted=new PaseoHost(f.client,f.directory);restarted.connected=true;
+    assert.equal(await bucketOf(restarted),'done');
+    f.a.updatedAt='2026-10-26T00:00:00Z';
+    await restarted.directory(true);assert.equal(await bucketOf(restarted),'attention');
+    assert.equal(readSeen(f).length,1);
+    restarted.close();
+    // Polling with no change never rewrites the file; only dropping an entry does.
+    const again=new PaseoHost(f.client,f.directory);again.connected=true;
+    let writes=0;const save=again.saveSeen.bind(again);again.saveSeen=()=>{writes++;save();};
+    f.a.updatedAt='2026-10-25T00:00:00Z';
+    for(let i=0;i<3;i++){await again.directory(true);assert.equal(await bucketOf(again),'done');}
+    assert.equal(writes,0);assert.equal(readSeen(f).length,1);
+    f.a.requiresAttention=false;
+    for(let i=0;i<3;i++){await again.directory(true);assert.equal(await bucketOf(again),'done');}
+    assert.equal(writes,1);assert.deepEqual(readSeen(f),[]);
+    // Running then finishing again with a newer stamp is a fresh episode.
+    f.a.requiresAttention=true;f.a.updatedAt='2026-10-27T00:00:00Z';
+    await again.directory(true);assert.equal(await bucketOf(again),'attention');
+    again.close();
+  }finally{f.close();}
+});
+test('corrupt seen file is tolerated and permission attention records no overlay',async()=>{
+  const f=fixture();try{
+    writeFileSync(seenFile(f),'{not json');
+    const host=new PaseoHost(f.client,f.directory);host.connected=true;await host.directory();
+    f.a.requiresAttention=true;f.a.attentionReason='permission';
+    let clears=0;f.client.clearAgentAttention=async()=>{clears++;};
+    await host.command({type:'view',commandId:'perm',sessionId:'a'});
+    assert.equal(clears,0);assert.equal(host.seen.size,0);assert.equal(readFileSync(seenFile(f),'utf8'),'{not json');
+    await host.directory(true);assert.equal(await bucketOf(host),'needs_input');host.close();
+  }finally{f.close();}
+});

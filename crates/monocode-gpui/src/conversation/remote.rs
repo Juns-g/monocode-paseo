@@ -8,6 +8,9 @@ pub(super) struct State {
     pub(super) client: Option<Arc<monocode_core::remote::Connections>>,
     clock: Option<gpui::Task<()>>,
     pub(super) refreshing: bool,
+    /// A `view` acknowledgement is in flight; `viewed_at` throttles repeats.
+    viewing: bool,
+    viewed_at: Option<std::time::Instant>,
     pub(super) first_content_trace: Option<std::time::Instant>,
     pub(super) pending: bool,
     pub(super) online: bool,
@@ -63,6 +66,19 @@ impl OpenTimings {
     fn finish(mut self) -> Value {
         self.values.insert("backgroundMs".into(), json!(self.started.elapsed().as_secs_f64() * 1000.));
         Value::Object(self.values)
+    }
+}
+/// Best-effort `view` acknowledgement: the host clears the conversation's attention.
+fn dispatch_remote_view(
+    client: &monocode_core::remote::Connections,
+    machine: &str,
+    session: &str,
+    id: i64,
+) {
+    let begin = std::time::Instant::now();
+    let result = client.request(machine, "commands.dispatch", json!({"type":"view", "sessionId":session, "commandId":monocode_core::mono::new_id()}));
+    if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+        eprintln!("native remote-view {}", json!({"session":id,"elapsedMs":begin.elapsed().as_secs_f64()*1000.,"ok":result.is_ok()}));
     }
 }
 pub(crate) fn prepare_remote_open(
@@ -212,6 +228,51 @@ impl Conversation {
             self.refresh_remote_snapshot(cx);
         }
     }
+    /// A loaded Paseo view the user is looking at acknowledges its host attention.
+    /// The initial open already does this; here at most one request is in flight
+    /// and a stale index cannot repeat it within `RETRY`. Returns whether it was sent.
+    pub(crate) fn mark_remote_viewed(&mut self, cx: &mut Context<Self>) -> bool {
+        const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+        if !self.paseo_controls()
+            || !self.history_loaded()
+            || self.remote_state.viewing
+            || self.remote_state.viewed_at.is_some_and(|at| at.elapsed() < RETRY)
+        {
+            return false;
+        }
+        let Some(client) = self.remote_state.client.clone() else {
+            return false;
+        };
+        self.remote_state.viewing = true;
+        self.remote_state.viewed_at = Some(std::time::Instant::now());
+        let store = self.store.clone();
+        let id = self.summary.id;
+        let work = cx.background_executor().spawn(async move {
+            let remote = locked(&store)?
+                .remote_session(id)?
+                .ok_or("Remote session no longer exists")?;
+            let session = remote.session_id.clone().ok_or("Unbound remote draft")?;
+            let machine = remote.machine(&client)?;
+            dispatch_remote_view(&client, &machine.id, &session, id);
+            Ok::<(), String>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let _ = work.await;
+            let _ = this.update(cx, |this, _| this.remote_state.viewing = false);
+        })
+        .detach();
+        true
+    }
+    /// Shell tests: a loaded Paseo view whose acknowledgement cannot reach any host.
+    #[cfg(test)]
+    pub(crate) fn mark_paseo_loaded_for_test(&mut self) {
+        self.summary.cwd = "remote://shell-test/project".into();
+        self.loaded = true;
+        self.remote_state.capabilities.insert("paseo.configure".into());
+        self.remote_state.client = Some(Arc::new(monocode_core::remote::Connections::new(
+            "/nonexistent/monocode-shell-test",
+        )));
+    }
     /// Re-syncs an open idle view now so a host-started turn attaches without waiting for the 3 s clock.
     pub(crate) fn nudge_remote_observation(&mut self, cx: &mut Context<Self>) {
         if self.is_remote()
@@ -260,9 +321,13 @@ impl Conversation {
                     loaded.remote.session_id.clone()?,
                 ))
             });
+            let notified = notification.is_some();
             let installed = this.update(cx, |this, cx| {
                 this.remote_state.refreshing = false;
                 this.loading = false;
+                if notified {
+                    this.remote_state.viewed_at = Some(std::time::Instant::now());
+                }
                 match result {
                     Ok(OpenHistory { remote, settings, snapshot, history, descriptor, workspace_choices, timings, .. }) => {
                         let install_started = std::time::Instant::now();
@@ -362,11 +427,7 @@ impl Conversation {
             });
             if installed.is_ok() && let Some((client, machine, session)) = notification {
                 cx.background_executor().spawn(async move {
-                    let begin = std::time::Instant::now();
-                    let result = client.request(&machine, "commands.dispatch", json!({"type":"view", "sessionId":session, "commandId":monocode_core::mono::new_id()}));
-                    if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
-                        eprintln!("native remote-view {}", json!({"session":id,"elapsedMs":begin.elapsed().as_secs_f64()*1000.,"ok":result.is_ok()}));
-                    }
+                    dispatch_remote_view(&client, &machine, &session, id);
                 }).detach();
             }
         })

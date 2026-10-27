@@ -46,7 +46,7 @@ mod window_chrome;
 mod worktrees;
 
 use crate::{
-    conversation::{Conversation, SessionChanged},
+    conversation::{Conversation, SessionChanged, UserSubmitted},
     input,
     notes::Notes,
     pane_layout::{Edge, LayoutLeaf, Rect, SplitDir},
@@ -693,6 +693,8 @@ pub(crate) struct Shell {
     project_anchor: AnchorSlot,
     sidebar_options_anchor: AnchorSlot,
     history: VisitHistory,
+    /// Sidebar clicks open conversations as preview tabs (the Paseo prototype).
+    preview_tabs: bool,
     /// User navigation invalidates pending requests that would otherwise
     /// focus a new session in a tab or project the user has already left.
     navigation_revision: u64,
@@ -836,6 +838,8 @@ impl Shell {
         let mut workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
         if crate::paseo_host::active() {
             crate::paseo_host::restrict_workspace(&mut workspace);
+        } else {
+            workspace.preview_tab = None;
         }
         crate::i18n::configure(&workspace.preferences);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
@@ -1049,6 +1053,7 @@ impl Shell {
             project_anchor: AnchorSlot::default(),
             sidebar_options_anchor: AnchorSlot::default(),
             history: VisitHistory::default(),
+            preview_tabs: crate::paseo_host::active(),
             navigation_revision: 0,
             pending_project_blanks: HashSet::new(),
             new_tab_task: None,
@@ -1325,6 +1330,10 @@ impl Shell {
                 this.update_chat_visibility(cx);
                 this.invalidate_chrome(cx);
                 cx.notify();
+            }));
+        self.observations
+            .push(cx.subscribe(&view, move |this, _, _: &UserSubmitted, cx| {
+                this.pin_session_tab(id, cx);
             }));
         self.observations
             .push(cx.subscribe(&view, |this, _, transfer: &Transfer, cx| {
@@ -2936,6 +2945,17 @@ impl Shell {
         )
         .map_err(crate::i18n::t)
     }
+    /// A Paseo conversation's `remote://` file link, as this Mac's path.
+    fn paseo_local_file(&self, raw: &str) -> Option<String> {
+        let prefs = &self.workspace.preferences;
+        let extra = |key: &str| prefs.extra.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        crate::paseo_host::local_file(
+            crate::paseo_host::project_ui(prefs),
+            extra("paseo_environment"),
+            extra("paseo_host_endpoint"),
+            raw,
+        )
+    }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
         let terminal = cx.new(|cx| Terminal::new(cwd, cx));
         self.observations
@@ -4048,6 +4068,15 @@ impl Shell {
         }
     }
     pub(crate) fn open(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_with(id, false, window, cx);
+    }
+    /// A sidebar click or history step: a conversation without a tab opens as
+    /// the preview tab when previews are on.
+    fn open_previewing(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let preview = self.preview_tabs && self.workspace.tab_of(id).is_none();
+        self.open_with(id, preview, window, cx);
+    }
+    fn open_with(&mut self, id: i64, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
             return;
@@ -4061,7 +4090,7 @@ impl Shell {
         }
         self.navigation_revision += 1;
         self.replace_blank_pane(id, cx);
-        self.activate_session(id, window, cx);
+        self.activate_session_as(id, preview, window, cx);
     }
     /// Opening a conversation that has no tab takes over a blank pane in the
     /// active tab instead of adding a tab, as in the desktop app.
@@ -4107,6 +4136,15 @@ impl Shell {
         }
     }
     fn activate_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_session_as(id, false, window, cx);
+    }
+    fn activate_session_as(
+        &mut self,
+        id: i64,
+        preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
             return;
@@ -4126,13 +4164,20 @@ impl Shell {
             return;
         };
         self.history.record(id);
-        self.workspace.open(id);
+        if !preview {
+            self.workspace.open(id);
+        } else if let Some(old) = self.workspace.open_preview(id) {
+            self.replace_title_tab_key(old, id);
+        }
         self.workspace.project = view.read(cx).summary.cwd.clone();
         self.workspace
             .project_focus
             .insert(self.workspace.project.clone(), id);
         self.workspace.collapsed.remove(&self.workspace.project);
         view.update(cx, |v, cx| v.load(cx));
+        // Refocusing a loaded Paseo row acknowledges its attention; a first
+        // open does that itself once history installs.
+        self.remote_row_focused(id, cx);
         self.record_worktree_session(id, cx);
         self.remember_title_tab(TitleTab::Session(self.workspace.tab_of(id).unwrap()));
         self.reveal_active_tab(cx);
@@ -4181,7 +4226,7 @@ impl Shell {
             }
         }
         if let Some(id) = self.history.step(step) {
-            self.open(id, window, cx);
+            self.open_previewing(id, window, cx);
         }
     }
     fn cycle(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -6278,7 +6323,13 @@ impl Shell {
                     if std::mem::take(&mut this.skip_session_click) {
                         return;
                     }
-                    this.select_sidebar_session(id, event.modifiers(), window, cx)
+                    this.select_sidebar_session_clicked(
+                        id,
+                        event.modifiers(),
+                        event.click_count(),
+                        window,
+                        cx,
+                    )
                 }),
             )
             // Sidebar.tsx: a session card dragged onto a pane edge opens there.
@@ -7203,6 +7254,7 @@ impl Shell {
         (leaving, dir, progress): (Option<usize>, f32, f32),
         active: bool,
         hovered: bool,
+        preview: bool,
     ) -> AnyElement {
         const LINE: f32 = 20.;
         let line = |pane: &TabPane, top: f32, opacity: f32| {
@@ -7233,6 +7285,7 @@ impl Shell {
             .overflow_hidden()
             .text_size(px(TITLE_TAB_TEXT_SIZE))
             .text_color(content(if active || hovered { 1. } else { 0.5 }))
+            .when(preview, |d| d.italic())
             .group_hover("title-tab", |s| s.text_color(content(1.)))
             .when_some(copy.panes.get(copy.focus), |d, pane| {
                 d.child(line(pane, dir * (1. - progress) * LINE, progress.max(0.2)))
@@ -7826,6 +7879,7 @@ impl Shell {
                                 (leaving, dir, progress),
                                 active,
                                 hovered,
+                                self.preview_tabs && self.workspace.preview_tab == Some(id),
                             )),
                     )
                     .when(close, |d| {
@@ -7924,11 +7978,14 @@ impl Shell {
                             this.close(id, window, cx);
                         }),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                         if std::mem::take(&mut this.skip_tab_click) {
                             return;
                         }
                         this.open_title_tab(&TitleTab::Session(id), window, cx);
+                        if event.click_count() == 2 {
+                            this.pin_session_tab(id, cx);
+                        }
                     }));
                 let element = if dragging {
                     gpui::deferred(tab).with_priority(1).into_any()
@@ -8043,7 +8100,7 @@ impl Shell {
                         })
                         .map(|id| {
                             let copy = self.tab_copy(id, cx);
-                            self.pane_headline(&copy, (None, 0., 1.), false, false)
+                            self.pane_headline(&copy, (None, 0., 1.), false, false, false)
                         });
                     Some(
                         slot(&key, open)
@@ -8456,8 +8513,16 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
-                    let cwd = this.git.read(cx).project().to_owned();
-                    let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
+                    let mut cwd = this.git.read(cx).project().to_owned();
+                    let mut raw = event.0.clone();
+                    if let Some(local) = this.paseo_local_file(&raw) {
+                        // Opened from this Mac, beside the project's local checkout.
+                        raw = local;
+                        if let Ok(local) = this.allowed_terminal_cwd(cx) {
+                            cwd = local;
+                        }
+                    }
+                    let (path, location) = crate::file_editor::file_location(&raw, &cwd);
                     this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
                     // Monos render above the session pane tree. Give its file
                     // an independent visible tab using the normal navigation
@@ -9108,6 +9173,55 @@ mod tests {
     use super::*;
     use gpui::{EntityInputHandler, TestAppContext, WindowHandle};
     use monocode_core::store::Store;
+    #[gpui::test]
+    fn paseo_file_links_open_the_local_file(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let dir = std::env::temp_dir().join(format!(
+            "paseo-link-test-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("README.md");
+        std::fs::write(&file, "# Synthetic\n").unwrap();
+        let local = dir.canonicalize().unwrap();
+        let link = format!("remote://fixture{}/README.md:1:1", local.to_str().unwrap());
+        window
+            .update(cx, |shell, _, cx| {
+                // Without the Paseo loopback authority the path stays remote.
+                assert!(shell.paseo_local_file(&link).is_none());
+                let prefs = &mut shell.workspace.preferences.extra;
+                prefs.insert(crate::paseo_host::PROJECT_SELECTION.into(), serde_json::json!({}));
+                prefs.insert("paseo_environment".into(), serde_json::json!("fixture"));
+                prefs.insert(
+                    "paseo_host_endpoint".into(),
+                    serde_json::json!("http://127.0.0.1:1234"),
+                );
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, w, cx| {
+                // The click comes from the focused conversation's transcript.
+                shell.focus_active(w, cx);
+                w.dispatch_action(Box::new(crate::file_editor::OpenPath(link.clone())), cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                let review = shell.active_review(cx).expect("the link opened a file pane");
+                let shown = review.read(cx).state.tabs.clone();
+                assert!(shown.iter().any(|tab| matches!(
+                    tab,
+                    crate::review::ReviewTab::File { path, .. }
+                        if std::path::Path::new(path) == local.join("README.md")
+                )), "{shown:?}");
+            })
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[gpui::test]
     fn paseo_terminal_uses_existing_dock_and_local_cwd_and_refuses_missing(
         cx: &mut TestAppContext,

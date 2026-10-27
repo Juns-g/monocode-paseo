@@ -1,6 +1,9 @@
 //! Composer.tsx / MessageQueue.tsx's durable follow-ups and saved user draft.
 use super::*;
+use gpui::AnimationExt;
 use monocode_core::follow_up::{Message, State};
+
+const STEER_HINT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Default)]
 pub(super) struct FollowUps {
@@ -9,6 +12,11 @@ pub(super) struct FollowUps {
     pub persisted: u64,
     pub sending: Option<String>,
     pub requested: Option<String>,
+    /// The message written to the running turn as a steer, awaiting acceptance.
+    pub steering: Option<String>,
+    /// Sequence number of the visible "sent to the running turn" hint.
+    pub steered: Option<usize>,
+    pub steers: usize,
     pub continuations: std::collections::VecDeque<String>,
     pub resuming: bool,
     pub ready: bool,
@@ -220,6 +228,12 @@ impl Conversation {
         cx.emit(SessionChanged);
     }
     pub(super) fn follow_up_delivered(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.follow_ups.steering.as_deref() == Some(id) {
+            self.follow_ups.steering = None;
+            if self.paseo_follow_ups() {
+                self.show_steer_hint(cx);
+            }
+        }
         if self.follow_ups.sending.as_deref() == Some(id) {
             self.follow_ups.sending = None;
         }
@@ -241,6 +255,23 @@ impl Conversation {
             self.save_follow_ups(cx);
         }
     }
+    /// The queued row vanishes the instant the host accepts a steer; say where it went.
+    fn show_steer_hint(&mut self, cx: &mut Context<Self>) {
+        self.follow_ups.steers += 1;
+        let steer = self.follow_ups.steers;
+        self.follow_ups.steered = Some(steer);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STEER_HINT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.follow_ups.steered == Some(steer) {
+                    this.follow_ups.steered = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
     pub(super) fn fail_follow_up(&mut self, id: &str, error: String, cx: &mut Context<Self>) {
         if let Some(message) = self
             .follow_ups
@@ -251,6 +282,9 @@ impl Conversation {
         {
             message.error = Some(error);
             self.follow_ups.state.paused = true;
+            if self.follow_ups.steering.as_deref() == Some(id) {
+                self.follow_ups.steering = None;
+            }
             if self
                 .follow_ups
                 .continuations
@@ -341,6 +375,7 @@ impl Conversation {
                     })
                     .is_ok()
                 {
+                    self.follow_ups.steering = Some(message.id.clone());
                     self.follow_ups.sending = Some(message.id);
                 } else {
                     self.fail_follow_up(
@@ -356,6 +391,7 @@ impl Conversation {
                 return;
             }
             self.follow_ups.sending = Some(message.id.clone());
+            self.follow_ups.steering = None;
             let message_id = message.id.clone();
             self.settings.mono_message_id = Some(message.id.clone());
             self.launch_message(message, cx);
@@ -487,8 +523,30 @@ impl Conversation {
                 .map(|message| message.id.as_str()),
             !cx.reduce_motion() && width.is_some(),
         );
+        let hint = self.follow_ups.steered.map(|steer| {
+            let hint = div()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(icon("check", 12.))
+                .child(crate::i18n::t("Sent to the running turn"));
+            if cx.reduce_motion() {
+                hint.into_any_element()
+            } else {
+                hint.with_animation(
+                    ("steer-hint", steer),
+                    gpui::Animation::new(STEER_HINT),
+                    |d, t| d.opacity(((1. - t) / 0.25).min(1.)),
+                )
+                .into_any_element()
+            }
+        });
         if self.follow_ups.state.messages.is_empty() {
-            return div().into_any_element();
+            return match hint {
+                Some(hint) => composer_shelf::shelf("message-queue").child(hint).into_any_element(),
+                None => div().into_any_element(),
+            };
         }
         let card_width = (width.unwrap_or_default() - px(16.)).max(px(0.));
         let row_width = (card_width - px(22.)).max(px(0.));
@@ -541,6 +599,7 @@ impl Conversation {
             }));
         composer_shelf::shelf("message-queue")
             .child(self.follow_ups.motion.card(card, card_width, window))
+            .children(hint)
             .into_any_element()
     }
 }
@@ -876,6 +935,80 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn an_accepted_steer_shows_a_short_lived_hint_only_for_paseo_steers(cx: &mut TestAppContext) {
+        for (paseo, steer) in [(true, true), (true, false), (false, true)] {
+            let window = conversation(cx);
+            cx.update(|cx| {
+                cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+                    prefs.follow_up = if steer { "steer" } else { "queue" }.into()
+                });
+            });
+            let (controls, received) = std::sync::mpsc::channel();
+            window
+                .update(cx, |view, _, cx| {
+                    if paseo {
+                        view.summary.cwd = "remote://paseo-hint/home/me/project".into();
+                        view.remote_state.online = true;
+                        view.remote_state.capabilities.extend(["paseo.configure".into(), "paseo.steer".into()]);
+                    }
+                    view.busy = true;
+                    view.controls = Some(controls);
+                    view.follow_ups.ready = true;
+                    view.input
+                        .update(cx, |input, cx| input.set_text("hint me".into(), cx));
+                    view.send(cx);
+                    view.follow_ups.state.messages[0].steer = steer;
+                    view.follow_ups.persisted = view.follow_ups.state.revision;
+                    view.pump_follow_ups(cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            if !steer {
+                // Not written to the running turn: accepting it later is a normal send.
+                assert!(received.try_recv().is_err());
+                window
+                    .update(cx, |view, _, cx| {
+                        let id = view.follow_ups.state.messages[0].id.clone();
+                        view.follow_up_delivered(&id, cx);
+                        assert!(view.follow_ups.steered.is_none());
+                    })
+                    .unwrap();
+                continue;
+            }
+            let id = received.try_recv().unwrap().id;
+            let persisted = window
+                .update(cx, |view, _, cx| {
+                    assert!(view.follow_ups.steered.is_none(), "not before acceptance");
+                    let persisted = view.follow_ups.state.revision;
+                    view.follow_up_delivered(&id, cx);
+                    assert_eq!(view.follow_ups.steered.is_some(), paseo);
+                    persisted
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |view, _, _| {
+                    assert_eq!(view.follow_ups.steered.is_some(), paseo);
+                    assert_eq!(
+                        view.follow_ups.state.revision,
+                        persisted + 1,
+                        "only removing the row is saved, not the hint"
+                    );
+                })
+                .unwrap();
+            cx.executor().advance_clock(STEER_HINT / 2);
+            window
+                .update(cx, |view, _, _| assert_eq!(view.follow_ups.steered.is_some(), paseo))
+                .unwrap();
+            cx.executor().advance_clock(STEER_HINT);
+            cx.run_until_parked();
+            window
+                .update(cx, |view, _, _| assert!(view.follow_ups.steered.is_none()))
+                .unwrap();
+        }
     }
 
     #[gpui::test]
