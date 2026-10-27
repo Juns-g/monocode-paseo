@@ -110,6 +110,9 @@ fn collect_inner(rows: &[Row], from: usize, streaming: bool, preserve_prose: boo
             if compaction {
                 flush(end, &mut members, &mut calls, &mut result);
             }
+        } else if role == "visual" {
+            // A visual published mid-work belongs to that work; it must not
+            // split the group around the call that published it.
         } else {
             // React's first assistant message replaces the initial private think.
             if role == "assistant" && leading && calls.is_empty() && !preserve_prose {

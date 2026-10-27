@@ -14,6 +14,7 @@ mod image_lightbox_tests;
 mod layout;
 mod live_agents;
 mod mobile_host;
+mod mono_panes;
 pub(crate) mod monos;
 mod notifications;
 mod orchestration;
@@ -40,6 +41,8 @@ mod sidebar_list;
 mod sidebar_peek;
 mod terminal_dock;
 mod title_tabs;
+#[cfg(target_os = "linux")]
+mod window_chrome;
 mod worktrees;
 
 use crate::{
@@ -257,8 +260,23 @@ pub(crate) fn bind_keys(cx: &mut App) {
     ]);
 }
 
+pub(crate) fn client_controls_width(window: &Window) -> f32 {
+    #[cfg(target_os = "linux")]
+    if !window.is_fullscreen()
+        && matches!(
+            window.window_decorations(),
+            gpui::Decorations::Client { .. }
+        )
+    {
+        return window_chrome::CONTROLS_WIDTH;
+    }
+    let _ = window;
+    0.
+}
+
 /// macOS must receive button clicks as app content. Only blank titlebar
 /// regions initiate native dragging or the system double-click action.
+/// Client-decorated Linux windows also need explicit native drag requests.
 pub(crate) fn titlebar_drag_area() -> gpui::Div {
     let bounds = AnchorSlot::default();
     div()
@@ -267,7 +285,12 @@ pub(crate) fn titlebar_drag_area() -> gpui::Div {
         .child(bounds.probe())
         .window_control_area(WindowControlArea::Drag)
         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-            if cfg!(target_os = "macos")
+            if (cfg!(target_os = "macos")
+                || (cfg!(target_os = "linux")
+                    && matches!(
+                        window.window_decorations(),
+                        gpui::Decorations::Client { .. }
+                    )))
                 && bounds.get().is_some_and(|b| b.contains(&event.position))
             {
                 // Check the measured spacer as well as GPUI's cached hit test:
@@ -409,6 +432,8 @@ enum DragSource {
     Review(i64),
     Tab(i64),
     Session(i64),
+    /// A Mono tab pulled down out of the strip; it has no pane yet.
+    MonoTab,
 }
 impl DragSource {
     fn session(self) -> i64 {
@@ -417,6 +442,7 @@ impl DragSource {
             | DragSource::Review(id)
             | DragSource::Tab(id)
             | DragSource::Session(id) => id,
+            DragSource::MonoTab => i64::MIN,
         }
     }
 }
@@ -485,6 +511,8 @@ enum PaneMark {
     Session(String, Option<i64>),
     /// A file's name, or `None` for changes and commits.
     File(Option<String>),
+    /// A Mono's mascot and colour.
+    Mono(String, u32),
 }
 /// A split tab's headline rolling to the newly focused pane: the next pane
 /// rises from below, the previous one drops from above.
@@ -567,6 +595,8 @@ pub(crate) struct Shell {
     /// useTrafficLightsVisible: fullscreen hides the native buttons, so the
     /// title bar takes their room back.
     fullscreen: bool,
+    #[cfg(target_os = "linux")]
+    client_decorations: bool,
     tabs_frame: Entity<Chrome>,
     store: Database,
     remote: Arc<monocode_core::remote::Connections>,
@@ -705,6 +735,8 @@ pub(crate) struct Shell {
     review_drag: bool,
     split_bounds: HashMap<i64, AnchorSlot>,
     pane_bounds: AnchorSlot,
+    /// The visible Mono's view, a drop target for tabs and panes.
+    mono_bounds: AnchorSlot,
     pane_drag: Option<PaneDrag>,
     pane_sash: Option<SashDrag>,
     pane_motion: Option<PaneMotion>,
@@ -730,6 +762,8 @@ pub(crate) struct Shell {
     live_mark: Option<Entity<terminal_dock::LiveMark>>,
     /// The sidebar collapsed itself to make room; it returns with the room.
     sidebar_auto_hidden: bool,
+    /// The room the sidebar was last fitted to; a change refits it.
+    sidebar_fitted_room: Option<(i32, bool)>,
     viewport_width: f32,
     viewport_height: f32,
     observations: Vec<Subscription>,
@@ -927,6 +961,8 @@ impl Shell {
             peek_close: None,
             peek_toggle_bounds: AnchorSlot::default(),
             fullscreen: false,
+            #[cfg(target_os = "linux")]
+            client_decorations: false,
             tabs_frame,
             store,
             remote,
@@ -1046,11 +1082,13 @@ impl Shell {
             review_drag: false,
             split_bounds: HashMap::new(),
             pane_bounds: AnchorSlot::default(),
+            mono_bounds: AnchorSlot::default(),
             pane_drag: None,
             pane_sash: None,
             pane_motion: None,
             skip_session_click: false,
             sidebar_auto_hidden: false,
+            sidebar_fitted_room: None,
             terminals: HashMap::new(),
             dock_slide: None,
             dock_resize: None,
@@ -1612,6 +1650,7 @@ impl Shell {
             .classic_sidebar_tabs
             .insert(self.workspace.project.clone(), tab.id().into());
         self.close_preview(cx);
+        self.sidebar_auto_hidden = false;
         self.set_sidebar_visible(true, cx);
         self.sync_right_panel(cx);
         self.notify_sidebar(cx);
@@ -2170,6 +2209,7 @@ impl Shell {
             .sessions
             .get(&id)
             .map(|s| s.read(cx).display_title())
+            .or_else(|| self.mono_pane_title(id, cx))
             .unwrap_or_default();
         let focused = self.workspace.active == Some(id) && !self.review_focused;
         div()
@@ -2549,6 +2589,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.workspace.mono_panes.contains_key(&id) {
+            return self.mono_pane_surface(id, split, cx);
+        }
         let in_split = split.is_some();
         let chat = self.sessions.get(&id).cloned();
         let now = std::time::Instant::now();
@@ -2821,6 +2864,40 @@ impl Shell {
             self.sidebar_auto_hidden = false;
         }
     }
+    /// Refit the sidebar whenever the room around the chats changes, however
+    /// it changed: a window resize, a tab or project switch, a review or pane
+    /// closed from inside, a panel's slide settling. Room is measured without
+    /// the sidebar so showing or hiding it by hand never counts as a change,
+    /// and drags refit once they let go.
+    fn refit_sidebar_to_room(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.resize.is_some()
+            || self.right_resize.is_some()
+            || self.review_drag
+            || self.pane_sash.is_some()
+            || self.dock_resize.is_some()
+            || self.project_resize.is_some()
+        {
+            return;
+        }
+        let room = (
+            self.narrowest_chat(false, cx).round() as i32,
+            self.session_sidebar_available(cx),
+        );
+        if self.sidebar_fitted_room.replace(room) == Some(room) {
+            return;
+        }
+        let this = cx.entity();
+        window.defer(cx, move |_, cx| {
+            this.update(cx, |this, cx| {
+                let visible = this.workspace.sidebar_visible;
+                this.fit_sidebar(cx);
+                if visible != this.workspace.sidebar_visible {
+                    this.persist(cx);
+                    cx.notify();
+                }
+            });
+        });
+    }
     /// newTerminalCwd: the focused session's worktree, else its folder, else
     /// the project.
     fn terminal_cwd(&self, cx: &App) -> String {
@@ -3044,6 +3121,32 @@ impl Shell {
             let t = terminal.read(cx);
             (t.foreground.clone(), project_name(&t.cwd))
         };
+        // The panel's last terminal stays: closing it hides the panel, and
+        // stops whatever it was running.
+        if self.terminal_in_panel(cx) && self.terminals.get(&project).is_some_and(|t| t.len() == 1)
+        {
+            let Some(process) = process else {
+                self.set_right_panel_open(false, window, cx);
+                return;
+            };
+            let answer = window.prompt(
+                gpui::PromptLevel::Warning,
+                &format!("\"{process}\" is still running in {label}. Stop it and close the panel?"),
+                None,
+                &["Stop", "Cancel"],
+                cx,
+            );
+            cx.spawn_in(window, async move |this, cx| {
+                if matches!(answer.await, Ok(0)) {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        terminal.update(cx, |t, cx| t.stop_foreground(cx));
+                        this.set_right_panel_open(false, window, cx);
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
         let Some(process) = process else {
             self.remove_terminal(&project, ix, window, cx);
             return;
@@ -3298,6 +3401,12 @@ impl Shell {
             self.open_file_pane(id, window, cx);
             return;
         }
+        if self.workspace.mono_panes.contains_key(&id) {
+            if self.workspace.active != Some(id) {
+                self.open_mono_pane(id, window, cx);
+            }
+            return;
+        }
         if self.workspace.active == Some(id) {
             return;
         }
@@ -3331,6 +3440,11 @@ impl Shell {
         self.navigation_revision += 1;
         self.begin_pane_motion(before, cx);
         self.fit_sidebar(cx);
+        // A Mono left alone becomes its tab again, and shows when focused.
+        self.settle_mono_panes(window, cx);
+        if self.mono_active(cx) {
+            return;
+        }
         if self.workspace.active != active {
             if let Some(active) = self.workspace.active {
                 self.open(active, window, cx);
@@ -3488,9 +3602,13 @@ impl Shell {
         });
     }
     /// The pane under a point and the edge it would take, in the active tab.
-    fn pane_hit(&self, position: Point<Pixels>) -> Option<(i64, Edge)> {
+    fn pane_hit(&self, position: Point<Pixels>, cx: &App) -> Option<(i64, Edge)> {
         if self.app_view_open() {
             return None;
+        }
+        // The visible Mono hides the tab's panes and stands in for them.
+        if self.mono_active(cx) {
+            return self.mono_view_hit(position, cx);
         }
         let bounds = self.pane_bounds.get()?;
         if !bounds.contains(&position) {
@@ -3561,7 +3679,7 @@ impl Shell {
         let over = if insert.is_some() {
             None
         } else {
-            self.pane_hit(event.position)
+            self.pane_hit(event.position, cx)
                 .and_then(|(id, edge)| {
                     if id != source.session()
                         || matches!(source, DragSource::Review(id) if self.workspace.reviews.get(&id).is_some_and(|r| !r.chat_hidden))
@@ -3618,9 +3736,15 @@ impl Shell {
             self.apply_sidebar_drop(drag.source.session(), target, window, cx);
             return;
         }
+        let mono = match drag.source {
+            DragSource::Pane(pane) => self.workspace.mono_panes.get(&pane).cloned(),
+            _ => None,
+        };
+        let mut over = drag
+            .over
+            .map(|(target, edge)| (self.resolve_mono_target(target, cx), edge));
         let mut before = self.active_leaves();
         let id = drag.source.session();
-        let mut over = drag.over;
         if matches!(drag.source, DragSource::Pane(_))
             && (over.is_some() || drag.insert.is_some())
             && let Some(review) = self.separate_session_review(id, cx)
@@ -3675,6 +3799,17 @@ impl Shell {
         self.history
             .prune(&self.workspace.open_sessions(), self.workspace.active);
         self.fit_sidebar(cx);
+        // A Mono pulled out of its split onto the strip is its tab again.
+        self.settle_mono_panes(window, cx);
+        if let (Some(mono), Some(to)) = (mono, drag.insert)
+            && self.workspace.title_order.contains(&mono)
+        {
+            self.reorder_title_tab(&mono, to, cx);
+        }
+        if self.mono_active(cx) {
+            self.persist(cx);
+            return;
+        }
         if let Some(active) = self.workspace.active {
             self.open(active, window, cx);
         }
@@ -3820,6 +3955,21 @@ impl Shell {
         self.update_usage_provider(cx);
         self.sync_right_panel(cx);
         self.invalidate_chrome(cx);
+        self.save_state(cx);
+    }
+    fn save_window_state(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let bounds = window.inner_window_bounds();
+        // X11 can report Windowed bounds while tracking fullscreen separately.
+        let bounds = if window.is_fullscreen() {
+            gpui::WindowBounds::Fullscreen(bounds.get_bounds())
+        } else {
+            bounds
+        };
+        if self.workspace.window.update(bounds) {
+            self.save_state(cx);
+        }
+    }
+    fn save_state(&mut self, cx: &mut Context<Self>) {
         let state = serde_json::to_string(&self.workspace).unwrap();
         *self.latest_state.lock().unwrap_or_else(|e| e.into_inner()) = state.clone();
         let revision = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3880,6 +4030,9 @@ impl Shell {
             monos.update(cx, |m, cx| m.focus_active(window, cx));
             return;
         }
+        if self.focus_mono_pane(window, cx) {
+            return;
+        }
         if let Some(review) = self
             .active_review(cx)
             .filter(|review| review.read(cx).state.chat_hidden)
@@ -3897,6 +4050,10 @@ impl Shell {
     pub(crate) fn open(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
+            return;
+        }
+        if self.workspace.mono_panes.contains_key(&id) {
+            self.open_mono_pane(id, window, cx);
             return;
         }
         if !self.session_summaries.contains_key(&id) || self.deleting.contains(&id) {
@@ -3952,6 +4109,10 @@ impl Shell {
     fn activate_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
+            return;
+        }
+        if self.workspace.mono_panes.contains_key(&id) {
+            self.open_mono_pane(id, window, cx);
             return;
         }
         if let Some(monos) = &self.monos {
@@ -4011,6 +4172,14 @@ impl Shell {
         self.close_title_tabs(&tabs, preferred, window, cx);
     }
     fn visit(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        // Settings sit over the history: Back leaves them, and Forward
+        // leaves them on its way to the next visit.
+        if self.settings.is_some() {
+            self.close_settings(window, cx);
+            if step < 0 {
+                return;
+            }
+        }
         if let Some(id) = self.history.step(step) {
             self.open(id, window, cx);
         }
@@ -4135,17 +4304,17 @@ impl Shell {
                         self.session_summaries.contains_key(
                             &self
                                 .workspace
-                                .session_for_pane(self.workspace.tab_focus(**id)),
+                                .session_for_pane(self.workspace.scope_pane(**id)),
                         ) && self
                             .session_metadata(
                                 self.workspace
-                                    .session_for_pane(self.workspace.tab_focus(**id)),
+                                    .session_for_pane(self.workspace.scope_pane(**id)),
                                 cx,
                             )
                             .summary
                             .cwd
                             == path
-                            && self.in_worktree_scope(self.workspace.tab_focus(**id), cx)
+                            && self.in_worktree_scope(self.workspace.scope_pane(**id), cx)
                     })
                     .map(|tab| self.workspace.tab_focus(*tab))
             });
@@ -4443,28 +4612,15 @@ impl Shell {
                     .w(px(self.traffic_lights()))
                     .flex_shrink_0(),
             )
-            .child(
-                icon_button("toggle-sidebar", TOGGLE_SIDEBAR_LABEL, "sidebar")
-                    .debug_selector(|| "toggle-sidebar".into())
-                    .child(self.peek_toggle_bounds.probe())
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    // Hovering the toggle peeks a collapsed sidebar out.
-                    .on_hover(cx.listener(|this, hovered, _, cx| {
-                        if !this.workspace.classic_layout {
-                            this.hover_peek_toggle(*hovered, cx)
-                        }
-                    }))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.toggle_primary_sidebar(window, cx)),
-                    ),
-            )
+            .child(self.sidebar_toggle(cx))
             .child(titlebar_drag_area().flex_1())
             .child(
                 icon_button_enabled(
                     "visit-back",
                     BACK_LABEL,
                     "chevron-left",
-                    (self.workspace.classic_layout && self.mono_active(cx))
+                    self.settings.is_some()
+                        || (self.workspace.classic_layout && self.mono_active(cx))
                         || !self.history.back.is_empty(),
                 )
                 .debug_selector(|| "visit-back".into())
@@ -4488,6 +4644,29 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| this.visit(1, window, cx))),
             )
+    }
+    /// Settings fill the sidebar's place, so its toggle steps aside. Its
+    /// slot stays, so nothing beside it moves.
+    fn sidebar_toggle(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        if self.settings.is_some() {
+            return div()
+                .id("toggle-sidebar")
+                .debug_selector(|| "toggle-sidebar".into())
+                .flex_shrink_0()
+                .size(px(24.))
+                .child(self.peek_toggle_bounds.probe());
+        }
+        icon_button("toggle-sidebar", TOGGLE_SIDEBAR_LABEL, "sidebar")
+            .debug_selector(|| "toggle-sidebar".into())
+            .child(self.peek_toggle_bounds.probe())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Hovering the toggle peeks a collapsed sidebar out.
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if !this.workspace.classic_layout {
+                    this.hover_peek_toggle(*hovered, cx)
+                }
+            }))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_primary_sidebar(window, cx)))
     }
     /// Part of the card: the project tools beside the workspace, behind a
     /// hairline. Its contents keep their full width while it slides.
@@ -4643,7 +4822,23 @@ impl Shell {
         true
     }
 
+    fn titlebar_controls_space(&self, bar: AnyElement, window: &Window) -> AnyElement {
+        let room = client_controls_width(window);
+        if room == 0. {
+            return bar;
+        }
+        div()
+            .w_full()
+            .h(px(TITLE_BAR_HEIGHT))
+            .pr(px(room))
+            .child(bar)
+            .into_any_element()
+    }
     fn titlebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let bar = self.titlebar_content(window, cx);
+        self.titlebar_controls_space(bar, window)
+    }
+    fn titlebar_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // Same hierarchy as TitleBar.tsx's inset layout: window navigation and
         // session tabs share the outer shell, above the rounded workspace card.
         if let Some(settings) = self.settings.clone() {
@@ -6887,7 +7082,11 @@ impl Shell {
             }
         }
         let file_panes = leaves.iter().filter(|id| review(id).is_some()).count();
-        let multi_pane = sessions.len() + file_panes > 1;
+        let mono_panes = leaves
+            .iter()
+            .filter(|id| self.workspace.mono_panes.contains_key(id))
+            .count();
+        let multi_pane = sessions.len() + file_panes + mono_panes > 1;
         let session_focused = sessions.first() == Some(&focus);
         let file_focused =
             !session_focused || (self.tab_review_focused(tab, cx) && review(&focus).is_some());
@@ -6902,7 +7101,10 @@ impl Shell {
         let conversation = sessions.first().map(title).unwrap_or_default();
         let file = files.first().cloned().unwrap_or_default();
         let untitled = "New session".to_owned();
-        let headline = if multi_pane && file_focused && !file.is_empty() {
+        let mono = self.mono_pane_title(focus, cx);
+        let headline = if let Some(mono) = mono {
+            mono
+        } else if multi_pane && file_focused && !file.is_empty() {
             file
         } else {
             [conversation, file]
@@ -6914,6 +7116,15 @@ impl Shell {
         // right or down rolls the headline up.
         let mut panes = Vec::new();
         for id in self.workspace.layout(tab).leaf_ids() {
+            if let (Some(title), Some(mark)) =
+                (self.mono_pane_title(id, cx), self.mono_pane_mark(id, cx))
+            {
+                panes.push(TabPane {
+                    key: (id, false),
+                    title,
+                    mark,
+                });
+            }
             if sessions.contains(&id) {
                 let session = self.session_metadata(id, cx);
                 let lit = session.responding()
@@ -6968,6 +7179,12 @@ impl Shell {
                 crate::file_icons::file_type_icon(name, false, false, 14.)
             }
             PaneMark::File(None) => icon("git-compare", 14.).text_color(ink).into_any_element(),
+            PaneMark::Mono(mascot, color) => div()
+                .opacity(if active { 1. } else { 0.55 })
+                .child(crate::monos::avatar::avatar(
+                    mascot, *color, "idle", 14., true,
+                ))
+                .into_any_element(),
         };
         div()
             .size(px(14.))
@@ -7216,17 +7433,22 @@ impl Shell {
         let (id, armed) = (drag.id.clone(), drag.armed);
         // The active tab has no other pane to land on, but its title still
         // follows the pointer.
-        let own = self.workspace.active_tab() == id.session();
+        let own = self.active_title_tab(cx).as_ref() == Some(&id);
+        let source = match &id {
+            TitleTab::Session(tab) => Some(DragSource::Tab(*tab)),
+            TitleTab::Mono { .. } => Some(DragSource::MonoTab),
+            TitleTab::Search | TitleTab::App(_) => None,
+        };
         let was = self.pane_drag.is_some();
-        self.pane_drag = id.session().filter(|_| armed).map(|id| PaneDrag {
-            source: DragSource::Tab(id),
+        self.pane_drag = source.filter(|_| armed).map(|source| PaneDrag {
+            source,
             start: event.position,
             position: event.position,
             active: true,
             over: if own {
                 None
             } else {
-                self.pane_hit(event.position)
+                self.pane_hit(event.position, cx)
             },
             insert: None,
         });
@@ -7238,13 +7460,20 @@ impl Shell {
     fn finish_tab_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(drag) = self.tab_drag.take() {
             let onto_pane = self.pane_drag.as_ref().is_some_and(|d| {
-                Some(d.source.session()) == drag.id.session()
-                    && matches!(d.source, DragSource::Tab(_))
-                    && d.over.is_some()
+                d.over.is_some()
+                    && match d.source {
+                        DragSource::Tab(tab) => drag.id.session() == Some(tab),
+                        DragSource::MonoTab => matches!(drag.id, TitleTab::Mono { .. }),
+                        _ => false,
+                    }
             });
             if onto_pane {
                 self.skip_tab_click = true;
-                self.finish_pane_drag(window, cx);
+                if matches!(drag.id, TitleTab::Mono { .. }) {
+                    self.drop_mono_tab(drag.id, window, cx);
+                } else {
+                    self.finish_pane_drag(window, cx);
+                }
             } else if drag.active {
                 self.cancel_pane_drag(cx);
                 // Each tab glides from where it is drawn into its new slot.
@@ -7365,7 +7594,8 @@ impl Shell {
         } else {
             self.navigation_width()
         };
-        (window.viewport_size().width.as_f32() - lead - trailing).max(0.)
+        (window.viewport_size().width.as_f32() - lead - trailing - client_controls_width(window))
+            .max(0.)
     }
     fn tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let viewport = self.tabs_width(window, cx);
@@ -7969,6 +8199,12 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.keep_visible_idle_agents(cx);
         self.sync_ui_scale(window, cx);
+        if self.mono_panes_unsettled(cx) {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                this.update(cx, |this, cx| this.settle_mono_panes(window, cx));
+            });
+        }
         if let Some(id) = self.pending_composer_focus.take()
             && self
                 .workspace
@@ -7993,6 +8229,17 @@ impl Render for Shell {
         }
         // Native fullscreen transitions resize the window, which redraws it.
         self.fullscreen = window.is_fullscreen();
+        #[cfg(target_os = "linux")]
+        {
+            let client = matches!(
+                window.window_decorations(),
+                gpui::Decorations::Client { .. }
+            );
+            if self.client_decorations != client {
+                self.client_decorations = client;
+                self.invalidate_chrome(cx);
+            }
+        }
         if cx.reduce_motion()
             && (self.sidebar_slide.is_some()
                 || self.right_slide.is_some()
@@ -8014,11 +8261,7 @@ impl Render for Shell {
         let glass = window_glass(p, system_light);
         if self.window_glass != Some(glass) {
             self.window_glass = Some(glass);
-            window.set_background_appearance(if glass {
-                gpui::WindowBackgroundAppearance::Blurred
-            } else {
-                gpui::WindowBackgroundAppearance::Opaque
-            });
+            window.set_background_appearance(crate::theme::window_backdrop(glass));
         }
         self.sync_settings(cx);
         self.sidebar_fraction = match &self.sidebar_slide {
@@ -8068,6 +8311,7 @@ impl Render for Shell {
             window.on_window_should_close(cx, move |window, cx| {
                 shell
                     .update(cx, |shell, cx| {
+                        shell.save_window_state(window, cx);
                         #[cfg(all(target_os = "macos", not(test)))]
                         if shell.workspace.preferences.close_to_tray
                             && shell.workspace.preferences.mono_menu_bar_icon
@@ -8098,10 +8342,14 @@ impl Render for Shell {
                     }
                 }));
             self.observations
-                .push(cx.observe_window_bounds(window, |this, _, cx| this.close_preview(cx)));
+                .push(cx.observe_window_bounds(window, |this, window, cx| {
+                    this.save_window_state(window, cx);
+                    this.close_preview(cx);
+                }));
         }
         self.viewport_width = window.viewport_size().width.as_f32();
         self.viewport_height = window.viewport_size().height.as_f32();
+        self.refit_sidebar_to_room(window, cx);
         self.ensure_right_panel(window, cx);
         let full = self.workspace.right_panel_width;
         let right_width = match &self.right_slide {
@@ -8167,6 +8415,7 @@ impl Render for Shell {
         self.sync_notices(window, cx);
         div()
             .id("monocode-workspace")
+            .relative()
             .role(Role::Application)
             .aria_label("Monocode Native")
             .key_context("Workspace")
@@ -8614,6 +8863,18 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(view, _)| crate::image_lightbox::overlay(view)),
             )
+            .map(|root| {
+                #[cfg(target_os = "linux")]
+                let root = root
+                    .when(self.client_decorations && !self.fullscreen, |root| {
+                        root.child(window_chrome::controls(
+                            window,
+                            cx.listener(|this, _, window, cx| this.request_quit(window, cx)),
+                        ))
+                    })
+                    .children(window_chrome::resize_handles(window));
+                root
+            })
     }
 }
 
@@ -8913,6 +9174,53 @@ mod tests {
             })
             .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[gpui::test]
+    fn window_state_is_saved_on_resize_and_restored_with_the_workspace(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let dimensions = gpui::size(px(1440.), px(900.));
+        cx.simulate_window_resize(window.into(), dimensions);
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let saved = locked(&shell.store).unwrap().ui_state().unwrap().unwrap();
+                assert_eq!(*shell.latest_state.lock().unwrap(), saved);
+                let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+                assert_eq!(restored.window.bounds(cx).get_bounds().size, dimensions);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn window_state_preserves_fullscreen_when_backend_bounds_report_windowed(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = window(cx);
+        let normal_size = gpui::size(px(1440.), px(900.));
+        cx.simulate_window_resize(window.into(), normal_size);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.toggle_fullscreen())
+            .unwrap();
+        cx.simulate_window_resize(window.into(), gpui::size(px(1920.), px(1080.)));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| {
+                // The test backend reproduces X11: fullscreen is tracked separately from bounds.
+                assert!(window.is_fullscreen());
+                assert!(matches!(
+                    window.inner_window_bounds(),
+                    gpui::WindowBounds::Windowed(_)
+                ));
+                let saved = locked(&shell.store).unwrap().ui_state().unwrap().unwrap();
+                assert_eq!(*shell.latest_state.lock().unwrap(), saved);
+                let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+                let bounds = restored.window.bounds(cx);
+                assert!(matches!(bounds, gpui::WindowBounds::Fullscreen(_)));
+                assert_eq!(bounds.get_bounds().size, normal_size);
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn hovering_archive_preserves_history_and_does_not_select_the_row(cx: &mut TestAppContext) {
@@ -12434,6 +12742,56 @@ mod tests {
                 shell.close_pane(pane, w, cx);
             })
             .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
+            .unwrap();
+    }
+    #[gpui::test]
+    fn the_sidebar_follows_the_room_however_it_changes(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        cx.simulate_window_resize(window.into(), gpui::size(px(1400.), px(800.)));
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                shell.focus_active(w, cx);
+            })
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        // Wide enough for two panes beside the sidebar.
+        cx.simulate_keystrokes("cmd-d");
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
+            .unwrap();
+        // Narrowing the window crowds the panes; the sidebar makes room.
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
+            .unwrap();
+        // Widening it again brings the sidebar back.
+        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
+            .unwrap();
+        // Shown by hand while crowded, it stays until the room changes again.
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-b");
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
+            .unwrap();
+        // Hidden by hand, it stays hidden however wide the window grows.
+        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_resize(gpui::size(px(1600.), px(800.)));
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))

@@ -89,10 +89,11 @@ mod traffic_lights;
 mod transcript;
 mod usage_footer;
 mod visuals;
+mod window_state;
 mod workspace;
 mod worktree_switcher;
 
-use gpui::{App, KeyBinding, actions, prelude::*};
+use gpui::{App, KeyBinding, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
 use monocode_core::{store::Store, transcript::Transcript};
 use std::{
     path::PathBuf,
@@ -521,6 +522,13 @@ fn main() {
         db.title(s.id, "Native visuals · Controls, charts and 3D")
             .unwrap();
         db.write_rows(s.id, 0, &fixtures::visuals().rows).unwrap();
+        let s = db
+            .create("claude", &cwd)
+            .expect("create visual story fixture");
+        db.title(s.id, "Native visuals · Charts inside an answer")
+            .unwrap();
+        db.write_rows(s.id, 0, &fixtures::visual_story().rows)
+            .unwrap();
     }
     let mut sessions = db.sessions().expect("read native sessions");
     if sessions.is_empty() && paseo.is_none() {
@@ -582,8 +590,34 @@ fn main() {
                 }
             })
             .detach();
+            let bounds = workspace.window.bounds(cx);
             cx.open_window(
-                native_shell::window_options("Monocode Native", Some("dev.usemono.gpui"), cx),
+                WindowOptions {
+                    window_bounds: Some(bounds),
+                    window_min_size: Some(size(px(820.), px(520.))),
+                    window_decorations: workspace
+                        .preferences
+                        .wayland_decorations(cx.compositor_name()),
+                    // Linux desktops match this to the .desktop file's
+                    // StartupWMClass to show the app icon.
+                    app_id: Some("dev.usemono.gpui".into()),
+                    window_background: theme::window_backdrop(true),
+                    // GPUI owns the custom chrome. AppKit must not reinterpret
+                    // its controls as native titlebar double-click/drag gestures.
+                    app_owns_titlebar_drag: cfg!(target_os = "macos"),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Monocode Native".into()),
+                        appears_transparent: cfg!(target_os = "macos"),
+                        traffic_light_position: if cfg!(target_os = "macos") {
+                            // Original macOS chrome: 12 pt left inset, with
+                            // 14 pt native buttons centered in the 40 pt bar.
+                            Some(point(px(12.), px((theme::TITLE_BAR_HEIGHT - 14.) / 2.)))
+                        } else {
+                            None
+                        },
+                    }),
+                    ..Default::default()
+                },
                 |window, cx| {
                     let shell = cx.new(|cx| {
                         shell::Shell::new_with_metadata(
@@ -611,10 +645,9 @@ mod native_tests {
     use super::*;
     use crate::{input, transcript::TranscriptView};
     use gpui::{
-        Bounds, EntityInputHandler, ListOffset, TestAppContext, WindowBounds, WindowOptions, point,
-        px, size,
+        Bounds, Context, Entity, EntityInputHandler, ListOffset, Render, StyleRefinement, TestAppContext,
+        Window, WindowBounds, WindowOptions, div, point, px, size,
     };
-    use gpui::{Context, Entity, Render, StyleRefinement, Window, div};
     use monocode_core::transcript::Row;
     struct Surface {
         transcript: Entity<TranscriptView>,
