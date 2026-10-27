@@ -1,12 +1,14 @@
 //! RemoteSession.tsx's host observation and composer restrictions.
 use super::*;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub(super) struct State {
     pub(super) client: Option<Arc<monocode_core::remote::Connections>>,
     clock: Option<gpui::Task<()>>,
     pub(super) refreshing: bool,
+    pub(super) first_content_trace: Option<std::time::Instant>,
     pub(super) pending: bool,
     pub(super) online: bool,
     /// A send rejected only because a turn is running; not a remote command.
@@ -24,6 +26,136 @@ impl State {
             .map(|rejected| rejected["error"].as_str().unwrap_or("Older pending requests could not be linked to one conversation. Open the original desktop to recover them."))
     }
 }
+
+/// Shared by the initial Conversation worker and the read-only switch probe.
+/// No view/clearAttention, model or filesystem command is dispatched here.
+pub(crate) struct OpenHistory {
+    remote: monocode_core::store::RemoteSession,
+    settings: monocode_core::agent::Settings,
+    snapshot: Option<Value>,
+    history: Option<(
+        crate::transcript::PreparedHistory,
+        HashMap<usize, monocode_core::agent::TurnInfo>,
+    )>,
+    descriptor: Option<Value>,
+    workspace_choices: Option<Vec<Value>>,
+    pub(crate) timings: Value,
+    machine_id: String,
+}
+struct OpenTimings {
+    started: std::time::Instant,
+    phase: std::time::Instant,
+    values: serde_json::Map<String, Value>,
+}
+impl OpenTimings {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            phase: now,
+            values: Default::default(),
+        }
+    }
+    fn mark(&mut self, key: &str) {
+        self.values.insert(key.into(), json!(self.phase.elapsed().as_secs_f64() * 1000.));
+        self.phase = std::time::Instant::now();
+    }
+    fn finish(mut self) -> Value {
+        self.values.insert("backgroundMs".into(), json!(self.started.elapsed().as_secs_f64() * 1000.));
+        Value::Object(self.values)
+    }
+}
+pub(crate) fn prepare_remote_open(
+    store: &Database,
+    id: i64,
+    known: Option<Value>,
+    client: Option<Arc<monocode_core::remote::Connections>>,
+    initial: bool,
+) -> Result<OpenHistory, String> {
+    let mut timings = OpenTimings::new();
+    let (mut remote, mut settings) = {
+        let store = locked(store)?;
+        timings.mark("storeLockWaitMs");
+        (
+            store
+                .remote_session(id)?
+                .ok_or("Remote session no longer exists")?,
+            store.agent_settings(id)?.unwrap_or_default(),
+        )
+    };
+    timings.mark("storeReadMs");
+    let client = client.ok_or("Remote connections are unavailable")?;
+    let machine = remote.machine(&client)?;
+    timings.mark("machineMs");
+    let descriptor = if initial {
+        Some(client.request(&machine.id, "environment.describe", json!({}))?)
+    } else {
+        None
+    };
+    timings.mark("describeMs");
+    let workspace_choices = if remote.session_id.is_none()
+        && descriptor.as_ref().is_some_and(|d| d["capabilities"]
+            .as_array().is_some_and(|caps| caps.iter().any(|c| c == "paseo.workspaces")))
+    {
+        Some(client.request(&machine.id, "paseo.workspaces",
+            json!({"projectId":remote.project.project_id}))?
+            .as_array().ok_or("Invalid Paseo workspace choices")?.clone())
+    } else {
+        None
+    };
+    timings.mark("workspaceChoicesMs");
+    let snapshot = remote
+        .session_id
+        .as_deref()
+        .map(|session| client.load_session(&machine.id, session, known.as_ref()))
+        .transpose()?;
+    timings.mark("syncMs");
+    let changed = initial
+        || known.as_ref().map(|s| &s["revision"])
+            != snapshot.as_ref().map(|s| &s["revision"]);
+    if let Some(snapshot) = snapshot.as_ref().filter(|_| changed) {
+        let store = locked(store)?;
+        timings.mark("registerLockWaitMs");
+        let summary = store.register_remote_summary(&remote.project, snapshot)?;
+        remote = store
+            .remote_session(summary.id)?
+            .ok_or("Remote session identity is missing")?;
+        settings = store.agent_settings(summary.id)?.unwrap_or_default();
+    }
+    timings.mark("registerMs");
+    let history = if changed {
+        let qualified = snapshot.as_ref().map(|snapshot| {
+            let mut snapshot = snapshot.clone();
+            if let Some(id) = remote.session_id.as_deref() {
+                monocode_core::remote::attachments::qualify_snapshot(
+                    &mut snapshot,
+                    &remote.project.environment_id,
+                    id,
+                );
+            }
+            snapshot
+        });
+        let (history, turns) = qualified
+            .as_ref()
+            .map(monocode_core::store::Store::project_remote_history)
+            .transpose()?
+            .unwrap_or_default();
+        timings.mark("projectionMs");
+        let prepared = crate::transcript::PreparedHistory::new(history.rows, false);
+        timings.mark("prepareMs");
+        Some((prepared, turns))
+    } else {
+        None
+    };
+    let rows = history.as_ref().map_or(0, |(h, _)| h.row_count());
+    let mut timings = timings.finish();
+    timings["rows"] = json!(rows);
+    Ok(OpenHistory {
+        remote, settings, snapshot, history, descriptor, workspace_choices,
+        timings, machine_id: machine.id,
+    })
+}
+
 impl Conversation {
     pub(super) fn paseo_controls(&self) -> bool {
         self.is_remote()
@@ -80,6 +212,17 @@ impl Conversation {
             self.refresh_remote_snapshot(cx);
         }
     }
+    /// Re-syncs an open idle view now so a host-started turn attaches without waiting for the 3 s clock.
+    pub(crate) fn nudge_remote_observation(&mut self, cx: &mut Context<Self>) {
+        if self.is_remote()
+            && self.history_loaded()
+            && !self.busy
+            && !self.stopping
+            && !self.remote_state.refreshing
+        {
+            self.refresh_remote_snapshot(cx);
+        }
+    }
     pub(super) fn refresh_remote_snapshot(&mut self, cx: &mut Context<Self>) {
         if self.remote_state.refreshing || self.busy || self.stopping {
             return;
@@ -94,85 +237,38 @@ impl Conversation {
             self.remote_state.client = monocode_core::remote::default_connections().ok();
         }
         let client = self.remote_state.client.clone();
+        let view_client = client.clone();
+        let started = std::time::Instant::now();
         let work = cx.background_executor().spawn(async move {
-            let (mut remote, mut settings) = {
-                let store = locked(&store)?;
-                (
-                    store
-                        .remote_session(id)?
-                        .ok_or("Remote session no longer exists")?,
-                    store.agent_settings(id)?.unwrap_or_default(),
-                )
-            };
-            let client = client.ok_or("Remote connections are unavailable")?;
-            let machine = remote.machine(&client)?;
-            let descriptor = if initial {
-                Some(client.request(&machine.id, "environment.describe", json!({}))?)
-            } else {
-                None
-            };
-            let workspace_choices = if remote.session_id.is_none()
-                && descriptor.as_ref().is_some_and(|d| d["capabilities"]
-                    .as_array().is_some_and(|caps| caps.iter().any(|c| c == "paseo.workspaces")))
-            {
-                Some(client.request(&machine.id, "paseo.workspaces",
-                    json!({"projectId":remote.project.project_id}))?
-                    .as_array().ok_or("Invalid Paseo workspace choices")?.clone())
-            } else {
-                None
-            };
-            let snapshot = remote
-                .session_id
-                .as_deref()
-                .map(|session| client.load_session(&machine.id, session, known.as_ref()))
-                .transpose()?;
-            let changed = initial
-                || known.as_ref().map(|s| &s["revision"])
-                    != snapshot.as_ref().map(|s| &s["revision"]);
-            if let Some(snapshot) = snapshot.as_ref().filter(|_| changed) {
-                let store = locked(&store)?;
-                let summary = store.register_remote_summary(&remote.project, snapshot)?;
-                remote = store
-                    .remote_session(summary.id)?
-                    .ok_or("Remote session identity is missing")?;
-                settings = store.agent_settings(summary.id)?.unwrap_or_default();
-            }
-            let history = if changed {
-                let qualified = snapshot.as_ref().map(|snapshot| {
-                    let mut snapshot = snapshot.clone();
-                    if let Some(id) = remote.session_id.as_deref() {
-                        monocode_core::remote::attachments::qualify_snapshot(
-                            &mut snapshot,
-                            &remote.project.environment_id,
-                            id,
-                        );
-                    }
-                    snapshot
-                });
-                let (history, turns) = qualified
-                    .as_ref()
-                    .map(monocode_core::store::Store::project_remote_history)
-                    .transpose()?
-                    .unwrap_or_default();
-                Some((
-                    crate::transcript::PreparedHistory::new(history.rows, false),
-                    turns,
-                ))
-            } else {
-                None
-            };
-            if initial && crate::paseo_host::active() && let Some(id) = remote.session_id.as_deref() {
-                client.request(&machine.id, "commands.dispatch", json!({"type":"view", "sessionId":id, "commandId":monocode_core::mono::new_id()}))?;
-            }
-            Ok::<_, String>((remote, settings, snapshot, history, descriptor, workspace_choices))
+            prepare_remote_open(&store, id, known, client, initial)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
+            let notification = result.as_ref().ok().and_then(|loaded| {
+                let paseo = crate::paseo_host::active()
+                    || loaded.descriptor.as_ref().is_some_and(|d| {
+                        d["capabilities"].as_array().is_some_and(|caps| {
+                            caps.iter().any(|c| c == "paseo.configure")
+                        })
+                    });
+                if !initial || !paseo {
+                    return None;
+                }
+                Some((
+                    view_client.clone()?,
+                    loaded.machine_id.clone(),
+                    loaded.remote.session_id.clone()?,
+                ))
+            });
+            let installed = this.update(cx, |this, cx| {
                 this.remote_state.refreshing = false;
                 this.loading = false;
                 match result {
-                    Ok((remote, settings, snapshot, history, descriptor, workspace_choices)) => {
+                    Ok(OpenHistory { remote, settings, snapshot, history, descriptor, workspace_choices, timings, .. }) => {
+                        let install_started = std::time::Instant::now();
+                        if initial && std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+                            this.remote_state.first_content_trace = Some(started);
+                        }
                         this.remote_state.unbound = remote.session_id.is_none();
                         if let Some(choices) = workspace_choices {
                             this.remote_state.workspace_choices = choices;
@@ -214,6 +310,10 @@ impl Conversation {
                                 view.install_prepared_history(history, cx);
                             });
                         }
+                        if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+                            eprintln!("native remote-open {}", json!({"session":id,"initial":initial,"phases":timings,
+                                "mainInstallMs":install_started.elapsed().as_secs_f64()*1000.,"contentInstalledMs":started.elapsed().as_secs_f64()*1000.}));
+                        }
                         this.loaded = true;
                         this.history_unloaded = false;
                         this.status = "Ready".into();
@@ -240,6 +340,11 @@ impl Conversation {
                             this.refresh_catalog(cx);
                             this.refresh_git(cx);
                         }
+                        if initial && std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+                            eprintln!("native remote-open-main {}", json!({"session":id,
+                                "mainCompleteMs":install_started.elapsed().as_secs_f64()*1000.,
+                                "loadToNotifyMs":started.elapsed().as_secs_f64()*1000.}));
+                        }
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);
                         }
@@ -255,6 +360,15 @@ impl Conversation {
                 cx.emit(SessionChanged);
                 cx.notify();
             });
+            if installed.is_ok() && let Some((client, machine, session)) = notification {
+                cx.background_executor().spawn(async move {
+                    let begin = std::time::Instant::now();
+                    let result = client.request(&machine, "commands.dispatch", json!({"type":"view", "sessionId":session, "commandId":monocode_core::mono::new_id()}));
+                    if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+                        eprintln!("native remote-view {}", json!({"session":id,"elapsedMs":begin.elapsed().as_secs_f64()*1000.,"ok":result.is_ok()}));
+                    }
+                }).detach();
+            }
         })
         .detach();
     }

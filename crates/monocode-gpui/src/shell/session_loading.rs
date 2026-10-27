@@ -7,6 +7,7 @@ pub(super) struct Metadata<'a> {
     live: Option<&'a Conversation>,
     draft: bool,
     remote_waiting: bool,
+    remote_running: bool,
 }
 impl Metadata<'_> {
     pub(super) fn display_title(&self) -> String {
@@ -16,8 +17,17 @@ impl Metadata<'_> {
     pub(super) fn needs_approval(&self) -> bool {
         self.live.is_some_and(Conversation::needs_approval) || self.remote_waiting
     }
+    /// A live view that is busy or observes the host itself is authoritative;
+    /// otherwise a Paseo-hosted turn shows through the host index.
     pub(super) fn responding(&self) -> bool {
-        self.live.is_some_and(Conversation::responding)
+        match self.live {
+            Some(live) if live.busy || live.history_loaded() => live.responding(),
+            _ => self.remote_running,
+        }
+    }
+    /// Explicit cancellation: idle in the UI while the worker finishes saving.
+    pub(super) fn cancelling(&self) -> bool {
+        self.live.is_some_and(|live| live.busy && !live.responding())
     }
     pub(super) fn has_saved_draft(&self) -> bool {
         self.live.map_or(self.draft, Conversation::has_saved_draft)
@@ -34,6 +44,11 @@ impl Shell {
             live,
             draft: self.draft_sessions.contains(&id),
             remote_waiting: self.remote_marks.get(&id).is_some_and(|state| state.1),
+            remote_running: self.remote_marks.get(&id).is_some_and(|state| state.0)
+                && self
+                    .remote_details
+                    .get(&id)
+                    .is_some_and(|details| !details["bucket"].is_null()),
         }
     }
     /// Opening and explicit previews materialize chats; enumerating or scrolling
@@ -47,7 +62,12 @@ impl Shell {
             return Some(view.clone());
         }
         let summary = self.session_summaries.get(&id)?.clone();
+        let started = std::time::Instant::now();
         self.add_loaded(summary, cx);
+        if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+            eprintln!("native session-materialize {}", serde_json::json!({"session":id,
+                "ensureSessionMs":started.elapsed().as_secs_f64()*1000.}));
+        }
         self.sessions.get(&id).cloned()
     }
     pub(super) fn trim_session_histories(&mut self, shown: &HashSet<i64>, cx: &mut Context<Self>) {
@@ -297,6 +317,106 @@ mod tests {
             })
             .unwrap();
     }
+    fn paseo_shell(
+        cx: &mut TestAppContext,
+        bucket: serde_json::Value,
+    ) -> (gpui::WindowHandle<Shell>, [i64; 2]) {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mut summaries = Vec::new();
+        for i in 0..3 {
+            let mut session = store.create("codex", "/work/paseo").unwrap();
+            session.title = format!("Paseo {i}");
+            session.has_messages = true;
+            summaries.push(session);
+        }
+        let ids = [summaries[1].id, summaries[2].id];
+        let mut workspace = Workspace::default();
+        workspace.open(summaries[0].id);
+        let saved = serde_json::to_string(&workspace).unwrap();
+        let database = Arc::new(Mutex::new(store));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| Shell::new(database, summaries, "/work/paseo".into(), Some(saved), cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |shell, _, _| {
+                for id in ids {
+                    shell
+                        .remote_details
+                        .insert(id, serde_json::json!({ "bucket": bucket }));
+                }
+            })
+            .unwrap();
+        (window, ids)
+    }
+
+    #[gpui::test]
+    fn paseo_host_turn_marks_a_row_without_materializing_it(cx: &mut TestAppContext) {
+        let (window, [id, other]) = paseo_shell(cx, serde_json::json!("running"));
+        window
+            .update(cx, |shell, _, cx| {
+                let chats = shell.sessions.len();
+                shell.apply_remote_mark(id, true, false, cx);
+                assert!(shell.session_marks[&id].read(cx).state() == MarkState::Working);
+                assert!(shell.session_metadata(id, cx).responding());
+                assert!(shell.busy_sessions.contains(&id));
+                assert!(!shell.session_marks.contains_key(&other));
+                assert_eq!(shell.sessions.len(), chats);
+                shell.apply_remote_mark(id, false, false, cx);
+                assert!(shell.session_marks[&id].read(cx).state() == MarkState::Done);
+                assert!(!shell.session_metadata(id, cx).responding());
+                assert!(shell.unseen_finished.contains(&id));
+                assert!(!shell.busy_sessions.contains(&id));
+                assert_eq!(shell.sessions.len(), chats);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn paseo_waiting_turn_asks_for_tab_attention(cx: &mut TestAppContext) {
+        let (window, [id, _]) = paseo_shell(cx, serde_json::json!("running"));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.apply_remote_mark(id, true, true, cx);
+                assert!(shell.tab_marks[&id].read(cx).state() == MarkState::Attention);
+                assert!(shell.session_marks[&id].read(cx).state() == MarkState::Working);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn host_running_without_a_paseo_bucket_is_not_responding(cx: &mut TestAppContext) {
+        let (window, [id, _]) = paseo_shell(cx, serde_json::Value::Null);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.apply_remote_mark(id, true, false, cx);
+                assert!(!shell.session_metadata(id, cx).responding());
+                assert!(!shell.session_marks.contains_key(&id));
+                assert!(!shell.busy_sessions.contains(&id));
+                shell.apply_remote_mark(id, true, true, cx);
+                assert!(!shell.tab_marks.contains_key(&id));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn focused_paseo_row_finishing_is_not_unseen(cx: &mut TestAppContext) {
+        let (window, [id, _]) = paseo_shell(cx, serde_json::json!("running"));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.active = Some(id);
+                shell.apply_remote_mark(id, true, false, cx);
+                assert!(shell.busy_sessions.contains(&id));
+                shell.apply_remote_mark(id, false, false, cx);
+                assert!(!shell.unseen_finished.contains(&id));
+                assert!(!shell.busy_sessions.contains(&id));
+                assert!(shell.session_marks[&id].read(cx).state() == MarkState::Idle);
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn inactive_history_cache_has_a_count_bound_and_reopens_evicted_history(
         cx: &mut TestAppContext,

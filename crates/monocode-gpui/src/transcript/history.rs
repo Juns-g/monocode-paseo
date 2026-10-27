@@ -14,6 +14,9 @@ pub(crate) struct PreparedHistory {
     parsers: HashMap<usize, MarkdownParser>,
 }
 impl PreparedHistory {
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.len()
+    }
     /// Run on the history loader, before handing its result to the UI.
     pub(crate) fn new(rows: Vec<Row>, mono: bool) -> Self {
         let start = if mono {

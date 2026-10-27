@@ -418,6 +418,32 @@ pub(crate) fn check(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Initial-open background path, twice over the newest sessions. Deliberately
+/// omits view/clearAttention and never attaches a runtime or sends a command.
+pub(crate) fn switch_check(directory: &Path) -> Result<(), String> {
+    check_scratch(directory)?;
+    let mut host = start(directory)?;
+    let store = Arc::new(Mutex::new(host.store.take().ok_or("Bootstrap store missing")?));
+    let client = Arc::new(Connections::new(directory));
+    let mut sessions = store.lock().map_err(|e| e.to_string())?.sessions()?;
+    sessions.retain(|s| !s.archived);
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    sessions.truncate(10);
+    if sessions.is_empty() { return Err("No Paseo sessions to measure".into()); }
+    let mut samples = Vec::new();
+    for pass in ["cold", "warm"] {
+        for (index, session) in sessions.iter().enumerate() {
+            let prepared = crate::conversation::remote::prepare_remote_open(
+                &store, session.id, None, Some(client.clone()), true,
+            )?;
+            samples.push(json!({"pass":pass,"sessionIndex":index,"phases":prepared.timings}));
+        }
+    }
+    println!("{}", json!({"readOnly":true,"sameInitialOpenWorker":true,
+        "viewCommands":0,"sessions":sessions.len(),"samples":samples}));
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn disk_bytes() -> Option<u64> {
     let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };

@@ -2,6 +2,23 @@
 use super::*;
 
 impl Shell {
+    /// Host-reported running/waiting state drives the marks without a live view.
+    pub(super) fn apply_remote_mark(
+        &mut self,
+        id: i64,
+        running: bool,
+        waiting: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.remote_marks.insert(id, (running, waiting));
+        let started = running && !previous.is_some_and(|state| state.0);
+        if previous != Some((running, waiting)) || self.busy_sessions.contains(&id) {
+            self.refresh_session_mark(id, cx);
+        }
+        if started && let Some(view) = self.sessions.get(&id).cloned() {
+            view.update(cx, |view, cx| view.nudge_remote_observation(cx));
+        }
+    }
     pub(super) fn refresh_remote_projects(&mut self, cx: &mut Context<Self>) {
         if self.remote_refreshing || !self.workspace.project.starts_with("remote://") {
             return;
@@ -48,6 +65,7 @@ impl Shell {
                             .collect();
                         for id in removed {
                             this.remote_marks.remove(&id);
+                            this.busy_sessions.remove(&id);
                             this.started_by.remove(&id);
                             this.order.retain(|existing| *existing != id);
                             if let Some(view) = this.sessions.get(&id) {
@@ -58,6 +76,7 @@ impl Shell {
                                     )
                                 });
                             }
+                            this.refresh_session_mark(id, cx);
                             // Open tabs retain an explanatory placeholder. A stale
                             // tab must not be rebound to a new host conversation.
                             if this.workspace.tab_of(id).is_none() {
@@ -71,7 +90,6 @@ impl Shell {
                             if let Some(parent) = index.started_by.get(&id) {
                                 this.started_by.insert(id, *parent);
                             }
-                            this.remote_marks.insert(id, (running, waiting));
                             if draft {
                                 this.draft_sessions.insert(id);
                             } else {
@@ -89,6 +107,7 @@ impl Shell {
                                 });
                             }
                             this.session_summaries.insert(id, summary);
+                            this.apply_remote_mark(id, running, waiting, cx);
                         }
                         if this.workspace.project == project {
                             this.invalidate_chrome(cx);

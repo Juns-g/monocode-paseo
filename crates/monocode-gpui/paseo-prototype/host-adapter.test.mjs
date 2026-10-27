@@ -634,3 +634,19 @@ test('unknown steer never replays after adapter restart',async()=>{
  const again=new PaseoHost(f.client,f.directory);again.connected=true;await again.directory();
  await assert.rejects(again.command(c),/No replay/);assert.equal(sends,1);again.close();f.close();
 });
+
+test('view attention is identity-checked and idempotent without durable command journal writes',async()=>{
+  const f=fixture();try{
+    await f.host.directory();f.a.requiresAttention=true;f.a.attentionReason='finished';
+    let clears=0;f.client.clearAgentAttention=async()=>{clears++;f.a.requiresAttention=false;};
+    let saves=0;const save=f.host.attempts.save.bind(f.host.attempts);
+    f.host.attempts.save=()=>{saves++;save();};
+    const started=performance.now();
+    for(let i=0;i<220;i++)await f.host.command({type:'view',commandId:'view-'+i,sessionId:'a'});
+    assert.equal(clears,1);assert.equal(saves,0);assert.equal(Object.keys(f.host.attempts.values).length,0);
+    await assert.rejects(f.host.command({type:'view',commandId:'wrong',sessionId:'missing'}),/Unknown Paseo agent/);
+    f.a.requiresAttention=true;f.a.attentionReason='permission';
+    await f.host.command({type:'view',commandId:'permission',sessionId:'a'});assert.equal(clears,1);
+    console.log(JSON.stringify({viewOperations:220,journalWrites:saves,journalEntries:Object.keys(f.host.attempts.values).length,elapsedMs:performance.now()-started}));
+  }finally{f.close();}
+});

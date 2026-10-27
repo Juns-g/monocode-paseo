@@ -139,9 +139,13 @@ struct HostFixture {
     stop: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
     directory: PathBuf,
+    view_barrier: Option<Arc<AtomicBool>>,
 }
 impl HostFixture {
     fn new(running: bool, saved_draft: bool) -> Self {
+        Self::with_view_barrier(running, saved_draft, None)
+    }
+    fn with_view_barrier(running: bool, saved_draft: bool, view_barrier: Option<Arc<AtomicBool>>) -> Self {
         use std::io::{BufRead, Read, Write};
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -152,7 +156,10 @@ impl HostFixture {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let descriptor = json!({"protocolVersion": 1, "environmentId": environment, "name": "UI test host", "providers": ["codex"], "capabilities": ["sessions.draft", "sessions.plan", "attachments.upload", "sessions.sync"]});
+        let mut descriptor = json!({"protocolVersion": 1, "environmentId": environment, "name": "UI test host", "providers": ["codex"], "capabilities": ["sessions.draft", "sessions.plan", "attachments.upload", "sessions.sync"]});
+        if view_barrier.is_some() {
+            descriptor["capabilities"].as_array_mut().unwrap().push(json!("paseo.configure"));
+        }
         let snapshot = json!({"projectId": "project", "revision": 1, "status": if running {"running"} else {"idle"}, "runId": if running {json!("host-run")} else {serde_json::Value::Null}, "updatedAt": 42,
             "session": {"id": "host-session", "title": "Conversation on host", "harness": "codex", "model": "codex:gpt-test", "runtimeMode": "supervised", "modelSettings": {}, "blocks": if saved_draft { json!([{ "id": "host-saved-draft", "role": "user", "draft": true, "text": "Saved host draft" }]) } else {json!([])} }
         });
@@ -161,6 +168,7 @@ impl HostFixture {
         let received = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let done = stop.clone();
+        let blocked_view = view_barrier.clone();
         let server = std::thread::spawn(move || {
             let mut snapshot = snapshot;
             let mut syncs = 0;
@@ -208,6 +216,11 @@ impl HostFixture {
                     }
                     "commands.dispatch" => {
                         let command = &request["params"];
+                        if command["type"] == "view" && let Some(barrier) = &blocked_view {
+                            while !barrier.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
                         json!({"commandId": command["commandId"], "sessionId": "host-session", "revision": 2})
                     }
                     _ => json!({}),
@@ -234,6 +247,7 @@ impl HostFixture {
             stop,
             server: Some(server),
             directory,
+            view_barrier,
         }
     }
     fn conversation(&self, cx: &mut TestAppContext) -> Entity<Conversation> {
@@ -270,6 +284,9 @@ impl HostFixture {
 }
 impl Drop for HostFixture {
     fn drop(&mut self) {
+        if let Some(barrier) = &self.view_barrier {
+            barrier.store(true, Ordering::Relaxed);
+        }
         self.stop.store(true, Ordering::Relaxed);
         if let Some(server) = self.server.take() {
             let result = server.join();
@@ -330,6 +347,66 @@ fn opening_running_host_reattaches_without_dispatching_another_turn(cx: &mut Tes
             >= 2
     );
     assert!(!requests.iter().any(|r| r["method"] == "commands.dispatch"));
+}
+
+#[gpui::test]
+fn nudging_observation_resyncs_only_loaded_idle_remote_views(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    let syncs = || {
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "sessions.sync")
+            .count()
+    };
+    let refreshing = |view: &Entity<Conversation>, cx: &mut TestAppContext| {
+        cx.update(|cx| view.read(cx).remote_state.refreshing)
+    };
+    // Unloaded views never start an initial load from a nudge.
+    let unloaded = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(host.summary.clone(), host.store.clone(), cx);
+            view.remote_state.client = Some(host.client.clone());
+            view
+        })
+    });
+    cx.update(|cx| unloaded.update(cx, |view, cx| view.nudge_remote_observation(cx)));
+    assert!(!refreshing(&unloaded, cx));
+    cx.run_until_parked();
+    assert_eq!(syncs(), 0);
+
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    let settled = syncs();
+    // Busy views have their own live sync loop.
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.busy = true;
+            view.nudge_remote_observation(cx);
+            assert!(!view.remote_state.refreshing);
+            view.busy = false;
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(syncs(), settled);
+    // A loaded idle view re-syncs immediately without dispatching a turn.
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.nudge_remote_observation(cx);
+            assert!(view.remote_state.refreshing);
+        })
+    });
+    host.wait(&view, cx, true);
+    assert!(syncs() > settled);
+    assert!(
+        !host
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "commands.dispatch")
+    );
 }
 
 #[gpui::test]
@@ -651,4 +728,125 @@ fn paseo_busy_send_uses_the_native_queue_and_steer_controls(cx: &mut TestAppCont
             }
         });
     }
+}
+
+
+/// Synthetic 1000-row Paseo window through the real Conversation/Transcript.
+/// Timings are diagnostic, not thresholds tied to this machine's load.
+#[gpui::test]
+fn paseo_switch_install_timing(cx: &mut TestAppContext) {
+    use std::time::Instant;
+    let view = conversation(cx);
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, _| view.clone()).unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let mut samples = Vec::new();
+    for iteration in 0..3 {
+        let rows = switch_fixture_rows(iteration);
+        let bytes: usize = rows.iter().map(|row| row.text.len()).sum();
+        let begin = Instant::now();
+        let prepared = crate::transcript::PreparedHistory::new(rows, false);
+        let prepare_ms = begin.elapsed().as_secs_f64()*1000.;
+        let begin = Instant::now();
+        window.update(visual, |view, _, cx| {
+            view.summary.has_messages = true;
+            view.transcript.update(cx, |transcript, cx| {
+                transcript.paseo_mode();
+                transcript.install_prepared_history(prepared, cx);
+                assert_eq!(transcript.source_rows().len(),1000);
+                assert!(transcript.source_rows()[999].text.contains(&format!("{iteration} / 999")));
+            });
+        }).unwrap();
+        let install_ms = begin.elapsed().as_secs_f64()*1000.;
+        let begin = Instant::now();
+        visual.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        }).unwrap();
+        let layout_ms = begin.elapsed().as_secs_f64()*1000.;
+        samples.push(json!({"iteration":iteration,"rows":1000,"bytes":bytes,"prepareMs":prepare_ms,"installMs":install_ms,"testLayoutMs":layout_ms}));
+    }
+    println!("paseo-switch-install {}",json!({"synthetic":true,"gpu":false,"samples":samples}));
+}
+
+fn switch_fixture_rows(iteration: usize) -> Vec<monocode_core::transcript::Row> {
+    (0..1000).map(|i| {
+            let role = match i % 10 { 0 => "user", 1 => "reasoning", 2..=7 => "tool", _ => "assistant" };
+            let text = if role == "tool" {
+                let mut tool = monocode_core::tool::ToolCall::new(&format!("tool-{i}"), "read");
+                tool.input = json!({"filePath":"src/example.rs"}).to_string();
+                tool.output = "Synthetic output\n".repeat(24);
+                tool.state = monocode_core::tool::ToolState::Completed;
+                serde_json::to_string(&tool).unwrap()
+            } else { format!("## Synthetic {iteration} / {i}\n\n{}\n```rust\nfn example() {{}}\n```", "Native Markdown **content**. ".repeat(12)) };
+            monocode_core::transcript::Row {role:role.into(),text,first:true,sent_at:None}
+        }).collect()
+}
+
+#[gpui::test]
+fn paseo_history_installs_before_view_acknowledgement(cx: &mut TestAppContext) {
+    let barrier = Arc::new(AtomicBool::new(false));
+    let host = HostFixture::with_view_barrier(false, true, Some(barrier.clone()));
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.loaded && !view.loading && view.remote_state.online);
+        assert_eq!(view.follow_ups.state.draft.as_ref().unwrap().text, "Saved host draft");
+    });
+    for _ in 0..1000 {
+        cx.run_until_parked();
+        if host.requests.lock().unwrap().iter().any(|r| r["params"]["type"] == "view") { break; }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(!barrier.load(Ordering::Relaxed));
+    assert_eq!(host.requests.lock().unwrap().iter().filter(|r| r["params"]["type"] == "view").count(), 1);
+    barrier.store(true, Ordering::Relaxed);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "Requires Metal; same real Conversation, synthetic history, no daemon or OS window"]
+fn render_paseo_switch_timing_fixture() {
+    use std::time::Instant;
+    let mut cx = gpui::HeadlessAppContext::with_platform(
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+        Arc::new(crate::assets::Assets),
+        || Ok(Some(Box::new(gpui_apple::metal_renderer::MetalHeadlessRenderer::new()))),
+    );
+    let window = cx.open_window(gpui::size(px(1180.), px(800.)), |_, cx| {
+        let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+        let mut summary = store.create("codex", "/synthetic").unwrap();
+        summary.cwd = "remote://fixture/synthetic".into();
+        summary.has_messages = true;
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+            view.loaded = true;
+            view
+        })
+    }).unwrap();
+    let mut samples = Vec::new();
+    for i in 0..3 {
+        let begin = Instant::now();
+        let prepared = crate::transcript::PreparedHistory::new(switch_fixture_rows(i), false);
+        let prepare_ms = begin.elapsed().as_secs_f64()*1000.;
+        let begin = Instant::now();
+        cx.update_window(window.into(), |view, _, cx| {
+            view.downcast::<Conversation>().unwrap().update(cx, |view, cx| {
+                view.transcript.update(cx, |v, cx| { v.paseo_mode(); v.install_prepared_history(prepared, cx); });
+            });
+        }).unwrap();
+        let install_ms = begin.elapsed().as_secs_f64()*1000.;
+        let begin = Instant::now();
+        cx.update_window(window.into(), |_, window, cx| {window.refresh();window.draw(cx).clear(cx);}).unwrap();
+        cx.run_until_parked();
+        let draw_ms = begin.elapsed().as_secs_f64()*1000.;
+        samples.push(json!({"iteration":i,"prepareMs":prepare_ms,"installMs":install_ms,"metalDrawMs":draw_ms}));
+    }
+    if let Some(directory) = std::env::var_os("PASEO_SWITCH_RENDER_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        cx.capture_screenshot(window.into()).unwrap().save(PathBuf::from(directory).join("r14-switch.png")).unwrap();
+    }
+    println!("paseo-switch-metal {}", json!({"synthetic":true,"rows":1000,"samples":samples}));
 }

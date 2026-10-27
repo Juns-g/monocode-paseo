@@ -368,6 +368,15 @@ export class PaseoHost {
   async command(c){
     this.identity();if(c.type==='create')return this.create(c);
     const entry=await this.target(c.sessionId),agent=entry.agent,control=this.control(agent);
+    // Viewing only clears non-permission attention. It is idempotent, not an
+    // at-most-once send; do not grow or rewrite the durable command journal.
+    if(c.type==='view'){
+      if(!c.commandId||typeof c.commandId!=='string')throw Error('Missing command identity');
+      if(agent.requiresAttention && agent.attentionReason!=='permission' && !agent.pendingPermissions?.length){
+        await control.dispatch({serverId:this.serverId,agentId:agent.id,op:'clearAttention'});this.invalidate();
+      }
+      return {commandId:c.commandId,sessionId:agent.id,revision:this.revision};
+    }
     return this.attempts.run(c,async()=>{
       const base={serverId:this.serverId,agentId:agent.id};
       if(c.type==='configure'){
@@ -391,8 +400,6 @@ export class PaseoHost {
           this.identity();await this.client.setAgentThinkingOption(agent.id,config.thinkingOptionId);
           for(const [id,value] of Object.entries(config.featureValues??{})){this.identity();await this.client.setAgentFeature(agent.id,id,value);}
         }
-      }else if(c.type==='view'){
-        if(agent.requiresAttention && agent.attentionReason!=='permission' && !agent.pendingPermissions?.length)await control.dispatch({...base,op:'clearAttention'});
       }else if(c.type==='send'){
         if(c.attachments?.length||c.intent||c.draftBlockId||c.planBlockId)throw Error('此适配层暂不支持附件、计划或草稿；请在 Paseo 发送。');
         const result=await control.dispatch({...base,op:'send',messageId:c.commandId,text:c.text,acknowledgeRace:true,

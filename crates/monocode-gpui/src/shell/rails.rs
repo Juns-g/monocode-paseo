@@ -67,10 +67,8 @@ impl Shell {
     fn in_play(&self, id: i64, cx: &App) -> bool {
         (self.workspace.active == Some(id) && !self.mono_active(cx))
             || self.selected_sessions.contains(&id)
-            || self
-                .sessions
-                .get(&id)
-                .is_some_and(|s| s.read(cx).responding())
+            || ((self.session_summaries.contains_key(&id) || self.sessions.contains_key(&id))
+                && self.session_metadata(id, cx).responding())
     }
     /// groupStartedSessions: each listed session another started joins the
     /// listed session at the top of its chain; one whose caller is not listed

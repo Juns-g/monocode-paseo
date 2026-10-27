@@ -1244,9 +1244,11 @@ impl Shell {
         }
         self.session_summaries.insert(id, summary.clone());
         self.session_marks
-            .insert(id, cx.new(|_| SessionMark::new(summary.provider.clone())));
+            .entry(id)
+            .or_insert_with(|| cx.new(|_| SessionMark::new(summary.provider.clone())));
         self.tab_marks
-            .insert(id, cx.new(|_| SessionMark::tab(summary.provider.clone())));
+            .entry(id)
+            .or_insert_with(|| cx.new(|_| SessionMark::tab(summary.provider.clone())));
         let appearance = self.appearance(&summary.cwd);
         let worktree = self.session_worktrees.get(&id).cloned().flatten();
         let view = cx.new(|cx| Conversation::new(summary, self.store.clone(), cx));
@@ -1335,24 +1337,32 @@ impl Shell {
     }
     fn refresh_session_mark(&mut self, id: i64, cx: &mut Context<Self>) {
         let id = self.workspace.session_for_pane(id);
-        let Some(view) = self.sessions.get(&id) else {
+        if !self.session_summaries.contains_key(&id) && !self.sessions.contains_key(&id) {
             return;
+        }
+        let (busy, cancelling, attention, archived, provider) = {
+            let session = self.session_metadata(id, cx);
+            (
+                session.responding(),
+                session.cancelling(),
+                session.needs_approval(),
+                session.summary.archived,
+                session.summary.provider.clone(),
+            )
         };
-        let session = view.read(cx);
-        let busy = session.responding();
         let focused = !self.app_view_open() && self.workspace.active == Some(id);
         if busy {
             self.busy_sessions.insert(id);
             self.unseen_finished.remove(&id);
-        } else if session.busy {
+        } else if cancelling {
             // Explicit cancellation is already idle in the UI. The worker is
             // only finishing its save, so it must not announce a completed turn.
             self.busy_sessions.remove(&id);
             self.unseen_finished.remove(&id);
-        } else if self.busy_sessions.remove(&id) && !focused && !session.summary.archived {
+        } else if self.busy_sessions.remove(&id) && !focused && !archived {
             self.unseen_finished.insert(id);
         }
-        if focused || session.summary.archived {
+        if focused || archived {
             self.unseen_finished.remove(&id);
         }
         let state = if busy {
@@ -1363,15 +1373,28 @@ impl Shell {
             MarkState::Idle
         };
         // A blocked turn is still busy, but the tab asks for attention first.
-        let attention = session.needs_approval();
         let tab_state = if attention {
             MarkState::Attention
         } else {
             state
         };
-        let provider = session.summary.provider.clone();
-        self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
-        self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
+        // Unopened rows get marks only from a Paseo host's turn.
+        let hosted = self
+            .remote_details
+            .get(&id)
+            .is_some_and(|details| !details["bucket"].is_null());
+        if (hosted && state != MarkState::Idle) || self.session_marks.contains_key(&id) {
+            self.session_marks
+                .entry(id)
+                .or_insert_with(|| cx.new(|_| SessionMark::new(provider.clone())))
+                .update(cx, |mark, cx| mark.set(&provider, state, cx));
+        }
+        if (hosted && tab_state != MarkState::Idle) || self.tab_marks.contains_key(&id) {
+            self.tab_marks
+                .entry(id)
+                .or_insert_with(|| cx.new(|_| SessionMark::tab(provider.clone())))
+                .update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
+        }
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
         if !self.archiving.insert(id) {

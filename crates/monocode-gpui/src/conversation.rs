@@ -14,7 +14,7 @@ mod mobile;
 mod mono;
 mod notifications;
 mod presets;
-mod remote;
+pub(crate) mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
 #[cfg(test)]
@@ -3772,6 +3772,10 @@ mod composer_motion_tests {
 }
 impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(started) = self.remote_state.first_content_trace.take() {
+            eprintln!("native remote-open-render {}", serde_json::json!({"session":self.summary.id,
+                "loadToRenderMs":started.elapsed().as_secs_f64()*1000.}));
+        }
         if self._input_focus.is_none() {
             let focus = self.input.focus_handle(cx);
             self._input_focus = Some([

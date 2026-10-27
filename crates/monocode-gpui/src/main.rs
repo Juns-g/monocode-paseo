@@ -193,6 +193,15 @@ fn main() {
         }
         return;
     }
+    if prototype_args.first().is_some_and(|a| a == "--paseo-switch-check") {
+        let path = prototype_args.get(1)
+            .expect("--paseo-switch-check needs an isolated scratch path");
+        if let Err(error) = paseo_host::switch_check(std::path::Path::new(path)) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if prototype_args
         .first()
         .is_some_and(|a| a == "--paseo-perf-check")
