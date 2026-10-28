@@ -140,12 +140,25 @@ struct HostFixture {
     server: Option<std::thread::JoinHandle<()>>,
     directory: PathBuf,
     view_barrier: Option<Arc<AtomicBool>>,
+    sync_barrier: Option<Arc<AtomicBool>>,
 }
 impl HostFixture {
     fn new(running: bool, saved_draft: bool) -> Self {
         Self::with_view_barrier(running, saved_draft, None)
     }
     fn with_view_barrier(running: bool, saved_draft: bool, view_barrier: Option<Arc<AtomicBool>>) -> Self {
+        Self::with_barriers(running, saved_draft, view_barrier, None)
+    }
+    /// A Paseo host whose `sessions.sync` blocks until `sync_barrier` is set.
+    fn with_sync_barrier(sync_barrier: Arc<AtomicBool>) -> Self {
+        Self::with_barriers(false, false, None, Some(sync_barrier))
+    }
+    fn with_barriers(
+        running: bool,
+        saved_draft: bool,
+        view_barrier: Option<Arc<AtomicBool>>,
+        sync_barrier: Option<Arc<AtomicBool>>,
+    ) -> Self {
         use std::io::{BufRead, Read, Write};
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -157,7 +170,7 @@ impl HostFixture {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let mut descriptor = json!({"protocolVersion": 1, "environmentId": environment, "name": "UI test host", "providers": ["codex"], "capabilities": ["sessions.draft", "sessions.plan", "attachments.upload", "sessions.sync"]});
-        if view_barrier.is_some() {
+        if view_barrier.is_some() || sync_barrier.is_some() {
             descriptor["capabilities"].as_array_mut().unwrap().push(json!("paseo.configure"));
         }
         let snapshot = json!({"projectId": "project", "revision": 1, "status": if running {"running"} else {"idle"}, "runId": if running {json!("host-run")} else {serde_json::Value::Null}, "updatedAt": 42,
@@ -169,6 +182,7 @@ impl HostFixture {
         let stop = Arc::new(AtomicBool::new(false));
         let done = stop.clone();
         let blocked_view = view_barrier.clone();
+        let blocked_sync = sync_barrier.clone();
         let server = std::thread::spawn(move || {
             let mut snapshot = snapshot;
             let mut syncs = 0;
@@ -206,6 +220,11 @@ impl HostFixture {
                 let result = match request["method"].as_str().unwrap() {
                     "environment.describe" => descriptor.clone(),
                     "sessions.sync" => {
+                        if let Some(barrier) = &blocked_sync {
+                            while !barrier.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
                         syncs += 1;
                         if running && syncs > 1 {
                             snapshot["status"] = json!("idle");
@@ -248,6 +267,7 @@ impl HostFixture {
             server: Some(server),
             directory,
             view_barrier,
+            sync_barrier,
         }
     }
     fn conversation(&self, cx: &mut TestAppContext) -> Entity<Conversation> {
@@ -285,6 +305,9 @@ impl HostFixture {
 impl Drop for HostFixture {
     fn drop(&mut self) {
         if let Some(barrier) = &self.view_barrier {
+            barrier.store(true, Ordering::Relaxed);
+        }
+        if let Some(barrier) = &self.sync_barrier {
             barrier.store(true, Ordering::Relaxed);
         }
         self.stop.store(true, Ordering::Relaxed);
@@ -912,4 +935,92 @@ fn render_paseo_switch_timing_fixture() {
         cx.capture_screenshot(window.into()).unwrap().save(PathBuf::from(directory).join("r14-switch.png")).unwrap();
     }
     println!("paseo-switch-metal {}", json!({"synthetic":true,"rows":1000,"samples":samples}));
+}
+
+#[gpui::test]
+fn paseo_cold_open_shows_loading_until_first_snapshot_lands(cx: &mut TestAppContext) {
+    let barrier = Arc::new(AtomicBool::new(false));
+    let host = HostFixture::with_sync_barrier(barrier.clone());
+    cx.update(|cx| {
+        let mut preferences = crate::settings::Preferences::default();
+        preferences
+            .extra
+            .insert(crate::paseo_host::PROJECT_SELECTION.into(), json!({}));
+        cx.set_global(preferences);
+    });
+    // The sidebar index lists a never-loaded conversation as having content.
+    let mut summary = host.summary.clone();
+    summary.has_messages = true;
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, host.store.clone(), cx);
+                view.remote_state.client = Some(host.client.clone());
+                view.load_remote(cx);
+                view
+            })
+        })
+        .unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    window
+        .update(visual, |view, _, _| assert!(view.loading && !view.loaded))
+        .unwrap();
+    assert!(visual.debug_bounds("paseo-cold-open-loading").is_some());
+    barrier.store(true, Ordering::Relaxed);
+    for _ in 0..1000 {
+        visual.run_until_parked();
+        if window.update(visual, |view, _, _| view.loaded).unwrap() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    visual.refresh().unwrap();
+    window
+        .update(visual, |view, _, _| assert!(view.loaded && !view.loading))
+        .unwrap();
+    assert!(visual.debug_bounds("paseo-cold-open-loading").is_none());
+}
+
+#[gpui::test]
+fn cold_open_loading_line_is_paseo_only_and_never_hides_an_error(cx: &mut TestAppContext) {
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let mut summary = store.create("codex", "/test-project").unwrap();
+    summary.cwd = "remote://remote-ui-tests/home/me/project".into();
+    summary.has_messages = true;
+    cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                view.loading = true;
+                view
+            })
+        })
+        .unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    // An ordinary remote host (no Paseo prototype) renders as before.
+    assert!(visual.debug_bounds("paseo-cold-open-loading").is_none());
+    visual.update(|_, cx| {
+        let mut preferences = crate::settings::Preferences::default();
+        preferences
+            .extra
+            .insert(crate::paseo_host::PROJECT_SELECTION.into(), json!({}));
+        cx.set_global(preferences);
+    });
+    window.update(visual, |_, _, cx| cx.notify()).unwrap();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("paseo-cold-open-loading").is_some());
+    // A failed load keeps the error path, not a perpetual loading line.
+    window
+        .update(visual, |view, _, cx| {
+            view.remote_state.error = Some("offline".into());
+            cx.notify();
+        })
+        .unwrap();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("paseo-cold-open-loading").is_none());
 }

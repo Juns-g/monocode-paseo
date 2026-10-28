@@ -3846,6 +3846,23 @@ impl Render for Conversation {
                             .clone()
                             .cached(StyleRefinement::default().size_full()),
                     )
+                    .when(self.paseo_cold_open(cx), |d| {
+                        d.child(
+                            div()
+                                .id("paseo-cold-open-loading")
+                                .debug_selector(|| "paseo-cold-open-loading".into())
+                                .role(Role::Status)
+                                .aria_label("Loading from Paseo…")
+                                .absolute()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(13.))
+                                .text_color(content(0.45))
+                                .child("Loading from Paseo…"),
+                        )
+                    })
                     // Level with the transcript's jump button, which moves to
                     // the column's other end.
                     .children(pill.map(|pill| {

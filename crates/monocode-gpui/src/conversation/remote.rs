@@ -178,6 +178,17 @@ impl Conversation {
             && (crate::paseo_host::active()
                 || self.remote_state.capabilities.contains("paseo.configure"))
     }
+    /// A Paseo conversation still waiting for its first snapshot (the daemon may
+    /// be resuming the agent). Same prototype gate as the failed-load retry.
+    pub(super) fn paseo_cold_open(&self, cx: &gpui::App) -> bool {
+        self.is_remote()
+            && self.loading
+            && (!self.loaded || self.history_unloaded)
+            && self.remote_state.error.is_none()
+            && cx
+                .try_global::<crate::settings::Preferences>()
+                .is_some_and(crate::paseo_host::project_ui)
+    }
     pub(super) fn paseo_follow_ups(&self) -> bool {
         self.paseo_controls() && self.remote_state.capabilities.contains("paseo.steer")
     }
