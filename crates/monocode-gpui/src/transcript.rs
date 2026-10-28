@@ -6,6 +6,8 @@ mod drafts;
 mod follow_tests;
 pub(crate) mod git_turns;
 mod history;
+#[cfg(test)]
+mod live_turn_tests;
 pub(crate) use history::{HistoryPager, PreparedHistory};
 mod links;
 mod live_phase;
@@ -1034,7 +1036,10 @@ impl TranscriptView {
     /// The latest live activity, without relabeling a completed turn before
     /// the next prompt arrives.
     fn mono_activity(&self) -> Option<(usize, String)> {
-        if !self.mono || !self.streaming || self.source.len() <= self.live_start {
+        if !self.mono
+            || !self.streaming
+            || (self.source.len() <= self.live_start && self.awaiting_first_row().is_none())
+        {
             return None;
         }
         let latest = self
@@ -1602,6 +1607,81 @@ impl TranscriptView {
             self.rebuild(from, cx);
         }
         cx.notify();
+    }
+    /// The fold line sits where the work starts, from before there is any.
+    /// A live turn whose source still ends at its prompt shows the WorkLine
+    /// its first response row will own, under that row's key and message.
+    fn push_live_placeholder(&mut self) {
+        let at = self.source.len();
+        let Some(turn) = self.awaiting_first_row().filter(|_| !self.document) else {
+            return;
+        };
+        if self.mono
+            && self.mono_group_start(turn) != turn
+            && !(self.history_start > 0 && self.prompt_start(turn) == self.history_start)
+        {
+            return;
+        }
+        let message = self.messages.len();
+        let group = if self.mono {
+            self.mono_group_start(turn)
+        } else {
+            turn
+        };
+        for (ordinal, body) in [
+            (
+                0,
+                Body::WorkLine {
+                    turn,
+                    expandable: false,
+                },
+            ),
+            (
+                usize::MAX - 1,
+                Body::Actions {
+                    turn: group,
+                    complete: false,
+                },
+            ),
+        ] {
+            self.rows.push(UiRow {
+                key: (at, ordinal),
+                body,
+                message,
+                first: ordinal == 0,
+                last: ordinal == 0,
+                work: false,
+                work_tail: false,
+                thought_phase: None,
+            });
+        }
+        self.messages.push(Message {
+            start: at,
+            display_start: self.rows.len() - 2,
+            role: "assistant".into(),
+            parser: MarkdownParser::default(),
+            markdown_blocks: Vec::new(),
+            under_line: false,
+            turn: group,
+            attachments: Arc::default(),
+            prompt_fingerprint: 0,
+            user_link: None,
+        });
+    }
+    /// The WorkLine of the response starting at `start` belongs to the live turn.
+    fn work_line_live(&self, start: usize) -> bool {
+        self.streaming
+            && start >= self.live_start
+            && self.source[start..].iter().all(|r| !r.is_prompt())
+    }
+    /// The live turn, while its source still ends at the prompt.
+    fn awaiting_first_row(&self) -> Option<usize> {
+        let prompt = self.source.iter().rposition(Row::is_prompt)?;
+        (self.streaming
+            && self.source[prompt + 1..]
+                .iter()
+                .all(|row| row.role == monocode_core::transcript::attachments::ROLE))
+        .then_some(prompt + 1)
     }
     fn push_pending(&mut self, at: usize) {
         for i in 0..self.pending.len() {
@@ -2695,8 +2775,11 @@ impl TranscriptView {
             }
         }
         // Starting a normal turn must not re-open the previous turn's work or
-        // rebuild it as live while the new prompt is still in transit.
-        if (!streaming || self.mono) && !self.messages.is_empty() {
+        // rebuild it as live while the new prompt is still in transit. A turn
+        // attached after its stored prompt shows its live line at once.
+        if (!streaming || self.mono || self.awaiting_first_row().is_some())
+            && !self.messages.is_empty()
+        {
             let start = self
                 .source
                 .iter()
@@ -3788,6 +3871,7 @@ impl TranscriptView {
             }
             at = end;
         }
+        self.push_live_placeholder();
         self.prepared_parsers.clear();
         if self.mono && !self.rows.iter().any(|r| matches!(r.body, Body::Pending(_))) {
             self.push_pending(self.source.len());
@@ -4801,9 +4885,7 @@ impl TranscriptView {
             }
             Body::WorkLine { turn, .. } if self.mono => self.mono_turn_header(turn, cx),
             Body::WorkLine { turn, expandable } => {
-                let live = self.streaming
-                    && message_start >= self.live_start
-                    && self.source[message_start..].iter().all(|r| !r.is_prompt());
+                let live = self.work_line_live(message_start);
                 let elapsed = if live {
                     self.started.map(|at| at.elapsed())
                 } else {
