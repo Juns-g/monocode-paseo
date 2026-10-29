@@ -551,7 +551,10 @@ impl TranscriptView {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(COPIED_DELAY).await;
             let _ = this.update(cx, |this, cx| {
-                if this.selection.0.borrow().copied == Some(born) {
+                let state = this.selection.0.borrow();
+                let pending = state.copied == Some(born) && state.menu.is_some();
+                drop(state);
+                if pending {
                     this.selection.clear();
                     cx.notify();
                 }
@@ -780,6 +783,22 @@ mod tests {
         cx.run_until_parked();
         view.update(cx, |view, _| {
             assert!(view.selection.0.borrow().anchor.is_some())
+        });
+    }
+    #[gpui::test]
+    fn menu_copy_timer_keeps_the_selection_after_an_outside_dismiss(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            let (_, text) = select_hello(view, cx);
+            view.copy_menu_selection(text, cx);
+            // The popover's on_dismiss only closes the menu.
+            view.selection.0.borrow_mut().menu = None;
+        });
+        cx.executor().advance_clock(COPIED_DELAY * 2);
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let state = view.selection.0.borrow();
+            assert!(state.anchor.is_some() && state.head.is_some());
         });
     }
     #[test]
