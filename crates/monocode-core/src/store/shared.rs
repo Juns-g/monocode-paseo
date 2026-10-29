@@ -271,6 +271,7 @@ impl Store {
         let (extras, extras_db) = settings::open(path, read_only)?;
         let store = Self {
             remote_status: Default::default(),
+            remote_mutations: Default::default(),
             conn,
             path: path.into(),
             shared: Some(Shared {

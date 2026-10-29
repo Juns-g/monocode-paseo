@@ -17,6 +17,8 @@ mod mobile_host;
 mod mono_panes;
 pub(crate) mod monos;
 mod notifications;
+#[cfg(test)]
+mod paseo_archive_tests;
 mod orchestration;
 mod picker_preferences;
 mod project_rail;
@@ -812,7 +814,14 @@ impl Shell {
                 std::env::temp_dir().join(format!("monocode-remote-{}", std::process::id()))
             });
         let remote = Arc::new(monocode_core::remote::Connections::new(remote_dir));
-        monocode_core::remote::set_default_connections(remote.clone());
+        // Tests that script a host pin the process-wide transport to their own.
+        #[cfg(test)]
+        let pinned = paseo_archive_tests::default_pinned();
+        #[cfg(not(test))]
+        let pinned = false;
+        if !pinned {
+            monocode_core::remote::set_default_connections(remote.clone());
+        }
         let quit_remote = remote.clone();
         cx.on_app_quit(move |_, cx| {
             let remote = quit_remote.clone();

@@ -121,6 +121,23 @@ mod tests {
             assert!(!view.focus_pending);
             view.renaming.as_ref().unwrap().input.update(cx,|i,cx|i.set_text(" ".into(),cx));
             let serial=view.serial;view.finish_rename(true,window,cx);assert_eq!(view.serial,serial);
+            // A sub-conversation card renames its agent, prefilled from the agent title.
+            let child=json!({"agent":{"id":"k","workspaceId":"w","title":"Child title","labels":{"paseo.parent-agent-id":"b"}},"project":{"projectKey":"p"},"workspace":{"id":"w","name":"Synthetic name","title":"Workspace title","pinnedAt":null,"canArchive":true}});
+            view.start_rename(child.clone(),window,cx);
+            assert_eq!(view.renaming.as_ref().unwrap().input.read(cx).content.as_ref(),"Child title");
+            view.renaming.as_ref().unwrap().input.update(cx,|i,cx|i.set_text(" 子标题 ".into(),cx));
+            let serial=view.serial;view.finish_rename(true,window,cx);
+            assert_eq!(view.serial,serial+1);
+            assert_eq!(view.pending.get(&view.serial).map(String::as_str),Some("renameAgent"));
+            // An empty parent label is not a child; the workspace anchor keeps renameWorkspace.
+            let anchor=json!({"agent":{"id":"b","workspaceId":"w","title":"Agent title","labels":{"paseo.parent-agent-id":""}},"project":{"projectKey":"p"},"workspace":{"id":"w","name":"Synthetic name","title":"Workspace title","pinnedAt":null,"canArchive":true}});
+            view.start_rename(anchor,window,cx);
+            assert_eq!(view.renaming.as_ref().unwrap().input.read(cx).content.as_ref(),"Workspace title");
+            view.finish_rename(false,window,cx);
+            // The reply refreshes the directory like the other workspace ops.
+            let rename=view.serial;
+            view.receive(json!({"id":rename,"ok":true,"value":{"serverId":"s","agentId":"k"}}),cx);
+            assert!(view.pending.values().any(|op|op=="list"),"renameAgent reply must refresh the directory");
             view.run_context_action(Target::Card(entry.clone()),"pin",window,cx);
             assert!(view.pending.values().any(|op|op=="pinWorkspace"));
             view.run_context_action(Target::Tab("b".into()),"all",window,cx);
@@ -338,7 +355,11 @@ impl Prototype {
     }
     fn workspace_command(&mut self, op: &str, entry: &Value, mut args: Value) {
         args["agentId"] = entry["agent"]["id"].clone();
-        args["workspaceId"] = entry["workspace"]["id"].clone();
+        args["workspaceId"] = if entry["workspace"]["id"].is_string() {
+            entry["workspace"]["id"].clone()
+        } else {
+            entry["agent"]["workspaceId"].clone()
+        };
         self.error.clear();
         self.command(op, args);
     }
@@ -352,8 +373,20 @@ impl Prototype {
             self.start_rename(entry, window, cx);
         }
     }
+    /// A sub-conversation card shows its own agent title; renaming it renames the agent.
+    fn is_child_agent(entry: &Value) -> bool {
+        entry["agent"]["labels"]["paseo.parent-agent-id"]
+            .as_str()
+            .is_some_and(|parent| !parent.is_empty())
+    }
     fn start_rename(&mut self, entry: Value, window: &mut Window, cx: &mut Context<Self>) {
-        if !entry["workspace"]["id"].is_string() || self.sending.is_some() {
+        let child = Self::is_child_agent(&entry);
+        if !(if child {
+            entry["agent"]["id"].is_string()
+        } else {
+            entry["workspace"]["id"].is_string()
+        }) || self.sending.is_some()
+        {
             return;
         }
         self.focus_pending = false;
@@ -367,11 +400,15 @@ impl Prototype {
             i.set_font_size(14.);
             i
         });
-        let title = entry["workspace"]["title"]
-            .as_str()
-            .or_else(|| entry["workspace"]["name"].as_str())
-            .unwrap_or("")
-            .to_owned();
+        let title = if child {
+            entry["agent"]["title"].as_str()
+        } else {
+            entry["workspace"]["title"]
+                .as_str()
+                .or_else(|| entry["workspace"]["name"].as_str())
+        }
+        .unwrap_or("")
+        .to_owned();
         input.update(cx, |i, cx| {
             i.set_text(title.clone(), cx);
             i.select_range(0..title.len(), cx);
@@ -416,7 +453,12 @@ impl Prototype {
         };
         let text = rename.input.read(cx).content.trim().to_owned();
         if commit && !text.is_empty() && rename.server == self.server {
-            self.workspace_command("renameWorkspace", &rename.entry, json!({"title":text}));
+            let op = if Self::is_child_agent(&rename.entry) {
+                "renameAgent"
+            } else {
+                "renameWorkspace"
+            };
+            self.workspace_command(op, &rename.entry, json!({"title":text}));
         }
         self.focus_composer(window, cx);
         cx.notify();

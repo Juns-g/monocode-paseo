@@ -5,7 +5,7 @@ use monocode_core::session_groups::Entry;
 use std::cell::{Cell, RefCell};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Row {
+pub(super) enum Row {
     Navigation,
     Monos,
     Pinned,
@@ -36,7 +36,7 @@ enum Row {
 
 pub(super) struct SidebarList {
     pub(super) state: ListState,
-    rows: Vec<Row>,
+    pub(super) rows: Vec<Row>,
     scope: String,
     structure_dirty: Cell<bool>,
     indexed_minute: u64,
@@ -223,6 +223,8 @@ impl Shell {
     /// hover state. Keep the expensive project index until a data notification
     /// invalidates it; individual cards still read live metadata each render.
     pub(super) fn refresh_sidebar_structure(&mut self, cx: &mut Context<Self>) {
+        // A project that was not listed at startup still shows its saved folders.
+        self.ensure_project_groups();
         let scope = self.sidebar_scope();
         let minute = monocode_core::time::now_ms() / 60_000;
         if self.sidebar_list.structure_dirty.replace(false)
@@ -276,6 +278,26 @@ impl Shell {
         )
     }
 
+    /// A Paseo folder lists only rows the sidebar shows on their own: a
+    /// sub agent travels with its parent's rail. A folder with none is hidden.
+    fn visible_folder_entry(&self, entry: &Entry) -> Option<Entry> {
+        let Entry::Folder { id, sessions } = entry else {
+            return Some(entry.clone());
+        };
+        if !crate::paseo_host::project_ui(&self.workspace.preferences) {
+            return Some(entry.clone());
+        }
+        let sessions: Vec<_> = sessions
+            .iter()
+            .copied()
+            .filter(|id| !self.rails.children.contains(id))
+            .collect();
+        (!sessions.is_empty()).then(|| Entry::Folder {
+            id: id.clone(),
+            sessions,
+        })
+    }
+
     pub(super) fn prepare_sidebar_list(&mut self, entries: &[Entry], cx: &App) {
         if crate::paseo_host::project_ui(&self.workspace.preferences)
             && self
@@ -301,6 +323,53 @@ impl Shell {
                     rows.push(Row::Gap);
                     ids.retain(|id| !pinned.contains(id));
                 }
+            }
+            // Folders follow Pinned; their members leave the status buckets.
+            let groups = self.project_groups();
+            let mut folders = false;
+            for entry in entries {
+                let Entry::Folder { id, .. } = entry else {
+                    continue;
+                };
+                let Some(entry) = self.visible_folder_entry(entry) else {
+                    continue;
+                };
+                let Entry::Folder { sessions, .. } = &entry else {
+                    continue;
+                };
+                let collapsed = groups.folder(id).is_some_and(|g| g.collapsed);
+                if !self.workspace.classic_layout && !folders {
+                    rows.push(Row::Folders);
+                }
+                folders = true;
+                rows.push(Row::Group(entry.clone()));
+                if !collapsed || !self.query.is_empty() {
+                    rows.extend(sessions.iter().enumerate().map(|(ix, id)| {
+                        if self.workspace.classic_layout {
+                            Row::ClassicGroupMember {
+                                entry: entry.clone(),
+                                id: *id,
+                                first: ix == 0,
+                                last: ix + 1 == sessions.len(),
+                            }
+                        } else {
+                            Row::GroupedSession {
+                                id: *id,
+                                first: ix == 0,
+                                last: ix + 1 == sessions.len(),
+                            }
+                        }
+                    }));
+                    if self.workspace.classic_layout {
+                        rows.push(Row::ClassicFolderNew(id.clone()));
+                    }
+                }
+                rows.push(if self.workspace.classic_layout {
+                    Row::ClassicGap(6)
+                } else {
+                    Row::Gap
+                });
+                ids.retain(|member| !sessions.contains(member));
             }
             let created = self
                 .workspace
@@ -375,6 +444,10 @@ impl Shell {
         let mut rows = vec![Row::Navigation, Row::Monos];
         let mut folders = false;
         for entry in entries {
+            let Some(entry) = self.visible_folder_entry(entry) else {
+                continue;
+            };
+            let entry = &entry;
             let (members, collapsed) = match entry {
                 Entry::Pinned { sessions } => {
                     // Pins sit between the folders and the dated sessions,
@@ -479,6 +552,10 @@ impl Shell {
         // Its project navigation and Mono roster belong to the first rail.
         let mut rows = vec![Row::ClassicGap(6)];
         for (ix, entry) in entries.iter().enumerate() {
+            let Some(entry) = self.visible_folder_entry(entry) else {
+                continue;
+            };
+            let entry = &entry;
             if ix > 0 {
                 rows.push(Row::ClassicGap(2));
             }

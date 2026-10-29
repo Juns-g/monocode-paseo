@@ -568,7 +568,7 @@ impl Prototype {
                 }
                 if matches!(
                     operation.as_str(),
-                    "renameWorkspace" | "pinWorkspace" | "archiveWorkspace"
+                    "renameWorkspace" | "renameAgent" | "pinWorkspace" | "archiveWorkspace"
                 ) && value["value"]["serverId"] == self.server
                 {
                     if operation == "archiveWorkspace" {

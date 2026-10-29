@@ -719,6 +719,11 @@ impl Store {
             shared::project_turns(&blocks)?,
         ))
     }
+    /// Changes whenever a host session mutation starts or finishes. A project
+    /// index requested before a change can predate it and must not be applied.
+    pub fn remote_mutations(&self) -> u64 {
+        self.remote_mutations.get()
+    }
     pub fn patch_remote_session(&self, id: i64, patch: Value) -> Result<(), String> {
         let mut remote = self
             .remote_session(id)?
@@ -729,7 +734,10 @@ impl Store {
             let mut params = patch.clone();
             params["sessionId"] = json!(session_id);
             params["projectId"] = json!(remote.project.project_id);
-            client.request(&machine.id, "sessions.update", params)?;
+            self.remote_mutations.set(self.remote_mutations.get() + 1);
+            let result = client.request(&machine.id, "sessions.update", params);
+            self.remote_mutations.set(self.remote_mutations.get() + 1);
+            result?;
         }
         if let Some(title) = patch["title"].as_str() {
             remote.summary.title = title.into();

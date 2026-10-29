@@ -218,6 +218,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let project = self.sessions[&id].read(cx).summary.cwd.clone();
+        self.ensure_groups_for(&project);
         let folders = self
             .groups
             .get(&project)
@@ -229,7 +230,10 @@ impl Shell {
             &picker,
             window,
             move |this, _, target: &Target, window, cx| {
-                if !matches!(target, Target::Dismiss) && this.sessions.contains_key(&id) {
+                if !matches!(target, Target::Dismiss)
+                    && this.sessions.contains_key(&id)
+                    && this.ensure_groups_for(&project)
+                {
                     let groups = this.groups.entry(project.clone()).or_default();
                     match target {
                         Target::Existing(folder) => groups.add_to_folder(folder, id),

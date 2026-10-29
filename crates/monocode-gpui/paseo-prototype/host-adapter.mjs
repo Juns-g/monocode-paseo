@@ -46,7 +46,7 @@ export function summary(entry,projectId) {
     model:`${provider}:${a.model||''}`,runtimeMode:mode(a),createdAt:stamp(a.createdAt),updatedAt:stamp(a.updatedAt),
     status:a.activeTurn||a.status==='running'||a.pendingPermissions?.length?'running':'idle',
     needsInput:!!a.pendingPermissions?.length,pinned:!!entry.workspace?.pinnedAt&&!a.archivedAt&&entry.paseoWorkspaceAnchorId===a.id,archived:!!a.archivedAt,
-    paseoWorkspaceId:a.workspaceId??null,paseoParentAgentId:entry.paseoParentAgentId??null,
+    paseoWorkspaceAnchor:entry.paseoWorkspaceAnchorId===a.id,paseoWorkspaceId:a.workspaceId??null,paseoParentAgentId:entry.paseoParentAgentId??null,
     paseoBucket:entry.paseoBucket,paseoStatusEnteredAt:entry.paseoStatusEnteredAt,
     branch:entry.project.checkout.currentBranch,providerSessionId:a.persistence?.sessionId};
 }
@@ -127,7 +127,7 @@ export class PaseoHost {
     this.seenPath=join(directory,'paseo-seen-attention.json');this.seen=new Map();this.clearing=new Map();this.clearTimeoutMs=CLEAR_ATTENTION_TIMEOUT_MS;
     try{for(const [id,at] of JSON.parse(readFileSync(this.seenPath,'utf8')))if(typeof id==='string'&&Number.isFinite(at))this.seen.set(id,at);}catch{}
     this.transfers=new SyncTransfers();
-    this.directoryAt=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
+    this.directoryAt=0;this.directoryRequests=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
   }
   fileProjects(){return [...this.projects.keys()].flatMap(id=>{
     try{return [this.fileProject(id)];}catch(error){if(['ENOENT','ENOTDIR'].includes(error.code))return [];throw error;}
@@ -151,7 +151,13 @@ export class PaseoHost {
   invalidate(){for(const h of this.histories.values()){h.dirty=true;h.generation=(h.generation??0)+1;}this.directoryAt=0;}
   async directory(force=false){
     this.identity();if(!force && Date.now()-this.directoryAt<2500)return;
-    if(this.directoryWork)return this.directoryWork;
+    // A forced refresh follows a mutation: never answer it from a fetch that started before it.
+    const requested=++this.directoryRequests;
+    while(this.directoryWork){
+      if(!force||this.directoryWork.started>requested)return this.directoryWork;
+      await this.directoryWork.catch(()=>{});
+    }
+    const started=++this.directoryRequests;
     this.directoryWork=(async()=>{
       const entries=new Map(),projects=new Map();let cursor;const seen=new Set();
       do{
@@ -222,7 +228,8 @@ export class PaseoHost {
       if(pruned)this.saveSeen();
       this.entries=entries;this.projects=projects;this.directoryAt=Date.now();
     })();
-    try{await this.directoryWork;}finally{this.directoryWork=null;}
+    const work=this.directoryWork;work.started=started;
+    try{await work;}finally{if(this.directoryWork===work)this.directoryWork=null;}
   }
   async target(id){
     this.identity();if(!this.entries.has(id))await this.directory(true);
@@ -525,15 +532,32 @@ export class PaseoHost {
     if(method==='commands.dispatch')return {result:await this.command(p)};
     if(method==='sessions.update'){
       const e=await this.target(p.sessionId);if(e.projectId!==p.projectId)throw Error('Wrong project');
-      if(e.paseoWorkspaceAnchorId!==e.agent.id)throw Error('工作区的改名、置顶或归档请在主任务上操作。');
-      const c=this.control(e.agent),base={serverId:this.serverId,agentId:e.agent.id,workspaceId:e.agent.workspaceId};
       // Exactly one field per operation avoids partial multi-field mutations.
-      if(Object.keys(p).filter(k=>!['sessionId','projectId'].includes(k)).length!==1)throw Error('One supported workspace change required');
-      if(p.title!==undefined)await c.dispatch({...base,op:'renameWorkspace',title:p.title});
-      else if(p.pinned!==undefined)await c.dispatch({...base,op:'pinWorkspace',pinned:p.pinned});
-      else if(p.archived===true)await c.dispatch({...base,op:'archiveWorkspace'});
+      if(Object.keys(p).filter(k=>!['sessionId','projectId'].includes(k)).length!==1)throw Error('One supported session change required');
+      const agent=e.agent,anchor=e.paseoWorkspaceAnchorId===agent.id;
+      if(p.title!==undefined){
+        const title=typeof p.title==='string'?p.title.trim():'';if(!title)throw Error('Empty rename cancelled');
+        // Same condition summary() uses to show agent.title; the anchor shows (and renames) the workspace title.
+        if(agent.labels?.['paseo.parent-agent-id']||!anchor){this.identity();await this.client.updateAgent(agent.id,{name:title});}
+        else await this.control(agent).dispatch({serverId:this.serverId,agentId:agent.id,workspaceId:agent.workspaceId,op:'renameWorkspace',title});
+      }
+      else if(p.pinned!==undefined){
+        if(!anchor)throw Error('置顶只适用于工作区的主会话；子会话或同一工作区的其他会话不能单独置顶。');
+        await this.control(agent).dispatch({serverId:this.serverId,agentId:agent.id,workspaceId:agent.workspaceId,op:'pinWorkspace',pinned:p.pinned});
+      }
+      else if(p.archived===true){
+        if(!agent.archivedAt){
+          // Paseo closes the agent runtime (stopping a running turn) and archives its children.
+          this.identity();const r=await this.client.archiveAgent(agent.id);if(!r?.archivedAt)throw Error('Archive not confirmed');
+        }
+      }
+      else if(p.archived===false){
+        // refreshAgent interrupts a live turn, so it is only sent for an archived agent.
+        if(agent.archivedAt){this.identity();await this.client.refreshAgent(agent.id);}
+      }
       else throw Error('请在 Paseo 中修改此设置');
-      await this.directory(true);return {result:{...summary(this.entries.get(e.agent.id)??e,e.projectId),archived:p.archived??!!e.agent.archivedAt}};
+      this.invalidate();await this.directory(true);const fresh=this.entries.get(agent.id);
+      return {result:fresh?summary(fresh,fresh.projectId):{...summary(e,e.projectId),archived:p.archived??!!agent.archivedAt}};
     }
     if(method==='paseo.checkCleanup'){
       const attempt=this.attempts.values[p.commandId];

@@ -113,6 +113,15 @@ export class Controller {
       }
       return {serverId:c.serverId,workspaceId:w.id};
     }
+    if(c.op==='renameAgent') {
+      this.identity(c.serverId);
+      if(!c.agentId)throw Error('Exact agent ID required');
+      const found=await this.client.fetchAgent(c.agentId);this.identity(c.serverId);
+      if(found?.agent.id!==c.agentId || (c.workspaceId && found.agent.workspaceId!==c.workspaceId))throw Error('Agent/workspace identity mismatch');
+      if(typeof c.title!=='string' || !c.title.trim())throw Error('Empty rename cancelled');
+      await this.client.updateAgent(c.agentId,{name:c.title.trim()});
+      return {serverId:c.serverId,agentId:c.agentId};
+    }
     if(c.op==='open') {
       this.identity(c.serverId);
       const found=await this.client.fetchAgent(c.agentId);

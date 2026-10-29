@@ -30,17 +30,18 @@ pub(crate) fn refresh_project_index(
     revision: Option<&str>,
     conditional: bool,
 ) -> Result<Option<ProjectIndex>, String> {
-    let project = {
+    let (project, mutations) = {
         let guard = match store.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(_) => return Err("Native session store unavailable".into()),
         };
-        guard
+        let project = guard
             .remote_projects()?
             .into_values()
             .find(|p| p.key == project_key)
-            .ok_or("Remote project identity is missing")?
+            .ok_or("Remote project identity is missing")?;
+        (project, guard.remote_mutations())
     };
     let machine = client.machine_for_environment(&project.environment_id)?;
     let mut params = json!({"projectId":project.project_id});
@@ -64,10 +65,15 @@ pub(crate) fn refresh_project_index(
         Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
         Err(_) => return Err("Native session store unavailable".into()),
     };
+    // A rename/archive/pin ran while this list was in flight: the host may
+    // have answered from before it. Keep the local state; the next index confirms.
+    if guard.remote_mutations() != mutations {
+        return Ok(None);
+    }
     let started = std::time::Instant::now();
     let registered = guard.sync_remote_summaries(&project, values)?;
     let started_by = guard.started_links()?;
-    let presentation=registered.iter().zip(values).map(|(r,v)|(r.summary.id,serde_json::json!({"bucket":v["paseoBucket"],"enteredAt":v["paseoStatusEnteredAt"],"createdAt":v["createdAt"]}))).collect();
+    let presentation=registered.iter().zip(values).map(|(r,v)|(r.summary.id,serde_json::json!({"bucket":v["paseoBucket"],"enteredAt":v["paseoStatusEnteredAt"],"createdAt":v["createdAt"],"workspaceAnchor":v["paseoWorkspaceAnchor"]}))).collect();
     let summaries = registered
         .into_iter()
         .zip(values)

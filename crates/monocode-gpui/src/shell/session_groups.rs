@@ -99,7 +99,7 @@ pub(super) enum RenameTarget {
 }
 pub(super) struct Renaming {
     pub(super) target: RenameTarget,
-    input: Entity<input::Input>,
+    pub(super) input: Entity<input::Input>,
     _events: Vec<Subscription>,
 }
 pub(super) struct LinkDialog {
@@ -184,7 +184,9 @@ impl Shell {
         source: i64,
         cx: &App,
     ) -> Option<ListDrop> {
-        if !self.workspace.sidebar_visible || self.reminders.iter().any(|r| r.session_id == source)
+        if !self.workspace.sidebar_visible
+            || self.reminders.iter().any(|r| r.session_id == source)
+            || self.paseo_nested_child(source)
         {
             return None;
         }
@@ -200,7 +202,10 @@ impl Shell {
             }
         }
         for id in self.sidebar_navigation_ids(cx) {
-            if id == source || self.reminders.iter().any(|r| r.session_id == id) {
+            if id == source
+                || self.reminders.iter().any(|r| r.session_id == id)
+                || self.paseo_nested_child(id)
+            {
                 continue;
             }
             if self
@@ -224,6 +229,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A sub agent travels with its parent, so it never joins a folder alone.
+        if self.paseo_nested_child(source)
+            || matches!(target, ListDrop::Session(id) if self.paseo_nested_child(id))
+        {
+            return;
+        }
         match target {
             ListDrop::Folder(folder) => {
                 self.update_groups(cx, |g| g.add_to_folder(&folder, source))
@@ -287,11 +298,42 @@ impl Shell {
             .cloned()
             .unwrap_or_default()
     }
+    /// A Paseo sub agent currently nested on its parent's rail.
+    pub(super) fn paseo_nested_child(&self, id: i64) -> bool {
+        crate::paseo_host::project_ui(&self.workspace.preferences)
+            && self.rails.children.contains(&id)
+    }
+    /// Startup reads the folders of the projects it knows; any other project
+    /// is read here before it is shown or edited, so a first edit cannot
+    /// replace what is stored. Returns false if the store could not be read.
+    pub(super) fn ensure_groups_for(&mut self, project: &str) -> bool {
+        if self.groups.contains_key(project) {
+            return true;
+        }
+        match locked(&self.store).and_then(|store| store.groups(project)) {
+            Ok(groups) => {
+                self.groups.insert(project.to_string(), groups);
+                true
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not read folders: {error}"));
+                false
+            }
+        }
+    }
+    pub(super) fn ensure_project_groups(&mut self) -> bool {
+        let project = self.workspace.project.clone();
+        self.ensure_groups_for(&project)
+    }
     pub(super) fn update_groups(
         &mut self,
         cx: &mut Context<Self>,
         change: impl FnOnce(&mut Groups),
     ) {
+        if !self.ensure_project_groups() {
+            cx.notify();
+            return;
+        }
         let project = self.workspace.project.clone();
         let groups = self.groups.entry(project.clone()).or_default();
         change(groups);
@@ -361,6 +403,21 @@ impl Shell {
         navigation_ids(&entries, !self.query.is_empty())
     }
 
+    /// Paseo marks whether an agent anchors its workspace; unknown counts as yes.
+    fn paseo_not_anchor(&self, id: i64) -> bool {
+        crate::paseo_host::project_ui(&self.workspace.preferences)
+            && self
+                .remote_details
+                .get(&id)
+                .is_some_and(|details| details["workspaceAnchor"] == false)
+    }
+    /// The menu rows that can take folder actions.
+    fn foldable_ids(&self, ids: &[i64]) -> Vec<i64> {
+        ids.iter()
+            .copied()
+            .filter(|id| !self.paseo_nested_child(*id))
+            .collect()
+    }
     fn session_menu_ids(&self, id: i64, cx: &App) -> Vec<i64> {
         if !self.selected_sessions.contains(&id) {
             return vec![id];
@@ -448,11 +505,14 @@ impl Shell {
                 .push(MenuAction::new("reminder:cancel", crate::i18n::t("Cancel reminder")).into());
             items.push(MenuItem::Separator);
         }
+        // Paseo pins a workspace, so only its anchor agent can be pinned.
+        let pin_blocked = ids.iter().any(|id| self.paseo_not_anchor(*id));
         items.push(
             MenuAction::new(
                 "pin",
                 crate::i18n::t(if all_pinned { "Unpin" } else { "Pin" }),
             )
+            .disabled(pin_blocked)
             .into(),
         );
         if !multiple {
@@ -484,32 +544,37 @@ impl Shell {
                 .into(),
             ]);
         }
-        items.extend([
-            MenuAction::new("reminder", crate::i18n::t("Remind me"))
-                .submenu(
-                    reminder_presets(Local::now().naive_local())
-                        .into_iter()
-                        .map(|(id, label, enabled)| {
-                            MenuAction::new(id, crate::i18n::t(&label)).disabled(!enabled)
-                        })
-                        .collect(),
-                )
-                .into(),
-            MenuItem::Separator,
-            MenuAction::new("folder-new", crate::i18n::t("New folder")).into(),
-        ]);
-        if !groups.folders.is_empty() {
+        items.extend([MenuAction::new("reminder", crate::i18n::t("Remind me"))
+            .submenu(
+                reminder_presets(Local::now().naive_local())
+                    .into_iter()
+                    .map(|(id, label, enabled)| {
+                        MenuAction::new(id, crate::i18n::t(&label)).disabled(!enabled)
+                    })
+                    .collect(),
+            )
+            .into()]);
+        // A nested sub agent travels with its parent, so it has no folder actions.
+        let foldable = self.foldable_ids(&ids);
+        let folder_actions = !foldable.is_empty();
+        if folder_actions {
+            items.extend([
+                MenuItem::Separator,
+                MenuAction::new("folder-new", crate::i18n::t("New folder")).into(),
+            ]);
+        }
+        if folder_actions && !groups.folders.is_empty() {
             items.push(MenuItem::Separator);
             items.extend(groups.folders.iter().map(|folder| {
                 MenuAction::new(
                     format!("folder-add:{}", folder.id),
                     format!("Add to {}", folder.name),
                 )
-                .checked(ids.iter().all(|id| folder.session_ids.contains(id)))
+                .checked(foldable.iter().all(|id| folder.session_ids.contains(id)))
                 .into()
             }));
         }
-        if ids.iter().any(|id| groups.folder_of(*id).is_some()) {
+        if foldable.iter().any(|id| groups.folder_of(*id).is_some()) {
             items.push(
                 MenuAction::new(
                     "folder-remove",
@@ -567,6 +632,13 @@ impl Shell {
                 }
             }
             "pin" => {
+                let ids: Vec<_> = ids
+                    .into_iter()
+                    .filter(|id| !self.paseo_not_anchor(*id))
+                    .collect();
+                if ids.is_empty() {
+                    return;
+                }
                 let pinned = !ids
                     .iter()
                     .all(|id| self.session_metadata(*id, cx).summary.pinned);
@@ -617,14 +689,25 @@ impl Shell {
                 });
             }
             "folder-new" => {
+                let ids = self.foldable_ids(&ids);
+                if ids.is_empty() {
+                    return;
+                }
                 let folder = format!("{:x}", monocode_core::time::now_ms() ^ ((id as u64) << 40));
                 self.update_groups(cx, |groups| {
                     groups.create_folder(&ids, folder.clone());
                 });
                 self.start_rename(RenameTarget::Folder(folder), window, cx);
             }
-            "folder-remove" => self.update_groups(cx, |groups| groups.remove_sessions(&ids)),
+            "folder-remove" => {
+                let ids = self.foldable_ids(&ids);
+                self.update_groups(cx, |groups| groups.remove_sessions(&ids))
+            }
             add if add.starts_with("folder-add:") => {
+                if self.foldable_ids(&ids).is_empty() {
+                    return;
+                }
+                let ids = self.foldable_ids(&ids);
                 let folder = add["folder-add:".len()..].to_string();
                 self.update_groups(cx, |groups| {
                     for id in &ids {
@@ -897,7 +980,12 @@ impl Shell {
         self.persist(cx);
     }
 
-    fn start_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn start_rename(
+        &mut self,
+        target: RenameTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_preview(cx);
         let text = match &target {
             RenameTarget::Session(id) => self.session_metadata(*id, cx).display_title(),
@@ -946,7 +1034,12 @@ impl Shell {
         self.invalidate_chrome(cx);
         cx.notify();
     }
-    fn finish_rename(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn finish_rename(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(renaming) = self.renaming.take() else {
             return;
         };
@@ -1910,6 +2003,10 @@ impl Shell {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "paseo_folder_tests.rs"]
+mod paseo_folder_tests;
 
 #[cfg(test)]
 mod tests {

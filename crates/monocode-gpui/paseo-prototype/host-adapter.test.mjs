@@ -88,7 +88,8 @@ test('workspace pin belongs to one root and parent identities survive without fl
     assert.equal(rows.find(r=>r.id==='child').paseoWorkspaceId,'w');
     assert.equal(rows.find(r=>r.id==='a').paseoParentAgentId,null);
     assert.equal(rows.find(r=>r.id==='peer').title,'Another conversation');
-    await assert.rejects(f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'child',pinned:true}),/主任务/);
+    await assert.rejects(f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'child',pinned:true}),/置顶只适用于工作区的主会话/);
+    await assert.rejects(f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'peer',pinned:true}),/置顶只适用于工作区的主会话/);
     assert.deepEqual(f.events.writes,[]);
     await f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'a',pinned:false});
     assert.deepEqual(f.events.writes,[['w',false]]);
@@ -157,17 +158,142 @@ test('native questions round-trip exact requests; permission number mapping surv
   assert.deepEqual(f.events.writes,[['a','q-opaque',{behavior:'allow',updatedInput:{...f.a.pendingPermissions[0].input,answers:{Choice:'Two'}}}]]);
   await assert.rejects(f.host.command({type:'answer',commandId:'bad-answer',sessionId:'a',runId:'t',requestId,reply:{kind:'answered',answers:{0:['unknown']}}}),/Unknown question/);f.close();
 });
-test('rename/pin/archive use exact workspace guards; risky archive and delete refuse',async()=>{
+test('rename/pin use exact workspace guards; archive never reaches the workspace; delete refuses',async()=>{
   const f=fixture();await f.host.directory();
   f.client.setWorkspaceTitle=async(...a)=>f.events.writes.push(['title',...a]);
   f.client.setWorkspacePinned=async(...a)=>f.events.writes.push(['pin',...a]);
+  f.client.updateAgent=async(...a)=>f.events.writes.push(['agent',...a]);
   await f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'a',title:'new'});
   await f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'a',pinned:true});
   assert.deepEqual(f.events.writes,[['title','w','new'],['pin','w',true]]);
   await assert.rejects(f.host.request('sessions.update',{projectId:'wrong',sessionId:'a',pinned:true}),/Wrong project/);
+  await assert.rejects(f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'a',title:'x',pinned:true}),/One supported/);
   f.client.fetchWorkspaces=async()=>({entries:[{id:'w',workspaceKind:'worktree',worktreeSlug:'owned'}],pageInfo:{}});
-  await assert.rejects(f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'a',archived:true}),/Paseo/);
+  f.client.archiveWorkspace=async()=>{throw Error('workspace archive must not be used');};
+  f.client.archiveAgent=async id=>{f.events.writes.push(['archive',id]);return {archivedAt:'synthetic'};};
+  await f.host.request('sessions.update',{projectId:'paseo:/fixture',sessionId:'a',archived:true});
+  assert.deepEqual(f.events.writes.slice(2),[['archive','a']]);
   await assert.rejects(f.host.request('sessions.delete',{sessionId:'a'}),/删除/);f.close();
+});
+// Mutable Paseo world: root anchor 'a', its child, and a non-anchor sibling 'peer' in one dirty worktree workspace.
+function world(){
+  const f=fixture(),calls=[];
+  const agents=new Map([
+    ['a',{...f.a,id:'a',title:'Original prompt',createdAt:1000}],
+    ['child',{...f.a,id:'child',title:'Research',createdAt:2000,labels:{'paseo.parent-agent-id':'a'}}],
+    ['peer',{...f.a,id:'peer',title:'Another conversation',createdAt:3000}]]);
+  const workspace={id:'w',name:'Short',title:'Workspace',workspaceKind:'worktree',worktreeSlug:'owned',gitRuntime:{isDirty:true,isPaseoOwnedWorktree:true},pinnedAt:'2026-10-26'};
+  f.client.fetchAgentHistory=async()=>({entries:[...agents.values()].map(agent=>({...f.e,agent:{...agent}})),pageInfo:{}});
+  f.client.fetchWorkspaces=async()=>({entries:[{...workspace}],pageInfo:{}});
+  f.client.fetchAgent=async id=>({agent:{...agents.get(id)}});
+  f.client.fetchAgentTimeline=async id=>({agent:{...agents.get(id)},epoch:'e',hasOlder:false,entries:[]});
+  f.client.archiveWorkspace=async()=>{throw Error('workspace archive must not be used');};
+  f.client.setWorkspaceTitle=async(...a)=>{calls.push(['setWorkspaceTitle',...a]);workspace.title=a[1];};
+  f.client.setWorkspacePinned=async(...a)=>calls.push(['setWorkspacePinned',...a]);
+  f.client.updateAgent=async(id,patch)=>{calls.push(['updateAgent',id,patch]);agents.get(id).title=patch.name;};
+  f.client.archiveAgent=async id=>{calls.push(['archiveAgent',id]);agents.get(id).archivedAt='2026-10-29T00:00:00Z';return {archivedAt:agents.get(id).archivedAt};};
+  f.client.refreshAgent=async id=>{calls.push(['refreshAgent',id]);agents.get(id).archivedAt=null;return {};};
+  const update=patch=>f.host.request('sessions.update',{projectId:'paseo:/fixture',...patch});
+  const list=async()=>(await f.host.request('sessions.list',{projectId:'paseo:/fixture'})).result;
+  return {...f,agents,calls,workspace,update,list};
+}
+test('sub-conversation and sibling rename write the agent title; the anchor renames only the workspace',async()=>{
+  const w=world();try{
+    await w.host.directory();await w.host.request('sessions.sync',{sessionId:'child'});
+    const before=(await w.host.request('sessions.sync',{sessionId:'child'})).result;
+    const result=(await w.update({sessionId:'child',title:'  Renamed child  '})).result;
+    assert.equal(result.title,'Renamed child');
+    await w.update({sessionId:'peer',title:'Renamed peer'});
+    await w.update({sessionId:'a',title:'Renamed root'});
+    assert.deepEqual(w.calls,[['updateAgent','child',{name:'Renamed child'}],['updateAgent','peer',{name:'Renamed peer'}],['setWorkspaceTitle','w','Renamed root']]);
+    await w.host.directory(true);
+    const rows=await w.list();
+    assert.deepEqual(rows.map(({id,title})=>({id,title})).sort((x,y)=>x.id.localeCompare(y.id)),[{id:'a',title:'Renamed root'},{id:'child',title:'Renamed child'},{id:'peer',title:'Renamed peer'}]);
+    const after=(await w.host.request('sessions.sync',{sessionId:'child',revision:before.value.revision})).result;
+    assert.notEqual(after.kind,'unchanged');
+    assert.equal((after.kind==='snapshot'?after.value:after.value).session.title,'Renamed child');
+  }finally{w.close();}
+});
+test('a child with a null title is renamed through the agent so its title becomes visible',async()=>{
+  const w=world();try{
+    w.agents.get('child').title=null;await w.host.directory();
+    await w.update({sessionId:'child',title:'Now visible'});
+    assert.deepEqual(w.calls,[['updateAgent','child',{name:'Now visible'}]]);
+    assert.equal((await w.list()).find(r=>r.id==='child').title,'Now visible');
+  }finally{w.close();}
+});
+test('empty or whitespace rename is rejected before any write',async()=>{
+  const w=world();try{
+    await w.host.directory();
+    for(const id of ['a','child','peer'])for(const title of ['','   ','\n\t'])await assert.rejects(w.update({sessionId:id,title}),/Empty rename/);
+    assert.deepEqual(w.calls,[]);
+  }finally{w.close();}
+});
+test('only the anchor can pin and only the anchor reports paseoWorkspaceAnchor',async()=>{
+  const w=world();try{
+    await w.host.directory();
+    for(const id of ['child','peer'])await assert.rejects(w.update({sessionId:id,pinned:true}),/置顶只适用于工作区的主会话；子会话或同一工作区的其他会话不能单独置顶。/);
+    assert.deepEqual(w.calls,[]);
+    await w.update({sessionId:'a',pinned:false});
+    assert.deepEqual(w.calls,[['setWorkspacePinned','w',false]]);
+    assert.deepEqual((await w.list()).filter(r=>r.paseoWorkspaceAnchor).map(r=>r.id),['a']);
+  }finally{w.close();}
+});
+test('archive closes exactly one agent, never the workspace, even for a dirty worktree or a running agent',async()=>{
+  for(const id of ['a','child','peer']){
+    const w=world();try{
+      await w.host.directory();
+      if(id==='peer')w.agents.get(id).activeTurn={turnId:'t'};
+      const result=(await w.update({sessionId:id,archived:true})).result;
+      assert.deepEqual(w.calls,[['archiveAgent',id]]);
+      assert.equal(result.archived,true);assert.equal(result.pinned,false);
+      const row=(await w.list()).find(r=>r.id===id);
+      assert.equal(row.archived,true);assert.equal(row.pinned,false);
+      assert.equal(w.events.cancels,0);
+    }finally{w.close();}
+  }
+});
+test('archive of an archived agent and unarchive of a live agent make no client mutation',async()=>{
+  const w=world();try{
+    w.agents.get('child').archivedAt='2026-10-28T00:00:00Z';w.agents.get('peer').activeTurn={turnId:'t'};
+    await w.host.directory();
+    assert.equal((await w.update({sessionId:'child',archived:true})).result.archived,true);
+    assert.equal((await w.update({sessionId:'a',archived:false})).result.archived,false);
+    const running=(await w.update({sessionId:'peer',archived:false})).result;
+    assert.equal(running.archived,false);assert.equal(running.status,'running');
+    assert.deepEqual(w.calls,[]);
+  }finally{w.close();}
+});
+test('unarchive of an archived agent refreshes exactly that agent',async()=>{
+  const w=world();try{
+    w.agents.get('peer').archivedAt='2026-10-28T00:00:00Z';await w.host.directory();
+    assert.equal((await w.list()).find(r=>r.id==='peer').archived,true);
+    const result=(await w.update({sessionId:'peer',archived:false})).result;
+    assert.deepEqual(w.calls,[['refreshAgent','peer']]);
+    assert.equal(result.archived,false);
+    assert.equal((await w.list()).find(r=>r.id==='peer').archived,false);
+  }finally{w.close();}
+});
+test('archive without a confirmed archivedAt rejects',async()=>{
+  const w=world();try{
+    await w.host.directory();w.client.archiveAgent=async()=>({});
+    await assert.rejects(w.update({sessionId:'child',archived:true}),/Archive not confirmed/);
+  }finally{w.close();}
+});
+test('a mutation never answers from a directory fetch that started before it',async()=>{
+  const w=world();try{
+    await w.host.directory();
+    const history=w.client.fetchAgentHistory;let release;
+    // The in-flight fetch reads pre-archive rows, then waits.
+    w.client.fetchAgentHistory=async(...a)=>{const page=await history(...a);w.client.fetchAgentHistory=history;await new Promise(r=>{release=r;});return page;};
+    const stale=w.host.directory(true);
+    await new Promise(r=>setImmediate(r));
+    const archived=w.update({sessionId:'child',archived:true});
+    await new Promise(r=>setImmediate(r));release();await stale;
+    assert.equal((await archived).result.archived,true);
+    assert.equal((await w.list()).find(r=>r.id==='child').archived,true);
+    assert.deepEqual(w.calls,[['archiveAgent','child']]);
+  }finally{w.close();}
 });
 test('16 parent-redacted snapshot sequences project without lost prose or duplicate block IDs',t=>{
   const directory=process.env.PASEO_R8_SHAPES;
@@ -562,7 +688,7 @@ test('Paseo bucket changes are volatile and entered time stays stable within a b
  f.close();
 });
 
-test('opt-in real daemon creates one isolated idle agent and archives only its own workspace',
+test('opt-in real daemon creates one isolated idle agent and archives only that agent',
   {skip:process.env.PASEO_LIVE_CREATE_CHECK!=='1',timeout:90000},async()=>{
   const {createClient,readConfig}=await import('./sdk.mjs');
   const expected=readConfig().serverId;

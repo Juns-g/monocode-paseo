@@ -146,3 +146,16 @@ test('concurrent duplicate sends cannot pass the post-fetch send fence twice',as
  const results=await Promise.allSettled([f.c.dispatch(c),f.c.dispatch(c)]);
  assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(f.sends(),1);f.c.close();
 });
+test('renameAgent updates only the exact agent title; empty, mismatched and foreign-daemon requests write nothing',async()=>{
+ const f=fixture();const writes=[];
+ f.client.updateAgent=async(...a)=>writes.push(['agent',...a]);f.client.setWorkspaceTitle=async(...a)=>writes.push(['workspace',...a]);
+ f.setAgent({id:'a',workspaceId:'w',status:'idle',activeTurn:null,pendingPermissions:[]});
+ assert.deepEqual(await f.c.dispatch({op:'renameAgent',serverId:'s',agentId:'a',workspaceId:'w',title:'  trimmed  '}),{serverId:'s',agentId:'a'});
+ assert.deepEqual(writes,[['agent','a',{name:'trimmed'}]]);
+ for(const title of ['','   ',undefined])await assert.rejects(f.c.dispatch({op:'renameAgent',serverId:'s',agentId:'a',workspaceId:'w',title}),/Empty rename/);
+ await assert.rejects(f.c.dispatch({op:'renameAgent',serverId:'other',agentId:'a',workspaceId:'w',title:'x'}),/identity/);
+ await assert.rejects(f.c.dispatch({op:'renameAgent',serverId:'s',agentId:'b',workspaceId:'w',title:'x'}),/mismatch/);
+ await assert.rejects(f.c.dispatch({op:'renameAgent',serverId:'s',agentId:'a',workspaceId:'other',title:'x'}),/mismatch/);
+ await assert.rejects(f.c.dispatch({op:'renameAgent',serverId:'s',workspaceId:'w',title:'x'}),/Exact agent/);
+ assert.equal(writes.length,1);f.c.close();
+});

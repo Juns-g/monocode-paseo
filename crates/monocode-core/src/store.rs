@@ -53,6 +53,8 @@ pub struct Store {
     path: std::path::PathBuf,
     shared: Option<shared::Shared>,
     remote_status: std::cell::RefCell<remote::StatusCache>,
+    /// Bumped around each host session mutation; see `remote_mutations`.
+    remote_mutations: std::cell::Cell<u64>,
 }
 impl Store {
     pub fn reset_provider_id_if(&self, id: i64, expected: Option<&str>) -> Result<(), String> {
@@ -179,6 +181,7 @@ impl Store {
             path: path.into(),
             shared: None,
             remote_status: Default::default(),
+            remote_mutations: Default::default(),
         })
     }
     /// The selected desktop or isolated-development database.
@@ -617,6 +620,7 @@ impl Store {
             path: self.path.clone(),
             shared: None,
             remote_status: Default::default(),
+            remote_mutations: Default::default(),
         }))
     }
     /// Stream saved message bodies without loading conversations into the UI.
