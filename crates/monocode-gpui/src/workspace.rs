@@ -432,6 +432,8 @@ impl Workspace {
             {
                 state.preferences.empty_session = if games { "games" } else { "none" }.into();
             }
+            // `extra` keeps unknown keys; the retired toggle must not ride along.
+            state.preferences.extra.remove("empty_session_games");
         }
         let has_rail_state = saved
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
