@@ -76,7 +76,38 @@ pub fn remote_catalog(cwd: &str) -> Result<RemoteCatalog, String> {
         "models.list",
         json!({"projectId":project["id"]}),
     )?;
-    remote_catalog_response(&response, providers)
+    let catalog = remote_catalog_response(&response, providers)?;
+    remember_remote_catalog(cwd, &catalog);
+    Ok(catalog)
+}
+
+/// A remote project's providers and model ids, in memory only (never on disk).
+type RemoteSnapshot = (Vec<Kind>, std::collections::HashMap<Kind, Vec<String>>);
+fn remote_cache() -> &'static Mutex<std::collections::HashMap<String, RemoteSnapshot>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, RemoteSnapshot>>> =
+        OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+/// Keeps the latest successful remote catalog for `cwd` so choices can be made
+/// without a request.
+pub fn remember_remote_catalog(cwd: &str, catalog: &RemoteCatalog) {
+    let models = catalog
+        .models
+        .iter()
+        .map(|(kind, rows)| (*kind, rows.iter().map(|m| m.id.clone()).collect()))
+        .collect();
+    remote_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cwd.into(), (catalog.providers.clone(), models));
+}
+/// The providers and model ids last fetched for a remote project, if any.
+pub fn cached_remote_catalog(cwd: &str) -> Option<RemoteSnapshot> {
+    remote_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(cwd)
+        .cloned()
 }
 
 pub fn remote_models(cwd: &str, provider: &str) -> Result<Vec<Model>, String> {
@@ -902,6 +933,21 @@ mod tests {
         assert!(catalog.models[&Kind::Claude][0].thinking);
         assert_eq!(catalog.errors[&Kind::Devin], "Sign in on the host");
         assert!(!catalog.models.contains_key(&Kind::Cursor));
+    }
+    #[test]
+    fn remote_catalog_remembers_providers_and_model_ids_in_memory() {
+        let cwd = "remote://catalog-memory-test/project";
+        assert!(cached_remote_catalog(cwd).is_none());
+        let catalog = RemoteCatalog {
+            providers: vec![Kind::Hermes],
+            models: std::collections::HashMap::from([(Kind::Hermes, vec![model("hermes:a", "A")])]),
+            errors: Default::default(),
+        };
+        remember_remote_catalog(cwd, &catalog);
+        let (providers, models) = cached_remote_catalog(cwd).unwrap();
+        assert_eq!(providers, [Kind::Hermes]);
+        assert_eq!(models[&Kind::Hermes], ["hermes:a"]);
+        assert!(cached_remote_catalog("remote://catalog-memory-test/other").is_none());
     }
     #[test]
     fn acp_catalogs_accept_grouped_options_and_legacy_models() {

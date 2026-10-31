@@ -330,18 +330,11 @@ impl Shell {
 
     /// What a new session in `cwd` starts with, as a new desktop tab would.
     fn mobile_defaults(&self, cwd: &str, cx: &App) -> (Kind, Option<String>, AccessMode) {
-        let prefs = &self.workspace.preferences;
-        let project = prefs.project_providers.get(cwd);
-        let kind = project
-            .and_then(|p| p.provider.as_deref())
-            .or(prefs.default_provider.as_deref())
-            .and_then(Kind::parse)
-            .unwrap_or(Kind::Codex);
-        let model = project
-            .and_then(|p| p.models.get(kind.id()))
-            .or(prefs.default_models.get(kind.id()))
-            .and_then(|model| monocode_core::store::native_model(model, kind.id()));
-        (kind, model, crate::conversation::default_access(cx))
+        let choice = self.new_chat_choice(cwd, false, cx);
+        let model = choice
+            .model
+            .and_then(|model| monocode_core::store::native_model(&model, choice.kind.id()));
+        (choice.kind, model, crate::conversation::default_access(cx))
     }
 
     fn mobile_catalog_sessions(&self, paths: &[String], cx: &App) -> Vec<CatalogEntry> {

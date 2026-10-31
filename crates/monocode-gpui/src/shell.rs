@@ -16,6 +16,9 @@ mod live_agents;
 mod mobile_host;
 mod mono_panes;
 pub(crate) mod monos;
+mod new_chat_choice;
+#[cfg(test)]
+mod new_chat_choice_tests;
 mod notifications;
 #[cfg(test)]
 mod paseo_archive_tests;
@@ -4407,7 +4410,7 @@ impl Shell {
         }) {
             self.activate_session(id, window, cx);
         } else {
-            self.create_session(self.default_kind(), true, cx);
+            self.create_session(self.default_choice(cx), true, cx);
         }
     }
     fn add_paseo_project(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -4469,20 +4472,25 @@ impl Shell {
         .detach();
     }
     fn new_chat(&mut self, cx: &mut Context<Self>) {
-        self.create(self.default_kind(), cx);
+        self.create_session(self.default_choice(cx), false, cx);
     }
     fn create(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        self.create_session(kind, false, cx);
+        self.create_session(self.explicit_choice(kind), false, cx);
     }
-    fn create_session(&mut self, kind: Kind, only_if_empty: bool, cx: &mut Context<Self>) {
-        self.create_session_target(kind, only_if_empty, None, cx);
+    fn create_session(
+        &mut self,
+        choice: new_chat_choice::NewChatChoice,
+        only_if_empty: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.create_session_target(choice, only_if_empty, None, cx);
     }
     fn create_in_folder(&mut self, folder: String, cx: &mut Context<Self>) {
-        self.create_session_target(self.default_kind(), false, Some(folder), cx);
+        self.create_session_target(self.default_choice(cx), false, Some(folder), cx);
     }
     fn create_session_target(
         &mut self,
-        kind: Kind,
+        choice: new_chat_choice::NewChatChoice,
         only_if_empty: bool,
         folder: Option<String>,
         cx: &mut Context<Self>,
@@ -4494,14 +4502,11 @@ impl Shell {
         if only_if_empty && !self.pending_project_blanks.insert(blank_key.clone()) {
             return;
         }
-        let model = self
-            .workspace
-            .preferences
-            .project_providers
-            .get(&cwd)
-            .and_then(|p| p.models.get(kind.id()))
-            .or(self.workspace.preferences.default_models.get(kind.id()))
-            .cloned();
+        let new_chat_choice::NewChatChoice {
+            kind,
+            model,
+            verify_catalog,
+        } = choice;
         let navigation_revision = self.navigation_revision;
         let account = crate::accounts::get(cx)
             .map(|center| center.read(cx).selected(kind, &cwd))
@@ -4512,14 +4517,16 @@ impl Shell {
             crate::conversation::default_access(cx)
         };
         let effort = crate::conversation::preferred_effort(kind.id(), cx);
-        let preset = self
-            .workspace
-            .preferences
-            .new_chat_preset(kind.id(), model.as_deref());
+        let preferences = self.workspace.preferences.clone();
         let work = cx.background_executor().spawn({
             let cwd = cwd.clone();
             let worktree_cwd = focus.as_ref().map(|f| f.path.clone());
             async move {
+                let mut model = model;
+                if verify_catalog {
+                    model = new_chat_choice::fork::verified_model(&cwd);
+                }
+                let preset = preferences.new_chat_preset(kind.id(), model.as_deref());
                 let store = locked(&store)?;
                 let summary = store.create(kind.id(), &cwd)?;
                 let mut settings = session_loading::new_session_settings(
