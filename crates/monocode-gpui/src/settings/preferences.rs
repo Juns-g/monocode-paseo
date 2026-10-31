@@ -1,5 +1,6 @@
 //! App-wide preferences the Settings pages edit. Defaults are the React
 //! app's (`settings.ts`, `appearance.ts`, `displayPrefs.ts`, `sounds.ts`).
+use monocode_core::provider::Kind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -87,6 +88,9 @@ pub(crate) struct Preferences {
     pub configured_models: HashMap<String, super::ConfiguredAgent>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+    /// The model for session titles, branch names, commit messages and pull
+    /// requests; `None` lets each use its own harness's quick model.
+    pub background_model: Option<ModelChoice>,
     // Monos
     pub monos: bool,
     pub rail_monos_pinned: bool,
@@ -171,6 +175,7 @@ impl Default for Preferences {
             default_agent_preset: None,
             configured_models: HashMap::new(),
             extra: HashMap::new(),
+            background_model: None,
             monos: true,
             rail_monos_pinned: false,
             mono_menu_bar_icon: true,
@@ -294,6 +299,11 @@ pub(crate) struct ModelChoice {
 
 impl gpui::Global for Preferences {}
 impl Preferences {
+    /// The background model picked in Settings, if any.
+    pub(crate) fn background_text_model(&self) -> Option<(Kind, Option<String>)> {
+        let choice = self.background_model.as_ref()?;
+        Some((Kind::parse(&choice.provider)?, choice.model.clone()))
+    }
     pub(crate) fn hidden_for(&self, project: &str) -> Vec<String> {
         let mut hidden = self.hidden_providers.clone();
         if let Some(settings) = self.project_providers.get(project) {
