@@ -1,12 +1,14 @@
-# Monocode Paseo（实验版）
+# Monocode Paseo (experimental)
 
-基于 [MonoCode](https://github.com/hardbeat920/monocode) 的原生 GPUI 客户端（`mc/migrate-monocode-to-gpui`，同步到 `native-v0.16.0-preview.7`），把后端换成本机的 [Paseo](https://github.com/getpaseo/paseo) daemon：界面沿用原版 Monocode 原生 Shell，对话、执行和历史都留在 Paseo 里，两边看到的是同一批对话，可以互相接着聊。
+**English** | [简体中文](README.zh-CN.md)
 
-> ⚠️ **个人实验版本**：只在作者自己的 macOS（Apple Silicon）+ Paseo 0.13.0-beta.1 上用过，不保证效果、兼容性或稳定性，不提供支持。需要正式体验请用原版 MonoCode。原版说明见 [README.upstream.md](README.upstream.md)。
+A fork of the native GPUI client of [MonoCode](https://github.com/hardbeat920/monocode) (synced to `native-v0.16.0-preview.11`) that uses a local [Paseo](https://github.com/getpaseo/paseo) daemon as its backend. The UI is the original MonoCode native shell; conversations, execution and history stay in Paseo, so the Paseo apps and this client see the same conversations and can continue each other's work.
 
-## 怎么用
+> ⚠️ **Personal experiment.** Only used on the author's own macOS (Apple Silicon) machine with Paseo 0.14.0. No guarantees on behavior, compatibility or stability, and no support. For the real thing, use upstream MonoCode. The upstream README is kept as [README.upstream.md](README.upstream.md).
 
-前提：macOS；本机已在跑 Paseo daemon（默认 `127.0.0.1:6973`，只接受 loopback）；Rust stable；Node（测试过 24.22.0）；一份已装好依赖的 Paseo 源码（打包时用来 bundle 官方 SDK，装好的 App 不再依赖它）。
+## Usage
+
+Requirements: macOS; a Paseo daemon already running locally (default `127.0.0.1:6973`, loopback only); Rust stable; Node (tested with 24.22.0); a Paseo source checkout with its dependencies installed (used only at packaging time to bundle the official SDK; the installed app does not need it).
 
 ```sh
 RUSTUP_TOOLCHAIN=stable cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --release
@@ -14,37 +16,40 @@ PASEO_SOURCE=/path/to/paseo python3 crates/monocode-gpui/paseo-prototype/package
 open "/tmp/monocode-paseo/Monocode Paseo Prototype.app"
 ```
 
-- 独立 Bundle ID `dev.usemono.paseo-prototype`，数据在 `~/Library/Application Support/Monocode Paseo Prototype/`，不碰原版 MonoCode 的数据。
-- 认证走 Paseo 官方的本地凭据读取，不把任何凭据写进源码或 App。
-- 可选配置 `~/Library/Application Support/Monocode Paseo Prototype/prototype.json`（或环境变量 `PASEO_PROTOTYPE_CONFIG`）：
+- Separate bundle ID `dev.usemono.paseo-prototype`; data lives in `~/Library/Application Support/Monocode Paseo Prototype/` and never touches upstream MonoCode's data.
+- Authentication uses Paseo's official local credential lookup; no credentials are written into the source or the app.
+- Optional config at `~/Library/Application Support/Monocode Paseo Prototype/prototype.json` (or the `PASEO_PROTOTYPE_CONFIG` environment variable):
 
 ```json
-{ "endpoint": "127.0.0.1:6973", "serverId": "你的 serverId（可选）", "defaultProjectNames": ["项目A", "项目B"], "nodePath": "/path/to/node" }
+{ "endpoint": "127.0.0.1:6973", "serverId": "your serverId (optional)", "defaultProjectNames": ["Project A", "Project B"], "nodePath": "/path/to/node" }
 ```
 
-- 打包产物是 ad-hoc 签名，未公证；Node 路径在打包时记录，移动后用 `nodePath` 覆盖。
+- The packaged app is ad-hoc signed and not notarized. The Node path is recorded at packaging time; override it with `nodePath` if Node moves.
+- Adapter internals: [crates/monocode-gpui/paseo-prototype/README.md](crates/monocode-gpui/paseo-prototype/README.md).
 
-## 和原版 MonoCode 的差异
+## Differences from upstream MonoCode
 
-**可用**
-- 原版窗口、侧栏、标签页、分屏、输入框；Paseo 对话实时同步，回复全部可见、工具和思考折叠。
-- 新建对话（首次发送时才在 Paseo 创建，防重复；可选新建独立工作区或加入同项目最近 20 个工作区之一）、切换模型/强度、预设（也出现在模型选择的 Favorites 里）。
-- 子 Agent 嵌套在父对话下显示；同一 Git 仓库的 linked worktree 合并到一个项目导航。
-- 权限审批与问题回答、取消当前回合。
-- 回合进行中继续发送：按设置 → 聊天 →「后续消息行为」**排队**（当前回合结束后自动发出，可编辑/移除）或 **Steer**（立即插入当前回合；不支持插入的 provider 由 Paseo 中断并替换回合）。队列只保存在本客户端，发送成功后两端才会看到；结果不确定时不自动重发。Steer 仅支持纯文本。
-- 侧栏：筛选、按项目或**按状态分组**（需要输入 → 失败 → 待查看 → 工作中 → 已完成）、按最近活动/创建时间排序。
-- 项目图标、底部项目切换（可只保留常用项目，其余手动加回）。
-- 只读的文件和 Git 面板；本机项目可直接打开**本地终端**。
-- 本地笔记；界面 **English / 简体中文** 切换（设置 → 通用 → 语言，默认跟随系统）。
+**Available**
+- The original window, sidebar, tabs, split panes and composer, plus upstream preview features such as project color themes. Paseo conversations sync live; all replies are visible, with tool calls and thinking collapsed. Opening a conversation shows a preview tab (VS Code style) until you interact with it.
+- A "working" line with a timer appears as soon as a turn starts, before the first output arrives.
+- New conversations are created in Paseo only on first send, which avoids duplicates. They can start in a new workspace or join one of the 20 most recent workspaces in the same project. The default model follows the project default, then the Settings default, then the current conversation, then your most recent choice.
+- Model and effort switching, presets, and favorite models (star a model in the picker; presets also appear under Favorites).
+- Sub-agents nest under their parent conversation; linked worktrees of the same Git repository share one project entry.
+- Permission approvals, answering questions, and cancelling the current turn.
+- Sending while a turn is running: Settings → Chat → "Follow-up behavior" chooses **Queue** (sent automatically when the turn ends, editable and removable) or **Steer** (inserted into the current turn; providers that cannot steer get the turn interrupted and replaced by Paseo). Cmd+Enter uses the opposite behavior for that message. The queue lives only in this client, and both ends see a message only after it is sent; uncertain results are never resent automatically. Steer supports plain text only.
+- Sidebar: filtering, grouping by project or **by status** (needs input → failed → unread → working → done), sorting by latest activity or creation time; archive and unarchive, rename, pin (top-level conversations), and folders.
+- Project icons and the bottom project switcher (keep only the projects you use; add others back by hand).
+- Read-only file and Git panels; a **local terminal** for projects on this machine.
+- Local notes; **English / 简体中文** UI (Settings → General → Language, follows the system by default).
 
-**隐藏 / 未实现**
-- 额度用量显示、远端 PTY / relay / tunnel。
-- 删除对话、标签、更早历史分页。
-- 快速输入框、Monos、自动化、Inbox、多 Agent 编排等依赖原版本地执行的功能。
-- 权限选择器：新对话默认使用 provider 的完全访问模式，不在界面显示。
+**Hidden / not implemented**
+- Usage display; remote PTY / relay / tunnel.
+- Deleting conversations, labels, paging through older history.
+- Quick input, Monos, automations, Inbox, multi-agent orchestration and other features that depend on upstream's local execution.
+- Permission picker: new conversations use the provider's full-access mode, and it is not shown in the UI.
 
-## 致谢与许可
+## Credits and license
 
-- 上游 MonoCode（MIT），GPUI 相关见 [NOTICE](NOTICE)；Paseo SDK 及其依赖的许可随打包附带。
-- 中文词表来自 [hardbeat920/monocode#1073](https://github.com/hardbeat920/monocode/pull/1073)（kev17in，MIT）。
-- 本 fork 沿用 MIT 许可，见 [LICENSE](LICENSE)。
+- Upstream MonoCode (MIT); see [NOTICE](NOTICE) for GPUI. Licenses for the Paseo SDK and its dependencies ship with the package.
+- The Chinese strings come from [hardbeat920/monocode#1073](https://github.com/hardbeat920/monocode/pull/1073) (kev17in, MIT).
+- This fork is also MIT licensed; see [LICENSE](LICENSE).
