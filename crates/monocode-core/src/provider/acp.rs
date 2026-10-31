@@ -289,7 +289,7 @@ impl Protocol {
         } else if !self.acp.settings_applied {
             self.acp.settings_applied = true;
             let setup = self.acp.setup.clone();
-            self.acp_settings(&setup)?;
+            self.acp_settings(&setup);
             self.acp_next(stdin)
         } else if let Some(mode) = self.acp.mode.take() {
             self.acp_send(
@@ -445,28 +445,9 @@ impl Protocol {
         }
         Ok(())
     }
-    fn acp_settings(&mut self, setup: &Value) -> Result<(), String> {
+    fn acp_settings(&mut self, setup: &Value) {
         let kind = self.request.kind;
         let settings = &self.request.settings;
-        if kind == Kind::Hermes {
-            if let Some(effort) = &settings.effort {
-                let config = setup["configOptions"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                let option = setting_option(&config, "effort");
-                let mut choices = Vec::new();
-                if let Some(option) = option {
-                    config_choices(&option["options"], &mut choices);
-                }
-                if !choices.contains(effort) {
-                    return Err(format!("Hermes ACP does not advertise reasoning effort {effort}; refusing to silently use its default."));
-                }
-                self.acp.options.push_back(("session/set_config_option",
-                    json!({"sessionId":self.acp.session,"configId":config_id(option.unwrap()),"value":effort})));
-            }
-            return Ok(());
-        }
         let mut selected = settings.model_settings.clone();
         if let Some(effort) = &settings.effort {
             selected
@@ -481,6 +462,9 @@ impl Protocol {
                 .entry("thinking".into())
                 .or_insert_with(|| thinking.to_string());
         }
+        if kind == Kind::Hermes {
+            selected.retain(|id, _| id == "effort");
+        }
         if kind == Kind::Grok {
             if let Some(effort) = selected
                 .get("effort")
@@ -492,7 +476,7 @@ impl Protocol {
                     json!({"sessionId":self.acp.session,"modeId":effort}),
                 ));
             }
-            return Ok(());
+            return;
         }
         let config = setup["configOptions"]
             .as_array()
@@ -543,7 +527,6 @@ impl Protocol {
                 .options
                 .push_back(("session/set_config_option", params));
         }
-        Ok(())
     }
     fn acp_failure(
         &mut self,
@@ -1469,32 +1452,26 @@ mod tests {
         }
     }
     #[test]
-    fn hermes_preset_uses_dont_ask_and_refuses_unadvertised_effort() {
+    fn hermes_sends_only_an_advertised_reasoning_effort() {
         let mut p = protocol(Kind::Hermes);
-        p.request.settings.access = AccessMode::FullAccess;
-        p.request.model = Some("openai-codex:gpt-6.1-sol".into());
         p.request.settings.effort = Some("high".into());
-        p.acp_options(&json!({})).unwrap();
-        assert_eq!(p.acp.mode, Some("dont_ask"));
-        assert_eq!(p.acp.options[0].1["modelId"], "openai-codex:gpt-6.1-sol");
-        assert!(p
-            .acp_settings(&json!({}))
-            .unwrap_err()
-            .contains("does not advertise"));
-        p.acp.options.clear();
-        p.acp_settings(
-            &json!({"configOptions":[{"id":"reasoning_effort","options":[{"value":"high"}]}]}),
-        )
-        .unwrap();
+        p.request.settings.fast = true;
+        let setup = json!({"configOptions":[
+            {"id":"reasoning_effort","category":"thought_level","currentValue":"default","options":[{"value":"low"},{"value":"high"}]},
+            {"id":"fast","currentValue":"false","options":[{"value":"false"},{"value":"true"}]}
+        ]});
+        p.acp_settings(&setup);
+        assert_eq!(p.acp.options.len(), 1);
         assert_eq!(p.acp.options[0].0, "session/set_config_option");
         assert_eq!(p.acp.options[0].1["configId"], "reasoning_effort");
         assert_eq!(p.acp.options[0].1["value"], "high");
-        p.request.settings.effort = None;
         p.acp.options.clear();
-        p.acp_settings(&json!({})).unwrap();
+        p.acp_settings(&json!({}));
+        assert!(p.acp.options.is_empty());
+        p.request.settings.effort = None;
+        p.acp_settings(&setup);
         assert!(p.acp.options.is_empty());
     }
-
     #[test]
     fn resuming_mutes_replay_and_replaces_missing_sessions_like_the_desktop() {
         let mut p = protocol(Kind::Grok);

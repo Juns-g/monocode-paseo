@@ -843,8 +843,7 @@ mod tests {
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         let at = window
             .update(visual, |view, _, _| {
-                let id = view.rows.iter().find(|r| matches!(&r.body, Body::Markdown(md) if crate::markdown::selection_text(md).contains("docs"))).unwrap().key;
-                id
+                view.rows.iter().find(|r| matches!(&r.body, Body::Markdown(md) if crate::markdown::selection_text(md).contains("docs"))).unwrap().key
             })
             .unwrap();
         let _ = at;

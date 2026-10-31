@@ -1041,7 +1041,7 @@ pub(crate) fn run() {
                 paced_reveal: false,
                 ..Default::default()
             };
-            crate::theme::configure(&prefs, false);
+            crate::theme::configure_project(&prefs, None, false, false);
             cx.set_global(prefs);
             input::bind(cx);
             bind_keys(cx);

@@ -117,6 +117,7 @@ impl Shell {
                         this.quick.last = Some(crate::quick_composer::Launch {
                             prompt: String::new(),
                             attachments: Vec::new(),
+                            staged_attachments: Vec::new(),
                             ..launch.clone()
                         });
                         let _ = handle.update(cx, |view, window, cx| view.dismiss(window, cx));
@@ -135,7 +136,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let store = self.store.clone();
-        let choice = launch.clone();
+        let mut choice = launch.clone();
+        let attachments = std::mem::take(&mut choice.attachments);
         crate::conversation::remember_access(choice.access, cx);
         let preset = self
             .workspace
@@ -164,19 +166,25 @@ impl Shell {
                 settings.access = choice.access;
             }
             store.save_agent_settings(summary.id, &settings)?;
-            Ok::<_, String>((summary, settings))
+            let attachments = store.adopt_attachments(
+                summary.id,
+                &crate::quick_composer::paste_staging_dir(),
+                attachments,
+                &choice.staged_attachments,
+            )?;
+            Ok::<_, String>((summary, settings, attachments))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok((summary, settings)) => {
+                Ok((summary, settings, attachments)) => {
                     let id = summary.id;
                     if !this.workspace.projects.contains(&launch.cwd) {
                         this.workspace.projects.push(launch.cwd.clone());
                     }
                     this.add(summary, cx);
                     this.sessions[&id].update(cx, |v, cx| {
-                        v.quick_attach(launch.attachments, cx);
+                        v.quick_attach(attachments, cx);
                         v.quick_submit(launch.prompt, settings, cx)
                     });
                     this.order.retain(|i| *i != id);

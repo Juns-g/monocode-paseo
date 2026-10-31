@@ -81,7 +81,7 @@ mod tests {
             .update(cx, |shell, _, _| {
                 assert_eq!(
                     shell.workspace.preferences.favorite_models,
-                    [favorite.clone()]
+                    std::slice::from_ref(&favorite)
                 )
             })
             .unwrap();

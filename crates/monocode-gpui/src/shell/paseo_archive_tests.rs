@@ -447,10 +447,7 @@ fn archiving_a_top_level_row_closes_its_tab_from_the_tab_menu(cx: &mut TestAppCo
     let host = FakeHost::new(rows());
     let ui = open(cx, &host, &["root", "solo"]);
     assert!(read(&ui, cx, |s, _| s.workspace.tab_of(ui.solo).is_some()));
-    assert_eq!(
-        read(&ui, cx, |s, cx| { s.session_menu_items(ui.solo, cx).len() }) > 0,
-        true
-    );
+    assert!(read(&ui, cx, |s, cx| { s.session_menu_items(ui.solo, cx).len() }) > 0);
     ui.window
         .update(cx, |shell, w, cx| {
             shell.run_menu(MenuTarget::Tab(ui.solo), "archive", None, w, cx)
@@ -659,7 +656,7 @@ fn commit_rename(ui: &Ui, cx: &mut TestAppContext, name: &str) {
                 .expect("rename started")
                 .input
                 .clone();
-            input.update(cx, |input, cx| input.set_text(name.to_string().into(), cx));
+            input.update(cx, |input, cx| input.set_text(name.to_string(), cx));
             shell.finish_rename(true, w, cx);
         })
         .unwrap();
