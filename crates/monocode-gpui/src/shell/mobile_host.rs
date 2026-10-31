@@ -1194,7 +1194,9 @@ impl Shell {
                 (Some(kind), Some(model)) if model.len() <= 256 => {
                     monocode_core::store::native_model(&model, kind.id())
                 }
-                (Some(kind), _) if kind != default_kind => None,
+                (Some(kind), _) if kind != default_kind => {
+                    explicit_model(&self.workspace.preferences, &cwd, kind)
+                }
                 _ => default_model,
             };
             let access = params["runtimeMode"]
@@ -1433,7 +1435,7 @@ impl Shell {
             Ok(current) => current,
             Err(error) => return request.reply(Err(error)),
         };
-        let hidden = self.workspace.preferences.hidden_providers.clone();
+        let hidden = hidden_providers(&self.workspace.preferences, &cwd);
         let center = crate::accounts::get(cx).map(|c| c.read(cx));
         let account_kinds = [Kind::Claude, Kind::Codex];
         let accounts: Vec<Value> = center
@@ -1742,6 +1744,22 @@ fn catalog_model(kind: Kind, model: monocode_core::catalog::Model) -> Value {
     })
 }
 
+/// The model a provider picked by the phone starts with: project, then Settings.
+fn explicit_model(prefs: &crate::settings::Preferences, cwd: &str, kind: Kind) -> Option<String> {
+    new_chat_choice::NewChatChoice::explicit(prefs, cwd, kind)
+        .model
+        .and_then(|model| monocode_core::store::native_model(&model, kind.id()))
+}
+
+/// Providers the phone's model sheet leaves out. Remote projects list them all,
+/// as the desktop model picker does.
+fn hidden_providers(prefs: &crate::settings::Preferences, cwd: &str) -> Vec<String> {
+    if monocode_core::remote::parse_remote_path(cwd).is_some() {
+        return Vec::new();
+    }
+    prefs.hidden_providers.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1824,6 +1842,38 @@ mod tests {
             monocode_core::store::native_model(choice["id"].as_str().unwrap(), "claude").as_deref(),
             Some("claude-opus-5-5")
         );
+    }
+
+    #[test]
+    fn remote_projects_keep_hidden_providers_in_the_model_sheet() {
+        let prefs = crate::settings::Preferences {
+            hidden_providers: vec!["claude".into()],
+            ..Default::default()
+        };
+        assert_eq!(hidden_providers(&prefs, "/work/project"), ["claude"]);
+        assert!(hidden_providers(&prefs, "remote://env/work/project").is_empty());
+    }
+
+    #[test]
+    fn an_explicit_phone_provider_without_a_model_uses_its_configured_model() {
+        let mut prefs = crate::settings::Preferences {
+            default_models: [("claude".into(), "claude-opus-5-5".into())].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit_model(&prefs, "/work/project", Kind::Claude).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        let project = prefs
+            .project_providers
+            .entry("/work/project".into())
+            .or_default();
+        project.models = [("claude".into(), "claude-sonnet-5-5".into())].into();
+        assert_eq!(
+            explicit_model(&prefs, "/work/project", Kind::Claude).as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(explicit_model(&prefs, "/work/project", Kind::Codex), None);
     }
 
     #[test]
