@@ -362,6 +362,12 @@ impl Follow {
     }
 }
 
+/// Rows that only carry a prompt's attachments.
+fn attachments_only(rows: &[Row]) -> bool {
+    rows.iter()
+        .all(|row| row.role == monocode_core::transcript::attachments::ROLE)
+}
+
 /// Whether the Mono has said something the user can read in `from..to`: the
 /// opening sentence of any run there. A message the user sends after it reads
 /// as the next line of the chat, not as part of the prompt above.
@@ -1047,7 +1053,13 @@ impl TranscriptView {
             .iter()
             .rposition(|r| r.is_prompt())
             .map_or(0, |ix| ix + 1);
-        if latest < self.live_start && self.source[..latest].iter().any(Row::is_prompt) {
+        // Attachments follow their prompt; anything else before `live_start`
+        // belongs to a finished turn.
+        let live = self.live_start.min(self.source.len());
+        if latest < live
+            && !attachments_only(&self.source[latest..live])
+            && self.source[..latest].iter().any(Row::is_prompt)
+        {
             return None;
         }
         let typing = (latest..self.source.len())
@@ -1674,14 +1686,13 @@ impl TranscriptView {
             && start >= self.live_start
             && self.source[start..].iter().all(|r| !r.is_prompt())
     }
-    /// The live turn, while its source still ends at the prompt.
+    /// The live turn, while its source still ends at the prompt. A prompt whose
+    /// turn already ended (a stopped `streaming`) is not it.
     fn awaiting_first_row(&self) -> Option<usize> {
         let prompt = self.source.iter().rposition(Row::is_prompt)?;
-        (self.streaming
-            && self.source[prompt + 1..]
-                .iter()
-                .all(|row| row.role == monocode_core::transcript::attachments::ROLE))
-        .then_some(prompt + 1)
+        let turn = prompt + 1;
+        let ended = self.turns.get(&turn).is_some_and(|info| info.duration_known);
+        (self.streaming && !ended && attachments_only(&self.source[turn..])).then_some(turn)
     }
     fn push_pending(&mut self, at: usize) {
         for i in 0..self.pending.len() {

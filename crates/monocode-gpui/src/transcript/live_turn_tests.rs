@@ -186,3 +186,64 @@ fn an_optimistic_prompt_keeps_a_single_live_line(cx: &mut TestAppContext) {
         render(window, cx);
     }
 }
+
+fn attachment() -> Row {
+    row(
+        monocode_core::transcript::attachments::ROLE,
+        &monocode_core::transcript::attachments::from_paths(&["/tmp/a.png".into()]).to_string(),
+    )
+}
+
+/// A turn that ended with only its prompt is settled: the next turn's start,
+/// before its own prompt arrives, must not put the line under the old prompt.
+#[gpui::test]
+fn a_prompt_only_turn_does_not_get_a_line_when_the_next_turn_starts(cx: &mut TestAppContext) {
+    for layout in [Layout::Chat, Layout::Mono] {
+        let window = open(cx, layout);
+        window
+            .update(cx, |view, _, cx| {
+                view.patch(0, earlier(), cx);
+                view.streaming(true, cx);
+                view.patch(2, vec![row("user", "Next")], cx);
+                assert!(work_line(view, 3).is_some());
+                view.streaming(false, cx);
+                view.streaming(true, cx);
+                assert_eq!(
+                    work_line(view, 3),
+                    None,
+                    "{layout:?}: the old prompt stays settled"
+                );
+                assert_eq!(view.awaiting_first_row(), None, "{layout:?}");
+                assert_eq!(view.mono_activity(), None, "{layout:?}");
+                // The new prompt then gets its own line.
+                view.patch(3, vec![row("user", "Again")], cx);
+                assert!(work_line(view, 4).is_some(), "{layout:?}");
+            })
+            .unwrap();
+        render(window, cx);
+    }
+}
+
+/// Attaching to a running turn whose prompt came with an attachment: the Mono's
+/// header ticks before and after the first response row; a finished turn's
+/// does not.
+#[gpui::test]
+fn a_running_turn_with_an_attachment_keeps_the_mono_ticker(cx: &mut TestAppContext) {
+    let window = open(cx, Layout::Mono);
+    window
+        .update(cx, |view, _, cx| {
+            let mut rows = earlier();
+            rows.extend([row("user", "Look at this"), attachment()]);
+            view.patch(0, rows, cx);
+            view.streaming(true, cx);
+            assert!(view.mono_activity().is_some(), "before any response row");
+            view.patch(4, vec![row("reasoning", "Looking")], cx);
+            assert!(view.mono_activity().is_some(), "after a response row");
+            view.streaming(false, cx);
+            assert_eq!(view.mono_activity(), None, "a finished turn has none");
+            view.streaming(true, cx);
+            assert_eq!(view.mono_activity(), None, "nor does the next start");
+        })
+        .unwrap();
+    render(window, cx);
+}
