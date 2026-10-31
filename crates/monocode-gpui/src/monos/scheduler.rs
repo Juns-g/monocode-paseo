@@ -1491,7 +1491,7 @@ impl Monos {
         );
         self.start_run(id, habit.id, habit.name, text, false, cx);
     }
-    fn start_heartbeat(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
+    pub(super) fn start_heartbeat(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
         self.start_run(
             id,
             heartbeat::RUN_ID.into(),
@@ -1536,7 +1536,7 @@ impl Monos {
             s.title = format!("{} · {}", mono.label(), name);
             db.title(s.id, &s.title)?;
             drop(db);
-            if triage {
+            if triage && inherited.usage_limit.is_none() {
                 // The catalog is cached for a few minutes; a miss keeps the Mono's model.
                 let models = Kind::parse(&provider)
                     .and_then(|kind| {
@@ -1572,7 +1572,9 @@ impl Monos {
                             .as_ref()
                             .map(|b| b.environment(session))
                             .unwrap_or_default();
-                        settings.access = AccessMode::FullAccess;
+                        if !triage {
+                            settings.access = AccessMode::FullAccess;
+                        }
                         settings.internal_message = true;
                         settings.mono = None;
                         settings.environment.clear();
