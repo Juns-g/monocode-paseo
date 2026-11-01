@@ -5,6 +5,7 @@
 基于 [MonoCode](https://github.com/hardbeat920/monocode) 的原生 GPUI 客户端（同步到 `native-v0.16.0-preview.11`），把后端换成本机的 [Paseo](https://github.com/getpaseo/paseo) daemon。界面沿用原版 MonoCode 原生 Shell；对话、执行和历史都留在 Paseo 里，Paseo 各端和本客户端看到的是同一批对话，可以互相接着聊。
 
 > ⚠️ **个人实验版本**：只在作者自己的 macOS（Apple Silicon）+ Paseo 0.14.0 上用过，不保证效果、兼容性或稳定性，不提供支持。需要正式体验请用原版 MonoCode。原版说明见 [README.upstream.md](README.upstream.md)。
+<img width="2600" height="1784" alt="image" src="https://github.com/user-attachments/assets/d7802cf2-7a4e-42cf-bf43-23f9fbcb4a16" />
 
 ## 怎么用
 
