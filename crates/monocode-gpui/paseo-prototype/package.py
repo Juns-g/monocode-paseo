@@ -16,8 +16,8 @@ for source,name in [(root/'LICENSE','Monocode-LICENSE'),(root/'NOTICE','Monocode
     if source.exists():shutil.copy2(source,resources/name)
 metadata={'CFBundleExecutable':'monocode-gpui','CFBundleIdentifier':'dev.usemono.paseo-prototype',
  'CFBundleName':'Monocode Paseo Prototype','CFBundleDisplayName':'Monocode Paseo Prototype',
- 'CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.2.9','CFBundleVersion':'25',
- 'MonocodeUpstreamBase':'native-v0.16.0-preview.12','MonocodeUpstreamCommit':'3fa189d1abf7423b68a979b1c8f4e6874d52f843',
+ 'CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.2.9','CFBundleVersion':'26',
+ 'MonocodeUpstreamBase':'main','MonocodeUpstreamCommit':'0ff7ef8bb1b698eb720faef7b396f13bc5ffe321',
  'CFBundleIconFile':'monocode.icns','NSHighResolutionCapable':True,'NSPrincipalClass':'NSApplication',
  'PaseoPrototype':True,'MonocodeDataMode':'paseo-prototype'}
 # Main checks a stable literal marker before any Store or ordinary data-mode path.
