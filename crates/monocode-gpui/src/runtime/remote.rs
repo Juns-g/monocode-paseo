@@ -110,6 +110,7 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         delivered: None,
         start: 0,
         rows: vec![],
+        window: None,
         provider_id: None,
         model: None,
         config_model: None,
@@ -615,9 +616,16 @@ pub(crate) fn run_with_client(
             .take()
             .unwrap_or_else(|| json!({"type":"send"}));
         let attaching = action["type"] == "attach";
-        let paseo = (crate::paseo_host::active() || action["paseoFollowUps"] == true)
-            && client.request(&binding.machine(&client)?.id, "environment.describe", json!({}))?["capabilities"]
-                .as_array().is_some_and(|caps| caps.iter().any(|c| c == "paseo.steer"));
+        let capabilities = if crate::paseo_host::active() || action["paseoFollowUps"] == true {
+            Some(client.request(&binding.machine(&client)?.id, "environment.describe", json!({}))?["capabilities"].clone())
+        } else {
+            None
+        };
+        let has = |name: &str| capabilities.as_ref().and_then(Value::as_array)
+            .is_some_and(|caps| caps.iter().any(|c| c == name));
+        let paseo = has("paseo.steer");
+        // A paged Paseo host slides its bounded window; track it in memory only.
+        let windowed = paseo && has("paseo.history-pages");
         paseo_followups = paseo;
         let mut initial_deliveries = Vec::new();
         let retrying = action["type"] == "retry";
@@ -764,6 +772,7 @@ pub(crate) fn run_with_client(
         let mut seen_approvals = HashSet::new();
         let mut seen_questions = HashSet::new();
         let mut last_revision = None;
+        let mut window = None::<crate::transcript::WindowLayout>;
         let mut control_commands = Vec::<Value>::new();
         let mut stopping_run = None::<String>;
         loop {
@@ -791,6 +800,24 @@ pub(crate) fn run_with_client(
                     &id,
                 );
                 let (history, _) = monocode_core::store::Store::project_remote_history(&projected)?;
+                if windowed {
+                    let layout = monocode_core::store::Store::remote_window_layout(&projected)?;
+                    // Rows that slid out of the host window's front leave `latest_rows`
+                    // first, so `start` is relative to the slid window.
+                    if let (Some(previous), Some((first, _))) = (&window, layout.first())
+                        && previous.first().is_some_and(|(id, _)| id != first)
+                    {
+                        match previous.iter().position(|(id, _)| id == first) {
+                            Some(slid) => {
+                                let rows = previous[..slid].iter().map(|(_, rows)| rows).sum();
+                                latest_rows.drain(..usize::min(rows, latest_rows.len()));
+                            }
+                            None => latest_rows.clear(),
+                        }
+                    }
+                    window = Some(layout.clone());
+                    next.window = Some(layout);
+                }
                 let prefix = latest_rows
                     .iter()
                     .zip(&history.rows)

@@ -145,6 +145,8 @@ struct HostFixture {
     idle_after: Arc<std::sync::atomic::AtomicUsize>,
     /// From this sync on (0: never) the host reports a title it chose itself.
     rename_at: Arc<std::sync::atomic::AtomicUsize>,
+    /// A `paseo.history-pages` host appends this many tail blocks to its window.
+    tail: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl HostFixture {
     fn new(running: bool, saved_draft: bool) -> Self {
@@ -157,11 +159,24 @@ impl HostFixture {
     fn with_sync_barrier(sync_barrier: Arc<AtomicBool>) -> Self {
         Self::with_barriers(false, false, None, Some(sync_barrier))
     }
+    /// A Paseo host with a bounded window of four blocks and one older page.
+    fn paged() -> Self {
+        Self::build(false, false, None, None, true)
+    }
     fn with_barriers(
         running: bool,
         saved_draft: bool,
         view_barrier: Option<Arc<AtomicBool>>,
         sync_barrier: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        Self::build(running, saved_draft, view_barrier, sync_barrier, false)
+    }
+    fn build(
+        running: bool,
+        saved_draft: bool,
+        view_barrier: Option<Arc<AtomicBool>>,
+        sync_barrier: Option<Arc<AtomicBool>>,
+        paged: bool,
     ) -> Self {
         use std::io::{BufRead, Read, Write};
         let nonce = std::time::SystemTime::now()
@@ -177,10 +192,26 @@ impl HostFixture {
         if view_barrier.is_some() || sync_barrier.is_some() {
             descriptor["capabilities"].as_array_mut().unwrap().push(json!("paseo.configure"));
         }
-        let snapshot = json!({"projectId": "project", "revision": 1, "status": if running {"running"} else {"idle"}, "runId": if running {json!("host-run")} else {serde_json::Value::Null}, "updatedAt": 42,
+        if paged {
+            descriptor["capabilities"].as_array_mut().unwrap().extend(
+                ["paseo.history-pages", "paseo.preserve-prose"].map(|name| json!(name)),
+            );
+        }
+        let mut snapshot = json!({"projectId": "project", "revision": 1, "status": if running {"running"} else {"idle"}, "runId": if running {json!("host-run")} else {serde_json::Value::Null}, "updatedAt": 42,
             "session": {"id": "host-session", "title": "Conversation on host", "harness": "codex", "model": "codex:gpt-test", "runtimeMode": "supervised", "modelSettings": {}, "blocks": if saved_draft { json!([{ "id": "host-saved-draft", "role": "user", "draft": true, "text": "Saved host draft" }]) } else {json!([])} }
         });
+        if paged {
+            snapshot["session"]["blocks"] = json!([
+                {"id": "w0", "role": "user", "text": "Window question"},
+                {"id": "w1", "role": "assistant", "text": "Window answer"},
+                {"id": "w2", "role": "user", "text": "Second window question"},
+                {"id": "w3", "role": "assistant", "text": "Second window answer"},
+            ]);
+            snapshot["session"]["historyWindow"] = json!({"epoch": "epoch-1", "before": 40});
+        }
         let initial = snapshot.clone();
+        let tail = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tails = tail.clone();
         let requests = Arc::new(Mutex::new(vec![]));
         let received = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -243,7 +274,21 @@ impl HostFixture {
                             snapshot["runId"] = serde_json::Value::Null;
                             snapshot["revision"] = json!(2);
                         }
-                        json!({"kind": "snapshot", "value": snapshot})
+                        let mut value = snapshot.clone();
+                        let extra = tails.load(Ordering::Relaxed);
+                        for index in 0..extra {
+                            value["session"]["blocks"].as_array_mut().unwrap().push(json!({"id": format!("tail{index}"), "role": "user", "text": format!("Tail question {index}")}));
+                        }
+                        value["revision"] = json!(value["revision"].as_u64().unwrap() + extra as u64);
+                        json!({"kind": "snapshot", "value": value})
+                    }
+                    "sessions.historyBefore" => {
+                        assert_eq!(request["params"]["epoch"], "epoch-1");
+                        assert_eq!(request["params"]["before"], 40);
+                        json!({"epoch": "epoch-1", "before": null, "blocks": [
+                            {"id": "o0", "role": "user", "text": "Older question"},
+                            {"id": "o1", "role": "assistant", "text": "Older answer"},
+                        ]})
                     }
                     "commands.dispatch" => {
                         let command = &request["params"];
@@ -282,6 +327,7 @@ impl HostFixture {
             sync_barrier,
             idle_after,
             rename_at,
+            tail,
         }
     }
     fn conversation(&self, cx: &mut TestAppContext) -> Entity<Conversation> {
@@ -295,6 +341,25 @@ impl HostFixture {
                 view.load_remote(cx);
                 view
             })
+        })
+    }
+    /// The same conversation in a window, so its transcript lays out and asks for older turns.
+    fn window(&self, cx: &mut TestAppContext) -> gpui::WindowHandle<Conversation> {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            cx.set_global(crate::settings::Preferences {
+                composer_mascot: false,
+                ..Default::default()
+            });
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut view = Conversation::new(self.summary.clone(), self.store.clone(), cx);
+                    view.remote_state.client = Some(self.client.clone());
+                    view.load_remote(cx);
+                    view
+                })
+            })
+            .unwrap()
         })
     }
     fn wait(&self, view: &Entity<Conversation>, cx: &mut TestAppContext, settled: bool) {
@@ -1088,4 +1153,95 @@ fn cold_open_loading_line_is_paseo_only_and_never_hides_an_error(cx: &mut TestAp
         .unwrap();
     visual.refresh().unwrap();
     assert!(visual.debug_bounds("paseo-cold-open-loading").is_none());
+}
+
+fn history_texts(view: &Entity<Conversation>, cx: &mut TestAppContext) -> Vec<String> {
+    cx.update(|cx| {
+        view.read(cx)
+            .transcript
+            .read(cx)
+            .history_rows()
+            .iter()
+            .map(|row| row.text.clone())
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn paged_paseo_window_keeps_an_older_page_through_the_next_idle_sync(cx: &mut TestAppContext) {
+    let host = HostFixture::paged();
+    let window = host.window(cx);
+    let view = window.root(cx).unwrap();
+    host.wait(&view, cx, true);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let window_rows = history_texts(&view, visual);
+    assert!(window_rows.iter().any(|text| text == "Window question"), "{window_rows:?}");
+    visual.update(|_, cx| {
+        let transcript = view.read(cx).transcript.read(cx);
+        assert_eq!(transcript.older_history_cursor(), Some(40));
+    });
+
+    // The short window's top is on screen: laying it out reads the page above it.
+    let mut paged = false;
+    for _ in 0..1000 {
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        paged = history_texts(&view, visual).iter().any(|text| text == "Older question");
+        if paged {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(paged, "the older page never arrived");
+    let with_page = history_texts(&view, visual);
+    let older = with_page.iter().position(|text| text == "Older question").unwrap();
+    let first = with_page.iter().position(|text| text == "Window question").unwrap();
+    assert!(older < first, "{with_page:?}");
+    let page_requests = |host: &HostFixture| {
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "sessions.historyBefore")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let requests = page_requests(&host);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["params"]["sessionId"], "host-session");
+    assert_eq!(requests[0]["params"]["limit"], 100);
+    visual.update(|_, cx| {
+        let transcript = view.read(cx).transcript.read(cx);
+        assert!(transcript.history_complete(), "the host had no older block");
+        assert_eq!(transcript.older_history_cursor(), Some(40));
+    });
+
+    // The next idle sync: the host window gained a tail block.
+    host.tail.store(1, Ordering::Relaxed);
+    visual.update(|_, cx| view.update(cx, |view, cx| view.refresh_remote_snapshot(cx)));
+    host.wait(&view, visual, true);
+    visual.refresh().unwrap();
+    visual.run_until_parked();
+    let synced = history_texts(&view, visual);
+    let mut expected = with_page.clone();
+    // A user block projects to its text and an (empty) attachment row.
+    expected.extend(["Tail question 0".to_owned(), "[]".to_owned()]);
+    assert_eq!(synced, expected, "every row once, the page kept above the window");
+    assert_eq!(page_requests(&host).len(), 1, "the sync does not re-read the page");
+    visual.update(|_, cx| {
+        let transcript = view.read(cx).transcript.read(cx);
+        assert_eq!(transcript.source_rows().len(), expected.len() - (with_page.len() - 6));
+    });
+}
+
+#[gpui::test]
+fn unpaged_host_installs_the_snapshot_without_a_window_or_pager(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, true);
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    cx.update(|cx| {
+        let transcript = view.read(cx).transcript.read(cx);
+        assert!(transcript.history_complete());
+        assert_eq!(transcript.older_history_cursor(), None);
+    });
 }

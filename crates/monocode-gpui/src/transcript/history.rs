@@ -7,6 +7,21 @@ use monocode_core::store::{HistoryPage, PAGE_TURNS};
 /// Called on the background executor.
 pub(crate) type HistoryPager = Arc<dyn Fn(i64, bool) -> Result<HistoryPage, String> + Send + Sync>;
 
+/// A Paseo host window, block by block: each block's id and how many rows it
+/// projects to. The host's window slides; ids say which rows left its front.
+pub(crate) type WindowLayout = Vec<(String, usize)>;
+
+/// What a view knows of a Paseo host window between syncs.
+#[derive(Default)]
+pub(super) struct RemoteWindow {
+    /// The layout of the window as last installed or aligned.
+    layout: WindowLayout,
+    /// The window comes from a remote host, whose pager cannot read `all`.
+    remote: bool,
+    /// Bumped when older rows are dropped, to discard a page in flight.
+    generation: u64,
+}
+
 /// Keep source row indices intact for persistence, tools and live patches.
 /// Only the displayed window needs Markdown and presentation objects.
 pub(crate) struct PreparedHistory {
@@ -68,13 +83,136 @@ impl TranscriptView {
         history: PreparedHistory,
         cx: &mut Context<Self>,
     ) {
-        // A Paseo sync is an authoritative window, including removals and reset.
-        if self.preserve_prose && history.rows.len() < self.source.len() {
+        // A view evicted while inactive restores where the reader left it.
+        if self.history_position.is_some() {
             self.restore_prepared_history(history, cx);
+            return;
+        }
+        // A Paseo sync is an authoritative window, including removals.
+        if self.preserve_prose && history.rows.len() < self.source_rows().len() {
+            self.replace_window(history, cx);
             return;
         }
         self.prepared_parsers = history.parsers;
         self.patch(0, history.rows, cx);
+    }
+
+    /// Install an authoritative Paseo window. Rows that slid out of the host
+    /// window's front stay above it as older history, and the window itself is
+    /// replaced in place, so the reading position survives the sync.
+    pub(crate) fn install_remote_window(
+        &mut self,
+        history: PreparedHistory,
+        layout: WindowLayout,
+        before: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.align_remote_window(layout);
+        if self.history_position.is_some() {
+            self.restore_prepared_history(history, cx);
+        } else {
+            self.replace_window(history, cx);
+        }
+        // Older rows, loaded or slid, already have a cursor above them.
+        if self.base == 0 {
+            self.history_before = before;
+        }
+        self.window_before = before;
+    }
+    /// Account for a live window slide before a live patch.
+    pub(crate) fn align_remote_window(&mut self, layout: WindowLayout) {
+        self.remote_window.remote = true;
+        let old = std::mem::replace(&mut self.remote_window.layout, layout);
+        if old.is_empty() {
+            return;
+        }
+        let first = self.remote_window.layout.first().map(|(id, _)| id);
+        match first.and_then(|id| old.iter().position(|(old, _)| old == id)) {
+            Some(slid) => {
+                // The rows that left the host's window stay here, unnumbered.
+                let slid: usize = old[..slid].iter().map(|(_, rows)| rows).sum();
+                // An evicted view's saved row moves up with the window.
+                if self.source.is_empty()
+                    && let Some(position) = self.history_position.as_mut()
+                {
+                    position.key = position
+                        .key
+                        .and_then(|(row, part)| Some((row.checked_sub(slid)?, part)));
+                }
+                self.base += slid.min(self.source_rows().len());
+            }
+            // A new epoch, a reset or a burst beyond the window: nothing joins.
+            None => {
+                let older = self.base > 0;
+                self.drop_older_history();
+                if older {
+                    self.source = Vec::new();
+                    self.source_bytes = 0;
+                    self.messages = Vec::new();
+                    self.rows = Vec::new();
+                    self.history_start = 0;
+                    self.mono_groups.get_mut().clear();
+                    self.list.reset(1);
+                }
+            }
+        }
+    }
+    /// The reader for older Paseo pages; `before` stays as
+    /// `install_remote_window` keeps it.
+    pub(crate) fn set_remote_pager(&mut self, pager: Option<HistoryPager>) {
+        self.remote_window.remote |= pager.is_some();
+        self.history_pager = pager;
+        self.history_failed = false;
+    }
+    /// Replace the window with `history`, without a reset: a shorter one
+    /// truncates, and the rebuild keeps the reading anchor.
+    fn replace_window(&mut self, history: PreparedHistory, cx: &mut Context<Self>) {
+        let base = self.base;
+        let end = base + history.rows.len();
+        self.prepared_parsers.retain(|&at, _| at < base);
+        self.prepared_parsers.extend(
+            history
+                .parsers
+                .into_iter()
+                .map(|(at, parser)| (at + base, parser)),
+        );
+        if end < self.source.len() {
+            self.truncate_source(end);
+        }
+        if history.rows.is_empty() {
+            self.rebuild(end.saturating_sub(1), cx);
+        } else {
+            self.patch_view(base, history.rows, cx);
+        }
+    }
+    /// Cut the source to `end` rows, and the state keyed beyond them.
+    fn truncate_source(&mut self, end: usize) {
+        let bytes = self.source.drain(end..).fold(0usize, |bytes, row| {
+            bytes.saturating_add(row.text.capacity().saturating_add(row.role.capacity()))
+        });
+        self.source_bytes = self.source_bytes.saturating_sub(bytes);
+        // A turn is keyed by the row after its prompt, which may be `end`.
+        let turn = self.turns.get(&end).cloned();
+        let elapsed = self.elapsed.get(&end).copied();
+        let live_start = self.live_start;
+        let outline = std::mem::take(&mut self.outline);
+        self.shift_rows(&|row| (row < end).then_some(row));
+        self.outline = outline;
+        self.outline.patched(&self.source, end);
+        self.live_start = live_start.min(end);
+        self.history_start = self.history_start.min(end);
+        if let Some(turn) = turn {
+            self.turns.insert(end, turn);
+        }
+        if let Some(elapsed) = elapsed {
+            self.elapsed.insert(end, elapsed);
+        }
+        self.placed.clear();
+        for row in &self.source {
+            if row.role == "assistant" {
+                visuals::placements(&row.text, &mut self.placed);
+            }
+        }
     }
 
     /// Where turns above the loaded rows come from. A paged Mono loads only
@@ -107,8 +245,10 @@ impl TranscriptView {
     }
     /// Reveal a saved search hit. Its row counts from the first turn, so read
     /// every older turn first; the loaded rows then number from it too.
+    /// A remote window reveals within its loaded rows only: its pager cannot
+    /// read every older page, so a hit above them is not reached.
     pub(crate) fn reveal_saved_search(&mut self, row: usize, query: &str, cx: &mut Context<Self>) {
-        if self.history_before.is_some() {
+        if self.history_before.is_some() && !self.remote_window.remote {
             self.history_search = Some((row, query.into()));
             self.list.pause_following_tail();
             if !self.history_loading {
@@ -170,6 +310,7 @@ impl TranscriptView {
         self.history_loading = true;
         self.list.pause_following_tail();
         let epoch = self.highlight_epoch;
+        let generation = self.remote_window.generation;
         let mono = self.mono;
         let work = cx.background_executor().spawn(async move {
             let page = pager(before, all)?;
@@ -179,7 +320,10 @@ impl TranscriptView {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
-                if epoch != this.highlight_epoch || this.history_before != Some(before) {
+                if epoch != this.highlight_epoch
+                    || this.remote_window.generation != generation
+                    || this.history_before != Some(before)
+                {
                     return;
                 }
                 this.history_loading = false;
@@ -321,6 +465,9 @@ impl TranscriptView {
         let base = std::mem::take(&mut self.base);
         self.history_before = None;
         self.window_before = None;
+        // A page in flight belongs to the rows just dropped.
+        self.history_loading = false;
+        self.remote_window.generation = self.remote_window.generation.wrapping_add(1);
         if base > 0 {
             self.shift_rows(&|row| row.checked_sub(base));
         }

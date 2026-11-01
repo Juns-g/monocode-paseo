@@ -11,7 +11,7 @@ import {SyncTransfers} from '../../../host/sync-transfer.ts';
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
 const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume and never answer (its own wait is 60 s).
-export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','sessions.no-delete','sessions.list-revision',
+export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.history-pages','sessions.no-delete','sessions.list-revision',
   'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
 const stamp=value=>{const n=typeof value==='number'?value:Date.parse(value);return Number.isFinite(n)?n:0;};
@@ -74,14 +74,14 @@ export function projectBlocks(page,entries=page.displayEntries??page.entries,req
     }
     blocks.push(block);if(at)last=at;
   }
-  if(prompt && !page.agent?.activeTurn && page.agent?.status!=='running' && last>=prompt.startedAt)prompt.durationMs=last-prompt.startedAt;
+  // An older page ends mid-history: its trailing prompt's turn may continue past the boundary.
+  if(prompt && !page.partial && !page.agent?.activeTurn && page.agent?.status!=='running' && last>=prompt.startedAt)prompt.durationMs=last-prompt.startedAt;
   for(const request of page.agent?.pendingPermissions??[]) {
     if(request.kind==='question')continue;
     blocks.push({id:`permission:${request.id}`,role:'tool',text:request.title||request.name,
       tool:{title:request.title||request.name,status:'running',detail:request.description||''},
       approval:{requestId:requestNumber(request.id)}});
   }
-  if(page.hasOlder)blocks.unshift({id:'paseo-history-window',role:'system',text:'较早历史请在 Paseo 查看；此窗口最多显示最近 1000 条记录。'});
   return blocks;
 }
 
@@ -271,7 +271,8 @@ export class PaseoHost {
     if(agentChanged||!h.snapshot||h.changedRows!==h.entries){
       const s=summary(entry,entry.projectId),blocks=projectBlocks({...h.page,agent:entry.agent},this.projectTimeline(h.entries),request=>this.number(id,request));
       const session={id,harness:s.harness,providerSessionId:s.providerSessionId,model:s.model,modelSettings:nativeSettings(entry.agent),runtimeMode:s.runtimeMode,title:s.title,cwd:s.cwd,
-        busy:s.status==='running',blocks,paseoModeId:entry.agent.currentModeId};
+        busy:s.status==='running',blocks,paseoModeId:entry.agent.currentModeId,
+        historyWindow:{epoch:h.page.epoch,before:h.page.hasOlder&&h.entries.length?h.entries[0].seqStart:null}};
       const question=entry.agent.pendingPermissions?.find(p=>p.kind==='question');
       // Arbitrary provider question forms need exact schemas. Keep them explicit.
       if(question && !parseQuestionFormQuestions(question.input))blocks.push({id:`question:${question.id}`,role:'error',text:'此 Paseo 提问暂不支持原生表单，请在 Paseo 中回答。'});
@@ -527,6 +528,16 @@ export class PaseoHost {
         sync={kind:'delta',base:p.revision,value:{...value,session},blockIds:blocks.map(b=>b.id),blocks:blocks.filter(b=>previous.get(b.id)!==JSON.stringify(b))};
       }
       return {result:this.transfers.respond(p.sessionId,sync)};
+    }
+    if(method==='sessions.historyBefore') {
+      if(!Number.isSafeInteger(p.before)||p.before<0)throw Error('Invalid history cursor');
+      if(typeof p.epoch!=='string'||!p.epoch)throw Error('Invalid history epoch');
+      const limit=Math.min(100,Math.max(1,Number.isFinite(p.limit)?Math.trunc(p.limit):100)),entry=await this.target(p.sessionId),id=entry.agent.id;
+      const page=await this.client.fetchAgentTimeline(id,{projection:'canonical',direction:'before',cursor:{epoch:p.epoch,seq:p.before},limit});this.identity();
+      if(page.agent?.id!==id||page.epoch!==p.epoch||page.reset||page.staleCursor)throw Error('Paseo 历史已变化，请重新同步 (history changed)');
+      // Read-only: no permission blocks, no turn duration for a prompt whose turn may continue past the page, and no cached window is touched.
+      const blocks=projectBlocks({epoch:page.epoch,partial:true},this.projectTimeline(page.entries));
+      return {result:{epoch:page.epoch,blocks,before:page.hasOlder&&page.entries.length?page.entries[0].seqStart:null}};
     }
     if(method==='sessions.syncChunk')return {result:this.transfers.chunk(p.sessionId,p.transfer,p.offset)};
     if(method==='commands.dispatch')return {result:await this.command(p)};

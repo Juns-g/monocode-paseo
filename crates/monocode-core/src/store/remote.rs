@@ -719,6 +719,25 @@ impl Store {
             shared::project_turns(&blocks)?,
         ))
     }
+    /// Each host block's id and the rows `project_remote_history` projects it
+    /// to, in order, so a sliding window can tell how many rows left its front.
+    pub fn remote_window_layout(snapshot: &Value) -> Result<Vec<(String, usize)>, String> {
+        let blocks = snapshot["session"]["blocks"]
+            .as_array()
+            .ok_or("Host transcript is missing")?;
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| {
+                let mut block = block.clone();
+                if block["role"] == "plan" {
+                    block["nativeRemotePlan"] = Value::Bool(true);
+                }
+                let id = block["id"].as_str().map_or_else(|| format!("#{index}"), str::to_owned);
+                Ok((id, shared::blocks::project(std::slice::from_ref(&block))?.len()))
+            })
+            .collect()
+    }
     /// Changes whenever a host session mutation starts or finishes. A project
     /// index requested before a change can predate it and must not be applied.
     pub fn remote_mutations(&self) -> u64 {
@@ -790,6 +809,24 @@ mod tests {
                 "blocks":[{"id":"prompt","role":"user","text":"hello"}]}})
     }
 
+    #[test]
+    fn remote_window_layout_counts_match_the_projected_rows() {
+        let mut value = snapshot("layout");
+        value["session"]["blocks"] = json!([
+            {"id":"u1","role":"user","text":"first"},
+            {"id":"a1","role":"assistant","text":"answer"},
+            {"id":"draft","role":"user","text":"later","draft":true},
+            {"id":"p1","role":"plan","text":"1. do it"},
+            {"id":"u2","role":"user","text":"second","attachments":[{"name":"a.txt"}]},
+        ]);
+        let layout = Store::remote_window_layout(&value).unwrap();
+        let ids: Vec<_> = layout.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["u1", "a1", "draft", "p1", "u2"]);
+        assert_eq!(layout[2].1, 0);
+        let (history, _) = Store::project_remote_history(&value).unwrap();
+        assert_eq!(layout.iter().map(|(_, rows)| rows).sum::<usize>(), history.rows.len());
+        assert!(Store::remote_window_layout(&json!({})).is_err());
+    }
     #[test]
     fn remote_parent_links_survive_restart_and_follow_authoritative_refresh() {
         let directory = tempfile::tempdir().unwrap();

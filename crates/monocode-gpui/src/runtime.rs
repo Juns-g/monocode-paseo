@@ -38,6 +38,8 @@ pub(crate) struct Update {
     pub(crate) delivered: Option<String>,
     pub(crate) start: usize,
     pub(crate) rows: Vec<Row>,
+    /// A Paseo window's blocks and their row counts, for a live slide.
+    pub(crate) window: Option<crate::transcript::WindowLayout>,
     pub(crate) provider_id: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) config_model: Option<String>,
@@ -235,6 +237,7 @@ fn run_turn_using(
             &tx,
             &cancel,
             Update {
+                window: None,
                 worktree_cwd: None,
                 commands: None,
                 provider_turn_id: None,
@@ -291,6 +294,7 @@ fn run_turn_using(
                 &tx,
                 &cancel,
                 Update {
+                    window: None,
                     worktree_cwd: Some(cwd),
                     commands: None,
                     provider_turn_id: None,
@@ -340,6 +344,7 @@ fn run_turn_using(
                 &tx,
                 &cancel,
                 Update {
+                    window: None,
                     worktree_cwd: None,
                     commands: None,
                     provider_turn_id: None,
@@ -401,6 +406,7 @@ fn run_turn_using(
                 &tx,
                 &cancel,
                 Update {
+                    window: None,
                     worktree_cwd: None,
                     commands: None,
                     provider_turn_id: None,
@@ -861,6 +867,7 @@ fn run_turn_using(
                         &tx,
                         &cancel,
                         Update {
+                            window: None,
                             worktree_cwd: None,
                             commands,
                             provider_turn_id,
@@ -1051,6 +1058,7 @@ fn run_turn_using(
     // Final status must still arrive after cancellation. Dropping a window closes
     // the receiver, so the worker never keeps a closed viewport alive.
     let _ = tx.send_blocking(Update {
+        window: None,
         // A stop can make the UI skip intermediate updates. Keep the created
         // checkout in the final receipt so the next Send cannot create it twice.
         worktree_cwd: created_worktree,

@@ -1265,6 +1265,9 @@ impl Conversation {
                                 || !update.follow_up_delivered.is_empty()
                                 || !update.follow_up_errors.is_empty());
                         this.transcript.update(cx, |v, cx| {
+                            if let Some(layout) = update.window {
+                                v.align_remote_window(layout);
+                            }
                             v.patch(update.start, update.rows, cx);
                             if stopping {
                                 v.stop_streaming(cx);

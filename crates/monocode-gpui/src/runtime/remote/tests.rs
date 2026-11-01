@@ -1016,3 +1016,73 @@ fn observer_reports_a_host_title_change_once_and_never_writes_it_back() {
         "Named by the host"
     );
 }
+
+fn windowed(revision: u64, status: &str, ids: &[&str]) -> Value {
+    let mut value = snapshot(status, revision);
+    value["session"]["blocks"] = json!(ids.iter().map(|id| json!({"id":id,"role":"user","text":format!("message {id}")})).collect::<Vec<_>>());
+    value
+}
+fn observe_window(capabilities: Vec<&'static str>) -> Vec<Update> {
+    let dir = Directory::new();
+    let store = dir.store();
+    let mut bound = binding(&store);
+    bound.session_id = Some("host-session".into());
+    journal(&store, &bound).unwrap();
+    let mut polls = 0;
+    let host = Host::with_capabilities(capabilities, move |_| {
+        polls += 1;
+        // The host's bounded window slides by one block between snapshots.
+        let value = match polls {
+            1 => windowed(1, "running", &["a", "b", "c"]),
+            2 => windowed(2, "running", &["b", "c", "d"]),
+            _ => windowed(3, "idle", &["c", "d", "e"]),
+        };
+        Some(json!({"kind":"snapshot","value":value}))
+    });
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        bound.summary.clone(),
+        String::new(),
+        Settings { remote_action: Some(json!({"type":"attach","paseoFollowUps":true})), ..Default::default() },
+        controls,
+        store,
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let mut updates = Vec::new();
+    while let Ok(next) = rx.try_recv() {
+        updates.push(next);
+    }
+    updates
+}
+
+#[test]
+fn paged_paseo_live_window_slide_is_relative_to_the_slid_window() {
+    let updates = observe_window(vec!["paseo.steer", "paseo.history-pages"]);
+    let layouts: Vec<_> = updates.iter().filter_map(|u| u.window.clone()).collect();
+    let ids = |layout: &crate::transcript::WindowLayout| -> Vec<String> { layout.iter().map(|(id, _)| id.clone()).collect() };
+    assert_eq!(layouts.len(), 3, "{} updates", updates.len());
+    assert_eq!(ids(&layouts[0]), ["a", "b", "c"]);
+    assert_eq!(ids(&layouts[1]), ["b", "c", "d"]);
+    assert_eq!(ids(&layouts[2]), ["c", "d", "e"]);
+    let rows = |layout: &crate::transcript::WindowLayout, id: &str| layout.iter().find(|(i, _)| i == id).unwrap().1;
+    assert!(rows(&layouts[0], "a") > 0);
+    let sent: Vec<_> = updates.iter().filter(|u| u.window.is_some()).collect();
+    assert_eq!((sent[0].start, sent[0].rows.len()), (0, rows(&layouts[0], "a") + rows(&layouts[0], "b") + rows(&layouts[0], "c")));
+    // "a" slid out: the two kept blocks match, so only "d" is new at their end.
+    assert_eq!(sent[1].start, rows(&layouts[1], "b") + rows(&layouts[1], "c"));
+    assert_eq!(sent[1].rows.len(), rows(&layouts[1], "d"));
+    assert_eq!(sent[2].start, rows(&layouts[2], "c") + rows(&layouts[2], "d"));
+    assert_eq!(sent[2].rows.len(), rows(&layouts[2], "e"));
+}
+
+#[test]
+fn live_window_layout_is_absent_without_the_history_pages_capability() {
+    let updates = observe_window(vec!["paseo.steer"]);
+    assert!(!updates.is_empty());
+    assert!(updates.iter().all(|u| u.window.is_none()));
+    // The unpaged host keeps the whole-snapshot comparison: no slide accounting.
+    assert!(updates.iter().any(|u| u.start == 0 && !u.rows.is_empty()));
+}

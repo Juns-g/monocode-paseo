@@ -40,10 +40,48 @@ pub(crate) struct OpenHistory {
         crate::transcript::PreparedHistory,
         HashMap<usize, monocode_core::agent::TurnInfo>,
     )>,
+    /// A `paseo.history-pages` host's window: its blocks' rows and older cursor.
+    window: Option<PagedWindow>,
     descriptor: Option<Value>,
     workspace_choices: Option<Vec<Value>>,
     pub(crate) timings: Value,
     machine_id: String,
+}
+struct PagedWindow {
+    layout: crate::transcript::WindowLayout,
+    before: Option<i64>,
+    epoch: Option<String>,
+}
+/// Reads the pages above a paged Paseo window. Pages belong to one `epoch`;
+/// the host rejects a stale one, which surfaces as the pager's error.
+fn history_pager(
+    client: Arc<monocode_core::remote::Connections>,
+    machine: String,
+    environment: String,
+    session: String,
+    epoch: String,
+) -> crate::transcript::HistoryPager {
+    Arc::new(move |before, all| {
+        if all {
+            return Err("Older Paseo history pages load as you scroll".into());
+        }
+        let page = client.request(
+            &machine,
+            "sessions.historyBefore",
+            json!({"sessionId":session,"epoch":epoch,"before":before,"limit":100}),
+        )?;
+        if page["epoch"].as_str().is_some_and(|reply| reply != epoch) {
+            return Err("Paseo history changed; reopen this conversation".into());
+        }
+        let mut wrapper = json!({"session":{"blocks":page["blocks"]}});
+        monocode_core::remote::attachments::qualify_snapshot(&mut wrapper, &environment, &session);
+        let (history, turns) = monocode_core::store::Store::project_remote_history(&wrapper)?;
+        Ok(monocode_core::store::HistoryPage {
+            rows: history.rows,
+            turns,
+            before: page["before"].as_i64(),
+        })
+    })
 }
 struct OpenTimings {
     started: std::time::Instant,
@@ -88,6 +126,18 @@ pub(crate) fn prepare_remote_open(
     client: Option<Arc<monocode_core::remote::Connections>>,
     initial: bool,
 ) -> Result<OpenHistory, String> {
+    prepare_remote_open_with(store, id, known, client, initial, false)
+}
+/// `paged`: the host is already known to advertise `paseo.history-pages`; an
+/// initial open reads that from its own descriptor instead.
+pub(crate) fn prepare_remote_open_with(
+    store: &Database,
+    id: i64,
+    known: Option<Value>,
+    client: Option<Arc<monocode_core::remote::Connections>>,
+    initial: bool,
+    paged: bool,
+) -> Result<OpenHistory, String> {
     let mut timings = OpenTimings::new();
     let (mut remote, mut settings) = {
         let store = locked(store)?;
@@ -109,6 +159,12 @@ pub(crate) fn prepare_remote_open(
         None
     };
     timings.mark("describeMs");
+    let paged = match &descriptor {
+        Some(descriptor) => descriptor["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|c| c == "paseo.history-pages")),
+        None => paged,
+    };
     let workspace_choices = if remote.session_id.is_none()
         && descriptor.as_ref().is_some_and(|d| d["capabilities"]
             .as_array().is_some_and(|caps| caps.iter().any(|c| c == "paseo.workspaces")))
@@ -139,6 +195,7 @@ pub(crate) fn prepare_remote_open(
         settings = store.agent_settings(summary.id)?.unwrap_or_default();
     }
     timings.mark("registerMs");
+    let mut window = None;
     let history = if changed {
         let qualified = snapshot.as_ref().map(|snapshot| {
             let mut snapshot = snapshot.clone();
@@ -157,6 +214,14 @@ pub(crate) fn prepare_remote_open(
             .transpose()?
             .unwrap_or_default();
         timings.mark("projectionMs");
+        if paged && let Some(snapshot) = qualified.as_ref() {
+            let host = &snapshot["session"]["historyWindow"];
+            window = Some(PagedWindow {
+                layout: monocode_core::store::Store::remote_window_layout(snapshot)?,
+                before: host["before"].as_i64(),
+                epoch: host["epoch"].as_str().map(str::to_owned),
+            });
+        }
         let prepared = crate::transcript::PreparedHistory::new(history.rows, false);
         timings.mark("prepareMs");
         Some((prepared, turns))
@@ -167,7 +232,7 @@ pub(crate) fn prepare_remote_open(
     let mut timings = timings.finish();
     timings["rows"] = json!(rows);
     Ok(OpenHistory {
-        remote, settings, snapshot, history, descriptor, workspace_choices,
+        remote, settings, snapshot, history, window, descriptor, workspace_choices,
         timings, machine_id: machine.id,
     })
 }
@@ -311,8 +376,9 @@ impl Conversation {
         let client = self.remote_state.client.clone();
         let view_client = client.clone();
         let started = std::time::Instant::now();
+        let paged = self.remote_state.capabilities.contains("paseo.history-pages");
         let work = cx.background_executor().spawn(async move {
-            prepare_remote_open(&store, id, known, client, initial)
+            prepare_remote_open_with(&store, id, known, client, initial, paged)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -340,7 +406,7 @@ impl Conversation {
                     this.remote_state.viewed_at = Some(std::time::Instant::now());
                 }
                 match result {
-                    Ok(OpenHistory { remote, settings, snapshot, history, descriptor, workspace_choices, timings, .. }) => {
+                    Ok(OpenHistory { remote, settings, snapshot, history, window, descriptor, workspace_choices, timings, machine_id }) => {
                         let install_started = std::time::Instant::now();
                         if initial && std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
                             this.remote_state.first_content_trace = Some(started);
@@ -378,12 +444,36 @@ impl Conversation {
                                 .capabilities
                                 .contains("paseo.preserve-prose");
                             this.settings.turns = turns.clone();
+                            // Rebuilt from every installed window, so the pager always
+                            // reads under the epoch of the window it sits above.
+                            let pager = window.as_ref().map(|window| {
+                                window.epoch.clone().zip(this.remote_state.client.clone()).zip(remote.session_id.clone())
+                                    .map(|((epoch, client), session)| history_pager(
+                                        client,
+                                        machine_id.clone(),
+                                        remote.project.environment_id.clone(),
+                                        session,
+                                        epoch,
+                                    ))
+                            });
                             this.transcript.update(cx, |view, cx| {
                                 if preserve {
                                     view.paseo_mode();
                                 }
-                                view.set_turns(turns);
-                                view.install_prepared_history(history, cx);
+                                match window {
+                                    Some(window) => {
+                                        view.install_remote_window(history, window.layout, window.before, cx);
+                                        // The window's base is only known once it is installed.
+                                        view.set_turns(turns);
+                                    }
+                                    None => {
+                                        view.set_turns(turns);
+                                        view.install_prepared_history(history, cx);
+                                    }
+                                }
+                                if let Some(pager) = pager {
+                                    view.set_remote_pager(pager);
+                                }
                             });
                         }
                         if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {

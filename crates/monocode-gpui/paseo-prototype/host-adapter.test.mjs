@@ -845,3 +845,77 @@ test('corrupt seen file is tolerated and permission attention records no overlay
     await host.directory(true);assert.equal(await bucketOf(host),'needs_input');host.close();
   }finally{f.close();}
 });
+// Fake daemon timeline of `count` entries (seq 1..count, user/assistant alternating, 1 s apart) with real tail/before paging.
+function pagedTimeline(f,count,calls=[]){
+  const all=Array.from({length:count},(_,i)=>({seqStart:i+1,seqEnd:i+1,timestamp:1000*(i+1),item:{type:i%2?'assistant_message':'user_message',text:`m${i+1}`}}));
+  f.client.fetchAgentTimeline=async(id,o)=>{
+    calls.push(o);
+    const end=o.direction==='before'?all.findIndex(e=>e.seqStart>=o.cursor.seq):all.length,rows=all.slice(Math.max(0,end-o.limit),end);
+    return {agent:{...f.a,id},epoch:'e',hasOlder:rows.length>0&&rows[0].seqStart>1,entries:rows,startCursor:rows[0]&&{epoch:'e',seq:rows[0].seqStart}};
+  };
+  return all;
+}
+test('historyBefore pages older blocks with window-identical ids and a next cursor until the last page',async()=>{
+  const f=fixture();try{
+    const calls=[];pagedTimeline(f,250,calls);await f.host.directory();
+    const sync=(await f.host.request('sessions.sync',{sessionId:'a'})).result.value,hw=sync.session.historyWindow;
+    assert.equal(sync.session.blocks.length,250);assert.deepEqual(hw,{epoch:'e',before:null});
+    const first=(await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:201,limit:100})).result;
+    assert.equal(first.epoch,'e');assert.equal(first.blocks.length,100);assert.deepEqual(first.blocks.map(b=>b.id),Array.from({length:100},(_,i)=>`e:${101+i}`));
+    assert.equal(first.before,101);
+    const window=new Map(sync.session.blocks.map(b=>[b.id,b]));
+    // Same ids and content as inside the window; only the trailing prompt of a page loses its duration (its turn continues past the boundary).
+    first.blocks.forEach((b,i)=>assert.deepEqual(i===98?{...window.get(b.id),durationMs:undefined}:window.get(b.id),i===98?{...b,durationMs:undefined}:b));
+    assert.equal(first.blocks[98].role,'user');assert.equal(first.blocks[98].durationMs,undefined);assert.equal(window.get(first.blocks[98].id).durationMs,1000);
+    const second=(await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:first.before})).result;
+    assert.deepEqual(second.blocks.map(b=>b.id),Array.from({length:100},(_,i)=>`e:${1+i}`));assert.equal(second.before,null);
+    const last=calls.at(-1);assert.deepEqual([last.direction,last.cursor,last.limit],['before',{epoch:'e',seq:101},100]);
+    const clamped=await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:201,limit:1000});assert.equal(clamped.result.blocks.length,100);
+    assert.equal(calls.at(-1).limit,100);
+    await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:201,limit:0});assert.equal(calls.at(-1).limit,1);
+  }finally{f.close();}
+});
+test('historyBefore rejects wrong identity, epoch, reset, stale cursor and invalid params without touching state',async()=>{
+  const f=fixture();try{
+    pagedTimeline(f,10);await f.host.directory();const good=f.client.fetchAgentTimeline;
+    const ask=(extra={})=>f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:5,...extra});
+    f.client.fetchAgentTimeline=async(...args)=>({...await good(...args),agent:{...f.a,id:'other'}});await assert.rejects(ask(),/history changed/);
+    f.client.fetchAgentTimeline=async(...args)=>({...await good(...args),epoch:'f'});await assert.rejects(ask(),/history changed/);
+    f.client.fetchAgentTimeline=async(...args)=>({...await good(...args),reset:true});await assert.rejects(ask(),/history changed/);
+    f.client.fetchAgentTimeline=async(...args)=>({...await good(...args),staleCursor:true});await assert.rejects(ask(),/history changed/);
+    f.client.fetchAgentTimeline=good;
+    for(const bad of [{before:-1},{before:1.5},{before:'5'},{before:Number.MAX_SAFE_INTEGER+1},{before:undefined},{epoch:''},{epoch:7},{epoch:undefined}])await assert.rejects(ask(bad),/Invalid history/);
+    await assert.rejects(ask({sessionId:'missing'}),/Unknown/);
+    assert.equal(f.host.histories.size,0);assert.equal((await ask()).result.blocks.length,4);assert.equal(f.host.histories.size,0);
+  }finally{f.close();}
+});
+test('historyBefore pages carry no permission blocks and no duration for a trailing prompt',async()=>{
+  const f=fixture();try{
+    f.a.pendingPermissions=[{id:'perm',kind:'tool',name:'bash',title:'Run',description:'d'}];
+    const e=(seq,type,at)=>({seqStart:seq,seqEnd:seq,timestamp:at,item:{type,text:`m${seq}`}});
+    f.client.fetchAgentTimeline=async id=>({agent:{...f.a,id},epoch:'e',hasOlder:true,entries:[e(10,'user_message',1000),e(11,'assistant_message',2000),e(12,'user_message',3000),e(13,'assistant_message',9000),e(14,'user_message',9500)]});
+    await f.host.directory();
+    const {blocks,before}=(await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:20})).result;
+    assert.equal(before,10);assert.equal(blocks.length,5);assert.ok(!blocks.some(b=>b.id.startsWith('permission:')||b.approval));
+    assert.equal(blocks[0].durationMs,1000);assert.equal(blocks[2].durationMs,6000);assert.equal(blocks[4].durationMs,undefined);
+    // The same agent state is idle in a window, where the trailing prompt does get its duration.
+    f.a.pendingPermissions=[];assert.equal(projectBlocks({epoch:'e',agent:{status:'idle'}},[e(14,'user_message',9500),e(15,'assistant_message',9900)]).at(0).durationMs,400);
+    const empty=pagedTimeline(f,0);assert.equal(empty.length,0);
+    assert.deepEqual((await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:1})).result,{epoch:'e',blocks:[],before:null});
+  }finally{f.close();}
+});
+test('the sync window stays bounded, reports its cursor, has no history notice and advertises paging',async()=>{
+  const f=fixture();try{
+    f.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+    const all=pagedTimeline(f,2500);await f.host.directory();
+    const value=(await f.host.request('sessions.sync',{sessionId:'a'})).result.value;
+    assert.ok(value.session.blocks.length<=1000);assert.ok(value.session.blocks.length>=100);
+    assert.ok(!value.session.blocks.some(b=>b.id==='paseo-history-window'));
+    const h=f.host.histories.get('a');assert.ok(h.entries.length<=1000);
+    assert.deepEqual(value.session.historyWindow,{epoch:'e',before:h.entries[0].seqStart});assert.ok(value.session.historyWindow.before>1);
+    assert.equal(value.session.blocks[0].id,`e:${h.entries[0].seqStart}`);assert.equal(all.at(-1).seqStart,2500);
+    const caps=(await f.host.request('environment.describe',{})).result.capabilities;assert.ok(caps.includes('paseo.history-pages'));
+    const page=(await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:value.session.historyWindow.before})).result;
+    assert.equal(page.blocks.at(-1).id,`e:${value.session.historyWindow.before-1}`);assert.equal(h.entries[0].seqStart,value.session.historyWindow.before);
+  }finally{f.close();}
+});
