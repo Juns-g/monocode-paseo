@@ -98,11 +98,17 @@ impl OpenTimings {
         }
     }
     fn mark(&mut self, key: &str) {
-        self.values.insert(key.into(), json!(self.phase.elapsed().as_secs_f64() * 1000.));
+        self.values.insert(
+            key.into(),
+            json!(self.phase.elapsed().as_secs_f64() * 1000.),
+        );
         self.phase = std::time::Instant::now();
     }
     fn finish(mut self) -> Value {
-        self.values.insert("backgroundMs".into(), json!(self.started.elapsed().as_secs_f64() * 1000.));
+        self.values.insert(
+            "backgroundMs".into(),
+            json!(self.started.elapsed().as_secs_f64() * 1000.),
+        );
         Value::Object(self.values)
     }
 }
@@ -114,9 +120,16 @@ fn dispatch_remote_view(
     id: i64,
 ) {
     let begin = std::time::Instant::now();
-    let result = client.request(machine, "commands.dispatch", json!({"type":"view", "sessionId":session, "commandId":monocode_core::mono::new_id()}));
+    let result = client.request(
+        machine,
+        "commands.dispatch",
+        json!({"type":"view", "sessionId":session, "commandId":monocode_core::mono::new_id()}),
+    );
     if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
-        eprintln!("native remote-view {}", json!({"session":id,"elapsedMs":begin.elapsed().as_secs_f64()*1000.,"ok":result.is_ok()}));
+        eprintln!(
+            "native remote-view {}",
+            json!({"session":id,"elapsedMs":begin.elapsed().as_secs_f64()*1000.,"ok":result.is_ok()})
+        );
     }
 }
 pub(crate) fn prepare_remote_open(
@@ -166,12 +179,22 @@ pub(crate) fn prepare_remote_open_with(
         None => paged,
     };
     let workspace_choices = if remote.session_id.is_none()
-        && descriptor.as_ref().is_some_and(|d| d["capabilities"]
-            .as_array().is_some_and(|caps| caps.iter().any(|c| c == "paseo.workspaces")))
-    {
-        Some(client.request(&machine.id, "paseo.workspaces",
-            json!({"projectId":remote.project.project_id}))?
-            .as_array().ok_or("Invalid Paseo workspace choices")?.clone())
+        && descriptor.as_ref().is_some_and(|d| {
+            d["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|c| c == "paseo.workspaces"))
+        }) {
+        Some(
+            client
+                .request(
+                    &machine.id,
+                    "paseo.workspaces",
+                    json!({"projectId":remote.project.project_id}),
+                )?
+                .as_array()
+                .ok_or("Invalid Paseo workspace choices")?
+                .clone(),
+        )
     } else {
         None
     };
@@ -183,8 +206,7 @@ pub(crate) fn prepare_remote_open_with(
         .transpose()?;
     timings.mark("syncMs");
     let changed = initial
-        || known.as_ref().map(|s| &s["revision"])
-            != snapshot.as_ref().map(|s| &s["revision"]);
+        || known.as_ref().map(|s| &s["revision"]) != snapshot.as_ref().map(|s| &s["revision"]);
     if let Some(snapshot) = snapshot.as_ref().filter(|_| changed) {
         let store = locked(store)?;
         timings.mark("registerLockWaitMs");
@@ -232,8 +254,15 @@ pub(crate) fn prepare_remote_open_with(
     let mut timings = timings.finish();
     timings["rows"] = json!(rows);
     Ok(OpenHistory {
-        remote, settings, snapshot, history, window, descriptor, workspace_choices,
-        timings, machine_id: machine.id,
+        remote,
+        settings,
+        snapshot,
+        history,
+        window,
+        descriptor,
+        workspace_choices,
+        timings,
+        machine_id: machine.id,
     })
 }
 
@@ -312,7 +341,10 @@ impl Conversation {
         if !self.paseo_controls()
             || !self.history_loaded()
             || self.remote_state.viewing
-            || self.remote_state.viewed_at.is_some_and(|at| at.elapsed() < RETRY)
+            || self
+                .remote_state
+                .viewed_at
+                .is_some_and(|at| at.elapsed() < RETRY)
         {
             return false;
         }
@@ -344,7 +376,9 @@ impl Conversation {
     pub(crate) fn mark_paseo_loaded_for_test(&mut self) {
         self.summary.cwd = "remote://shell-test/project".into();
         self.loaded = true;
-        self.remote_state.capabilities.insert("paseo.configure".into());
+        self.remote_state
+            .capabilities
+            .insert("paseo.configure".into());
         self.remote_state.client = Some(Arc::new(monocode_core::remote::Connections::new(
             "/nonexistent/monocode-shell-test",
         )));
@@ -376,7 +410,10 @@ impl Conversation {
         let client = self.remote_state.client.clone();
         let view_client = client.clone();
         let started = std::time::Instant::now();
-        let paged = self.remote_state.capabilities.contains("paseo.history-pages");
+        let paged = self
+            .remote_state
+            .capabilities
+            .contains("paseo.history-pages");
         let work = cx.background_executor().spawn(async move {
             prepare_remote_open_with(&store, id, known, client, initial, paged)
         });

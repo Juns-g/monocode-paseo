@@ -152,7 +152,11 @@ impl HostFixture {
     fn new(running: bool, saved_draft: bool) -> Self {
         Self::with_view_barrier(running, saved_draft, None)
     }
-    fn with_view_barrier(running: bool, saved_draft: bool, view_barrier: Option<Arc<AtomicBool>>) -> Self {
+    fn with_view_barrier(
+        running: bool,
+        saved_draft: bool,
+        view_barrier: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self::with_barriers(running, saved_draft, view_barrier, None)
     }
     /// A Paseo host whose `sessions.sync` blocks until `sync_barrier` is set.
@@ -190,12 +194,16 @@ impl HostFixture {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let mut descriptor = json!({"protocolVersion": 1, "environmentId": environment, "name": "UI test host", "providers": ["codex"], "capabilities": ["sessions.draft", "sessions.plan", "attachments.upload", "sessions.sync"]});
         if view_barrier.is_some() || sync_barrier.is_some() {
-            descriptor["capabilities"].as_array_mut().unwrap().push(json!("paseo.configure"));
+            descriptor["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("paseo.configure"));
         }
         if paged {
-            descriptor["capabilities"].as_array_mut().unwrap().extend(
-                ["paseo.history-pages", "paseo.preserve-prose"].map(|name| json!(name)),
-            );
+            descriptor["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .extend(["paseo.history-pages", "paseo.preserve-prose"].map(|name| json!(name)));
         }
         let mut snapshot = json!({"projectId": "project", "revision": 1, "status": if running {"running"} else {"idle"}, "runId": if running {json!("host-run")} else {serde_json::Value::Null}, "updatedAt": 42,
             "session": {"id": "host-session", "title": "Conversation on host", "harness": "codex", "model": "codex:gpt-test", "runtimeMode": "supervised", "modelSettings": {}, "blocks": if saved_draft { json!([{ "id": "host-saved-draft", "role": "user", "draft": true, "text": "Saved host draft" }]) } else {json!([])} }
@@ -260,7 +268,8 @@ impl HostFixture {
                     "environment.describe" => descriptor.clone(),
                     "sessions.sync" => {
                         if let Some(barrier) = &blocked_sync {
-                            while !barrier.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+                            while !barrier.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed)
+                            {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                         }
@@ -279,7 +288,8 @@ impl HostFixture {
                         for index in 0..extra {
                             value["session"]["blocks"].as_array_mut().unwrap().push(json!({"id": format!("tail{index}"), "role": "user", "text": format!("Tail question {index}")}));
                         }
-                        value["revision"] = json!(value["revision"].as_u64().unwrap() + extra as u64);
+                        value["revision"] =
+                            json!(value["revision"].as_u64().unwrap() + extra as u64);
                         json!({"kind": "snapshot", "value": value})
                     }
                     "sessions.historyBefore" => {
@@ -292,8 +302,11 @@ impl HostFixture {
                     }
                     "commands.dispatch" => {
                         let command = &request["params"];
-                        if command["type"] == "view" && let Some(barrier) = &blocked_view {
-                            while !barrier.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+                        if command["type"] == "view"
+                            && let Some(barrier) = &blocked_view
+                        {
+                            while !barrier.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed)
+                            {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                         }
@@ -708,10 +721,17 @@ fn sending_while_remote_turn_runs_shows_a_not_sent_notice_without_a_retry_comman
 }
 
 #[gpui::test]
-fn only_an_unbound_paseo_draft_offers_workspace_selection_without_local_git(cx: &mut TestAppContext) {
+fn only_an_unbound_paseo_draft_offers_workspace_selection_without_local_git(
+    cx: &mut TestAppContext,
+) {
     for bound in [false, true] {
         let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
-        let project = store.remember_remote_project("remote-ui-tests", &json!({"id":"paseo:/repo","cwd":"/repo"})).unwrap();
+        let project = store
+            .remember_remote_project(
+                "remote-ui-tests",
+                &json!({"id":"paseo:/repo","cwd":"/repo"}),
+            )
+            .unwrap();
         let summary = store.create("codex", &project.key).unwrap();
         if bound {
             let mut binding = store.remote_session(summary.id).unwrap().unwrap();
@@ -722,42 +742,60 @@ fn only_an_unbound_paseo_draft_offers_workspace_selection_without_local_git(cx: 
             let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
             view.loaded = true;
             view.remote_state.online = true;
-            view.remote_state.capabilities = ["paseo.configure", "paseo.workspaces"].into_iter().map(str::to_owned).collect();
+            view.remote_state.capabilities = ["paseo.configure", "paseo.workspaces"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
             view
         });
-        window.update(cx, |view, window, cx| {
-            assert!(view.git.is_none());
-            assert!(!view.summary.has_messages);
-            view.remote_state.workspace_choices = vec![json!({
-                "id":"chosen-workspace","title":"Existing task","cwd":"/repo"
-            })];
-            view.toggle_menu(ComposerMenu::Workspace, window, cx);
-            if bound {
-                assert!(view.menu.is_none(), "an existing empty agent must not offer reparenting");
-                view.menu_choice("workspace:paseo:existing:chosen-workspace", cx);
-                assert!(view.settings.remote_workspace_id.is_none());
-            } else {
-                let mut events = Vec::new();
-                let (_, items, _, _) = view.menu_items(ComposerMenu::Workspace, &mut events, window, cx);
-                let actions: Vec<_> = items.iter().filter_map(|item| match item {
-                    MenuItem::Action(action) => Some(action.id.as_ref()),
-                    _ => None,
-                }).collect();
-                assert!(actions.contains(&"workspace:paseo:new"));
-                assert!(!actions.contains(&"workspace:new"));
-                assert!(!actions.contains(&"workspace:existing"));
-                assert!(actions.contains(&"workspace:paseo:existing:chosen-workspace"));
-                view.menu_choice("workspace:paseo:existing:chosen-workspace", cx);
-                assert_eq!(view.settings.remote_workspace_id.as_deref(), Some("chosen-workspace"));
-                view.menu_choice("workspace:paseo:existing:missing", cx);
-                assert_eq!(view.settings.remote_workspace_id.as_deref(), Some("chosen-workspace"));
-                view.menu_choice("workspace:paseo:new", cx);
-                assert!(view.settings.remote_workspace_id.is_none());
-                assert!(view.settings.remote_action.is_none());
-                assert!(view.follow_ups.state.messages.is_empty());
-                assert!(view.transcript.read(cx).source_rows().is_empty());
-            }
-        }).unwrap();
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.git.is_none());
+                assert!(!view.summary.has_messages);
+                view.remote_state.workspace_choices = vec![json!({
+                    "id":"chosen-workspace","title":"Existing task","cwd":"/repo"
+                })];
+                view.toggle_menu(ComposerMenu::Workspace, window, cx);
+                if bound {
+                    assert!(
+                        view.menu.is_none(),
+                        "an existing empty agent must not offer reparenting"
+                    );
+                    view.menu_choice("workspace:paseo:existing:chosen-workspace", cx);
+                    assert!(view.settings.remote_workspace_id.is_none());
+                } else {
+                    let mut events = Vec::new();
+                    let (_, items, _, _) =
+                        view.menu_items(ComposerMenu::Workspace, &mut events, window, cx);
+                    let actions: Vec<_> = items
+                        .iter()
+                        .filter_map(|item| match item {
+                            MenuItem::Action(action) => Some(action.id.as_ref()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(actions.contains(&"workspace:paseo:new"));
+                    assert!(!actions.contains(&"workspace:new"));
+                    assert!(!actions.contains(&"workspace:existing"));
+                    assert!(actions.contains(&"workspace:paseo:existing:chosen-workspace"));
+                    view.menu_choice("workspace:paseo:existing:chosen-workspace", cx);
+                    assert_eq!(
+                        view.settings.remote_workspace_id.as_deref(),
+                        Some("chosen-workspace")
+                    );
+                    view.menu_choice("workspace:paseo:existing:missing", cx);
+                    assert_eq!(
+                        view.settings.remote_workspace_id.as_deref(),
+                        Some("chosen-workspace")
+                    );
+                    view.menu_choice("workspace:paseo:new", cx);
+                    assert!(view.settings.remote_workspace_id.is_none());
+                    assert!(view.settings.remote_action.is_none());
+                    assert!(view.follow_ups.state.messages.is_empty());
+                    assert!(view.transcript.read(cx).source_rows().is_empty());
+                }
+            })
+            .unwrap();
     }
 }
 
@@ -777,37 +815,48 @@ fn paseo_new_draft_loads_workspace_choices_over_real_transport_before_enabling_s
         },
     );
     let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
-    let project = store.remember_remote_project(
-        "env", &json!({"id":"paseo:/repo","cwd":"/repo"}),
-    ).unwrap();
+    let project = store
+        .remember_remote_project("env", &json!({"id":"paseo:/repo","cwd":"/repo"}))
+        .unwrap();
     let summary = store.create("codex", &project.key).unwrap();
     let store = Arc::new(Mutex::new(store));
     let window = cx.open_window(Default::default(), |_, cx| {
         let mut view = Conversation::new(summary, store.clone(), cx);
         view.remote_state.client = Some(host.client.clone());
-        view.seed_new_settings(Settings {
-            model: Some("codex:fixture-model".into()), ..Default::default()
-        }, cx);
-        view.input.update(cx, |input, cx| input.set_text("Test; reply 111".into(), cx));
+        view.seed_new_settings(
+            Settings {
+                model: Some("codex:fixture-model".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+        view.input
+            .update(cx, |input, cx| input.set_text("Test; reply 111".into(), cx));
         view
     });
     window.update(cx, |view, _, cx| view.load(cx)).unwrap();
     cx.run_until_parked();
-    window.update(cx, |view, window, cx| {
-        assert!(view.loaded, "actual draft startup failed: {}", view.status);
-        assert!(view.remote_state.online);
-        assert!(view.remote_state.error.is_none());
-        assert!(view.paseo_workspace_draft());
-        assert_eq!(view.remote_state.workspace_choices.len(), 1);
-        assert_eq!(view.input.read(cx).content, "Test; reply 111");
-        assert!(!view.remote_send_guard(cx), "{}", view.status);
-        assert!(!view.attaching && !view.busy && !view.stopping);
-        view.toggle_menu(ComposerMenu::Workspace, window, cx);
-        assert!(view.menu.is_some());
-        let binding = locked(&store).unwrap().remote_session(view.summary.id).unwrap().unwrap();
-        assert!(binding.session_id.is_none());
-        assert!(binding.outbox.is_empty(), "loading must not create or send");
-    }).unwrap();
+    window
+        .update(cx, |view, window, cx| {
+            assert!(view.loaded, "actual draft startup failed: {}", view.status);
+            assert!(view.remote_state.online);
+            assert!(view.remote_state.error.is_none());
+            assert!(view.paseo_workspace_draft());
+            assert_eq!(view.remote_state.workspace_choices.len(), 1);
+            assert_eq!(view.input.read(cx).content, "Test; reply 111");
+            assert!(!view.remote_send_guard(cx), "{}", view.status);
+            assert!(!view.attaching && !view.busy && !view.stopping);
+            view.toggle_menu(ComposerMenu::Workspace, window, cx);
+            assert!(view.menu.is_some());
+            let binding = locked(&store)
+                .unwrap()
+                .remote_session(view.summary.id)
+                .unwrap()
+                .unwrap();
+            assert!(binding.session_id.is_none());
+            assert!(binding.outbox.is_empty(), "loading must not create or send");
+        })
+        .unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();
     assert!(visual.debug_bounds("paseo-workspace-selector").is_some());
@@ -818,21 +867,30 @@ fn paseo_new_draft_loads_workspace_choices_over_real_transport_before_enabling_s
 fn ordinary_remote_hosts_keep_the_existing_worktree_picker(cx: &mut TestAppContext) {
     for (remote, stopping) in [(true, false), (true, true), (false, true)] {
         let view = conversation(cx);
-        cx.update(|cx| view.update(cx, |view, _| {
-            view.remote_state.capabilities = ["git.worktrees"].into_iter().map(str::to_owned).collect();
-            view.git = Some(monocode_core::git::Snapshot::default());
-            view.summary.has_messages = false;
-            view.stopping = stopping;
-            if !remote {
-                view.summary.cwd = "/test-project".into();
-            }
-            assert_eq!(view.is_remote(), remote);
-            assert!(!view.paseo_controls());
-        }));
-        let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| view.clone())).unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.remote_state.capabilities =
+                    ["git.worktrees"].into_iter().map(str::to_owned).collect();
+                view.git = Some(monocode_core::git::Snapshot::default());
+                view.summary.has_messages = false;
+                view.stopping = stopping;
+                if !remote {
+                    view.summary.cwd = "/test-project".into();
+                }
+                assert_eq!(view.is_remote(), remote);
+                assert!(!view.paseo_controls());
+            })
+        });
+        let window = cx
+            .update(|cx| cx.open_window(Default::default(), |_, _| view.clone()))
+            .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        let point = window.update(visual, |view, _, _| view.workspace_anchor.get().unwrap().center()).unwrap();
+        let point = window
+            .update(visual, |view, _, _| {
+                view.workspace_anchor.get().unwrap().center()
+            })
+            .unwrap();
         visual.simulate_click(point, Default::default());
         visual.run_until_parked();
         window.update(visual, |view, _, cx| {
@@ -851,16 +909,24 @@ fn paseo_busy_send_uses_the_native_queue_and_steer_controls(cx: &mut TestAppCont
         let view = conversation(cx);
         let (controls, receiver) = std::sync::mpsc::channel();
         cx.update(|cx| {
-            cx.set_global(crate::settings::Preferences { follow_up: if prefer_steer {"steer"} else {"queue"}.into(), ..Default::default() });
+            cx.set_global(crate::settings::Preferences {
+                follow_up: if prefer_steer { "steer" } else { "queue" }.into(),
+                ..Default::default()
+            });
             view.update(cx, |view, cx| {
-                view.remote_state.capabilities.extend(["paseo.configure".into(), "paseo.steer".into()]);
+                view.remote_state
+                    .capabilities
+                    .extend(["paseo.configure".into(), "paseo.steer".into()]);
                 view.busy = true;
                 view.follow_ups.ready = true;
                 view.controls = Some(controls);
                 view.send(cx);
                 assert!(view.input.read(cx).content.is_empty());
                 assert_eq!(view.follow_ups.state.messages.len(), 1);
-                assert_eq!(view.follow_ups.state.messages[0].text, "Keep this next message");
+                assert_eq!(
+                    view.follow_ups.state.messages[0].text,
+                    "Keep this next message"
+                );
                 assert_eq!(view.follow_ups.state.messages[0].steer, prefer_steer);
                 assert!(!view.remote_state.send_blocked_notice);
                 assert!(view.remote_state.rejected.is_none());
@@ -883,7 +949,6 @@ fn paseo_busy_send_uses_the_native_queue_and_steer_controls(cx: &mut TestAppCont
     }
 }
 
-
 /// Synthetic 1000-row Paseo window through the real Conversation/Transcript.
 /// Timings are diagnostic, not thresholds tied to this machine's load.
 #[gpui::test]
@@ -891,7 +956,8 @@ fn paseo_switch_install_timing(cx: &mut TestAppContext) {
     use std::time::Instant;
     let view = conversation(cx);
     let window = cx.update(|cx| {
-        cx.open_window(Default::default(), |_, _| view.clone()).unwrap()
+        cx.open_window(Default::default(), |_, _| view.clone())
+            .unwrap()
     });
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     let mut samples = Vec::new();
@@ -900,41 +966,69 @@ fn paseo_switch_install_timing(cx: &mut TestAppContext) {
         let bytes: usize = rows.iter().map(|row| row.text.len()).sum();
         let begin = Instant::now();
         let prepared = crate::transcript::PreparedHistory::new(rows, false);
-        let prepare_ms = begin.elapsed().as_secs_f64()*1000.;
+        let prepare_ms = begin.elapsed().as_secs_f64() * 1000.;
         let begin = Instant::now();
-        window.update(visual, |view, _, cx| {
-            view.summary.has_messages = true;
-            view.transcript.update(cx, |transcript, cx| {
-                transcript.paseo_mode();
-                transcript.install_prepared_history(prepared, cx);
-                assert_eq!(transcript.source_rows().len(),1000);
-                assert!(transcript.source_rows()[999].text.contains(&format!("{iteration} / 999")));
-            });
-        }).unwrap();
-        let install_ms = begin.elapsed().as_secs_f64()*1000.;
+        window
+            .update(visual, |view, _, cx| {
+                view.summary.has_messages = true;
+                view.transcript.update(cx, |transcript, cx| {
+                    transcript.paseo_mode();
+                    transcript.install_prepared_history(prepared, cx);
+                    assert_eq!(transcript.source_rows().len(), 1000);
+                    assert!(
+                        transcript.source_rows()[999]
+                            .text
+                            .contains(&format!("{iteration} / 999"))
+                    );
+                });
+            })
+            .unwrap();
+        let install_ms = begin.elapsed().as_secs_f64() * 1000.;
         let begin = Instant::now();
-        visual.update_window(window.into(), |_, window, cx| {
-            window.refresh();
-            window.draw(cx).clear(cx);
-        }).unwrap();
-        let layout_ms = begin.elapsed().as_secs_f64()*1000.;
+        visual
+            .update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        let layout_ms = begin.elapsed().as_secs_f64() * 1000.;
         samples.push(json!({"iteration":iteration,"rows":1000,"bytes":bytes,"prepareMs":prepare_ms,"installMs":install_ms,"testLayoutMs":layout_ms}));
     }
-    println!("paseo-switch-install {}",json!({"synthetic":true,"gpu":false,"samples":samples}));
+    println!(
+        "paseo-switch-install {}",
+        json!({"synthetic":true,"gpu":false,"samples":samples})
+    );
 }
 
 fn switch_fixture_rows(iteration: usize) -> Vec<monocode_core::transcript::Row> {
-    (0..1000).map(|i| {
-            let role = match i % 10 { 0 => "user", 1 => "reasoning", 2..=7 => "tool", _ => "assistant" };
+    (0..1000)
+        .map(|i| {
+            let role = match i % 10 {
+                0 => "user",
+                1 => "reasoning",
+                2..=7 => "tool",
+                _ => "assistant",
+            };
             let text = if role == "tool" {
                 let mut tool = monocode_core::tool::ToolCall::new(&format!("tool-{i}"), "read");
                 tool.input = json!({"filePath":"src/example.rs"}).to_string();
                 tool.output = "Synthetic output\n".repeat(24);
                 tool.state = monocode_core::tool::ToolState::Completed;
                 serde_json::to_string(&tool).unwrap()
-            } else { format!("## Synthetic {iteration} / {i}\n\n{}\n```rust\nfn example() {{}}\n```", "Native Markdown **content**. ".repeat(12)) };
-            monocode_core::transcript::Row {role:role.into(),text,first:true,sent_at:None}
-        }).collect()
+            } else {
+                format!(
+                    "## Synthetic {iteration} / {i}\n\n{}\n```rust\nfn example() {{}}\n```",
+                    "Native Markdown **content**. ".repeat(12)
+                )
+            };
+            monocode_core::transcript::Row {
+                role: role.into(),
+                text,
+                first: true,
+                sent_at: None,
+            }
+        })
+        .collect()
 }
 
 #[gpui::test]
@@ -946,15 +1040,34 @@ fn paseo_history_installs_before_view_acknowledgement(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let view = view.read(cx);
         assert!(view.loaded && !view.loading && view.remote_state.online);
-        assert_eq!(view.follow_ups.state.draft.as_ref().unwrap().text, "Saved host draft");
+        assert_eq!(
+            view.follow_ups.state.draft.as_ref().unwrap().text,
+            "Saved host draft"
+        );
     });
     for _ in 0..1000 {
         cx.run_until_parked();
-        if host.requests.lock().unwrap().iter().any(|r| r["params"]["type"] == "view") { break; }
+        if host
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["params"]["type"] == "view")
+        {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(!barrier.load(Ordering::Relaxed));
-    assert_eq!(host.requests.lock().unwrap().iter().filter(|r| r["params"]["type"] == "view").count(), 1);
+    assert_eq!(
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["params"]["type"] == "view")
+            .count(),
+        1
+    );
     barrier.store(true, Ordering::Relaxed);
 }
 
@@ -975,7 +1088,9 @@ fn marking_a_loaded_paseo_view_acknowledges_it_once(cx: &mut TestAppContext) {
         cx.new(|cx| {
             let mut view = Conversation::new(host.summary.clone(), host.store.clone(), cx);
             view.remote_state.client = Some(host.client.clone());
-            view.remote_state.capabilities.insert("paseo.configure".into());
+            view.remote_state
+                .capabilities
+                .insert("paseo.configure".into());
             view
         })
     });
@@ -999,7 +1114,9 @@ fn marking_a_loaded_paseo_view_acknowledges_it_once(cx: &mut TestAppContext) {
     cx.update(|cx| view.update(cx, |view, _| view.remote_state.viewed_at = None));
     // One request in flight at a time.
     let (first, second) = cx.update(|cx| {
-        view.update(cx, |view, cx| (view.mark_remote_viewed(cx), view.mark_remote_viewed(cx)))
+        view.update(cx, |view, cx| {
+            (view.mark_remote_viewed(cx), view.mark_remote_viewed(cx))
+        })
     });
     assert!(first && !second);
     for _ in 0..1000 {
@@ -1029,42 +1146,64 @@ fn render_paseo_switch_timing_fixture() {
     let mut cx = gpui::HeadlessAppContext::with_platform(
         Arc::new(gpui_apple::AppleTextSystem::new()),
         Arc::new(crate::assets::Assets),
-        || Ok(Some(Box::new(gpui_apple::metal_renderer::MetalHeadlessRenderer::new()))),
+        || {
+            Ok(Some(Box::new(
+                gpui_apple::metal_renderer::MetalHeadlessRenderer::new(),
+            )))
+        },
     );
-    let window = cx.open_window(gpui::size(px(1180.), px(800.)), |_, cx| {
-        let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
-        let mut summary = store.create("codex", "/synthetic").unwrap();
-        summary.cwd = "remote://fixture/synthetic".into();
-        summary.has_messages = true;
-        cx.new(|cx| {
-            let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
-            view.loaded = true;
-            view
+    let window = cx
+        .open_window(gpui::size(px(1180.), px(800.)), |_, cx| {
+            let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+            let mut summary = store.create("codex", "/synthetic").unwrap();
+            summary.cwd = "remote://fixture/synthetic".into();
+            summary.has_messages = true;
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                view.loaded = true;
+                view
+            })
         })
-    }).unwrap();
+        .unwrap();
     let mut samples = Vec::new();
     for i in 0..3 {
         let begin = Instant::now();
         let prepared = crate::transcript::PreparedHistory::new(switch_fixture_rows(i), false);
-        let prepare_ms = begin.elapsed().as_secs_f64()*1000.;
+        let prepare_ms = begin.elapsed().as_secs_f64() * 1000.;
         let begin = Instant::now();
         cx.update_window(window.into(), |view, _, cx| {
-            view.downcast::<Conversation>().unwrap().update(cx, |view, cx| {
-                view.transcript.update(cx, |v, cx| { v.paseo_mode(); v.install_prepared_history(prepared, cx); });
-            });
-        }).unwrap();
-        let install_ms = begin.elapsed().as_secs_f64()*1000.;
+            view.downcast::<Conversation>()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.transcript.update(cx, |v, cx| {
+                        v.paseo_mode();
+                        v.install_prepared_history(prepared, cx);
+                    });
+                });
+        })
+        .unwrap();
+        let install_ms = begin.elapsed().as_secs_f64() * 1000.;
         let begin = Instant::now();
-        cx.update_window(window.into(), |_, window, cx| {window.refresh();window.draw(cx).clear(cx);}).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
         cx.run_until_parked();
-        let draw_ms = begin.elapsed().as_secs_f64()*1000.;
+        let draw_ms = begin.elapsed().as_secs_f64() * 1000.;
         samples.push(json!({"iteration":i,"prepareMs":prepare_ms,"installMs":install_ms,"metalDrawMs":draw_ms}));
     }
     if let Some(directory) = std::env::var_os("PASEO_SWITCH_RENDER_DIR") {
         std::fs::create_dir_all(&directory).unwrap();
-        cx.capture_screenshot(window.into()).unwrap().save(PathBuf::from(directory).join("r14-switch.png")).unwrap();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(PathBuf::from(directory).join("r14-switch.png"))
+            .unwrap();
     }
-    println!("paseo-switch-metal {}", json!({"synthetic":true,"rows":1000,"samples":samples}));
+    println!(
+        "paseo-switch-metal {}",
+        json!({"synthetic":true,"rows":1000,"samples":samples})
+    );
 }
 
 #[gpui::test]
@@ -1175,7 +1314,10 @@ fn paged_paseo_window_keeps_an_older_page_through_the_next_idle_sync(cx: &mut Te
     host.wait(&view, cx, true);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     let window_rows = history_texts(&view, visual);
-    assert!(window_rows.iter().any(|text| text == "Window question"), "{window_rows:?}");
+    assert!(
+        window_rows.iter().any(|text| text == "Window question"),
+        "{window_rows:?}"
+    );
     visual.update(|_, cx| {
         let transcript = view.read(cx).transcript.read(cx);
         assert_eq!(transcript.older_history_cursor(), Some(40));
@@ -1186,7 +1328,9 @@ fn paged_paseo_window_keeps_an_older_page_through_the_next_idle_sync(cx: &mut Te
     for _ in 0..1000 {
         visual.refresh().unwrap();
         visual.run_until_parked();
-        paged = history_texts(&view, visual).iter().any(|text| text == "Older question");
+        paged = history_texts(&view, visual)
+            .iter()
+            .any(|text| text == "Older question");
         if paged {
             break;
         }
@@ -1194,8 +1338,14 @@ fn paged_paseo_window_keeps_an_older_page_through_the_next_idle_sync(cx: &mut Te
     }
     assert!(paged, "the older page never arrived");
     let with_page = history_texts(&view, visual);
-    let older = with_page.iter().position(|text| text == "Older question").unwrap();
-    let first = with_page.iter().position(|text| text == "Window question").unwrap();
+    let older = with_page
+        .iter()
+        .position(|text| text == "Older question")
+        .unwrap();
+    let first = with_page
+        .iter()
+        .position(|text| text == "Window question")
+        .unwrap();
     assert!(older < first, "{with_page:?}");
     let page_requests = |host: &HostFixture| {
         host.requests
@@ -1226,11 +1376,21 @@ fn paged_paseo_window_keeps_an_older_page_through_the_next_idle_sync(cx: &mut Te
     let mut expected = with_page.clone();
     // A user block projects to its text and an (empty) attachment row.
     expected.extend(["Tail question 0".to_owned(), "[]".to_owned()]);
-    assert_eq!(synced, expected, "every row once, the page kept above the window");
-    assert_eq!(page_requests(&host).len(), 1, "the sync does not re-read the page");
+    assert_eq!(
+        synced, expected,
+        "every row once, the page kept above the window"
+    );
+    assert_eq!(
+        page_requests(&host).len(),
+        1,
+        "the sync does not re-read the page"
+    );
     visual.update(|_, cx| {
         let transcript = view.read(cx).transcript.read(cx);
-        assert_eq!(transcript.source_rows().len(), expected.len() - (with_page.len() - 6));
+        assert_eq!(
+            transcript.source_rows().len(),
+            expected.len() - (with_page.len() - 6)
+        );
     });
 }
 

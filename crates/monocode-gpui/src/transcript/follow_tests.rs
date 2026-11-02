@@ -1210,7 +1210,7 @@ fn mono_badge_ticker_tracks_work_at_the_top_of_the_turn(cx: &mut TestAppContext)
         (
             "exec_command",
             r#"{"cmd":"cargo check"}"#,
-            "Running command…",
+            "Running a build…",
         ),
         ("Read", r#"{"file_path":"notes.md"}"#, "Reading file…"),
         ("Write", r#"{"file_path":"notes.md"}"#, "Editing file…"),
@@ -2676,6 +2676,187 @@ fn a_mono_opening_sentence_already_shown_does_not_enter_again_when_the_run_ends(
             assert!(
                 view.entrances.contains_key(&3),
                 "the reply held back while working still appears"
+            );
+        })
+        .unwrap();
+}
+
+fn evicted_turns() -> Vec<Row> {
+    (0..12)
+        .flat_map(|i| {
+            [
+                row("user", &format!("Question {i}")),
+                tool(i, true),
+                row(
+                    "assistant",
+                    &format!(
+                        "Answer {i}.\n\n{}",
+                        "A long paragraph of prose. ".repeat(40)
+                    ),
+                ),
+            ]
+        })
+        .collect()
+}
+
+/// Evict an inactive transcript, then install the same history through
+/// `install_prepared_history`, as a reload that does not go through the local
+/// reopen path does, and report where the reader is afterwards.
+fn reinstall_after_eviction(
+    cx: &mut TestAppContext,
+    reading: bool,
+    grown: bool,
+) -> ((String, usize, f32), bool, bool) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let window = chat_mode(cx, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.visible = false;
+            view.install_prepared_history(PreparedHistory::new(evicted_turns(), false), cx);
+            view.visible = true;
+        })
+        .unwrap();
+    render(window, cx);
+    let top = |view: &TranscriptView| {
+        let at = view.list.logical_scroll_top();
+        let row = &view.rows[at.item_ix];
+        (
+            view.source[row.key.0].text.clone(),
+            row.key.1,
+            f32::from(at.offset_in_item),
+        )
+    };
+    window
+        .update(cx, |view, _, _| {
+            if reading {
+                let ix = view.rows.iter().position(|r| r.key.0 == 15).unwrap();
+                view.list.scroll_to(ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(13.),
+                });
+            }
+        })
+        .unwrap();
+    render(window, cx);
+    let expected = window
+        .update(cx, |view, _, _| {
+            assert_eq!(view.list.is_following_tail(), !reading);
+            top(view)
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            view.visible = false;
+            assert!(view.suspend_history(cx));
+            view.visible = true;
+            let mut rows = evicted_turns();
+            if grown {
+                rows.push(row("assistant", "One more reply."));
+            }
+            view.install_prepared_history(PreparedHistory::new(rows, false), cx);
+        })
+        .unwrap();
+    render(window, cx);
+    window
+        .update(cx, |view, _, _| {
+            let after = top(view);
+            let same = if reading {
+                after == expected
+            } else {
+                view.list.is_following_tail()
+            };
+            (after, same, view.history_position.is_none())
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn a_reinstalled_history_returns_the_reader_to_where_they_left_it(cx: &mut TestAppContext) {
+    let (after, same, consumed) = reinstall_after_eviction(cx, true, false);
+    assert!(same, "the reader moved to {after:?}");
+    assert!(consumed, "the suspended position is still pending");
+}
+
+#[gpui::test]
+fn a_reinstalled_history_with_a_new_tail_row_keeps_the_reader_in_place(cx: &mut TestAppContext) {
+    let (after, same, consumed) = reinstall_after_eviction(cx, true, true);
+    assert!(same, "the reader moved to {after:?}");
+    assert!(consumed, "the suspended position is still pending");
+}
+
+#[gpui::test]
+fn a_reinstalled_history_keeps_following_the_tail(cx: &mut TestAppContext) {
+    for grown in [false, true] {
+        let (after, same, consumed) = reinstall_after_eviction(cx, false, grown);
+        assert!(same, "the list stopped following the tail at {after:?}");
+        assert!(consumed, "the suspended position is still pending");
+    }
+}
+
+#[gpui::test]
+fn a_trimmed_final_message_keeps_the_reader_on_its_own_prose_not_its_actions(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let chat_with = |paragraphs: usize| {
+        vec![
+            row("user", "Question 0"),
+            row(
+                "assistant",
+                &"A long paragraph of prose.\n\n".repeat(paragraphs),
+            ),
+            row("user", "Question 1"),
+            row("assistant", &"Later answer.\n\n".repeat(40)),
+        ]
+    };
+    let window = chat_mode(cx, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.visible = false;
+            view.patch(0, chat_with(40), cx);
+            view.visible = true;
+        })
+        .unwrap();
+    render(window, cx);
+    window
+        .update(cx, |view, _, _| {
+            let ix = view
+                .rows
+                .iter()
+                .rposition(|r| r.key.0 == 1 && matches!(r.body, Body::Markdown(_)))
+                .unwrap();
+            view.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
+        })
+        .unwrap();
+    render(window, cx);
+    let read = window
+        .update(cx, |view, _, _| {
+            assert!(!view.list.is_following_tail());
+            view.rows[view.list.logical_scroll_top().item_ix].key
+        })
+        .unwrap();
+    // The patch drops the later prose of the message; its actions row keeps
+    // the same source index.
+    window
+        .update(cx, |view, _, cx| view.patch(0, chat_with(10), cx))
+        .unwrap();
+    render(window, cx);
+    window
+        .update(cx, |view, _, _| {
+            assert!(!view.rows.iter().any(|r| r.key == read));
+            assert!(
+                view.rows
+                    .iter()
+                    .any(|r| r.key.0 == 1 && matches!(r.body, Body::Actions { .. }))
+            );
+            let top = &view.rows[view.list.logical_scroll_top().item_ix];
+            assert!(
+                top.key.0 == 1 && matches!(top.body, Body::Markdown(_)),
+                "the reader moved from {read:?} to {:?}",
+                top.key
             );
         })
         .unwrap();

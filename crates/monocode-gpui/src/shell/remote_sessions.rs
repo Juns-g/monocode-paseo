@@ -44,7 +44,10 @@ impl Shell {
                     && self.workspace.active == Some(self.workspace.session_for_pane(id));
                 let archived = self.session_metadata(id, cx).summary.archived;
                 // A live busy view is authoritative over a stale index.
-                let live_busy = self.sessions.get(&id).is_some_and(|view| view.read(cx).busy);
+                let live_busy = self
+                    .sessions
+                    .get(&id)
+                    .is_some_and(|view| view.read(cx).busy);
                 !focused && !archived && !live_busy && self.unseen_finished.insert(id)
             }
             "done" if matches!(previous, Some("attention" | "failed")) => {
@@ -75,7 +78,11 @@ impl Shell {
         let id = self.workspace.session_for_pane(id);
         if self.app_view_open()
             || self.workspace.active != Some(id)
-            || self.remote_details.get(&id).and_then(|d| d["bucket"].as_str()) != Some("attention")
+            || self
+                .remote_details
+                .get(&id)
+                .and_then(|d| d["bucket"].as_str())
+                != Some("attention")
         {
             return;
         }
@@ -123,7 +130,10 @@ impl Shell {
                             .keys()
                             .map(|id| {
                                 let bucket = this.remote_details.get(id);
-                                (*id, bucket.and_then(|d| d["bucket"].as_str()).map(str::to_owned))
+                                (
+                                    *id,
+                                    bucket.and_then(|d| d["bucket"].as_str()).map(str::to_owned),
+                                )
                             })
                             .collect();
                         this.remote_details.extend(index.presentation);

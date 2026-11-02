@@ -58,6 +58,7 @@ mod pane_motion;
 mod particle_text;
 mod paseo_host;
 mod paseo_prototype;
+mod phase_tile;
 mod pickers;
 mod popover;
 mod project_background;
@@ -77,6 +78,7 @@ mod review;
 mod right_panel;
 mod runtime;
 mod search;
+mod send_morph;
 mod session_mark;
 mod session_review;
 mod settings;
@@ -85,6 +87,7 @@ mod sound;
 mod syntax;
 mod tab_label;
 mod tab_motion;
+mod tab_tile;
 mod terminal;
 mod theme;
 #[cfg(target_os = "macos")]
@@ -92,6 +95,8 @@ mod traffic_lights;
 mod transcript;
 mod usage_footer;
 mod visuals;
+#[cfg(test)]
+mod wheel_glide_tests;
 mod window_state;
 mod workspace;
 mod worktree_switcher;
@@ -197,8 +202,12 @@ fn main() {
         }
         return;
     }
-    if prototype_args.first().is_some_and(|a| a == "--paseo-switch-check") {
-        let path = prototype_args.get(1)
+    if prototype_args
+        .first()
+        .is_some_and(|a| a == "--paseo-switch-check")
+    {
+        let path = prototype_args
+            .get(1)
             .expect("--paseo-switch-check needs an isolated scratch path");
         if let Err(error) = paseo_host::switch_check(std::path::Path::new(path)) {
             eprintln!("{error}");
@@ -256,6 +265,13 @@ fn main() {
     }
     if cli_args.first().is_some_and(|a| a == "visual-mcp") {
         if let Err(error) = monocode_core::visual_bridge::mcp_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if cli_args.first().is_some_and(|a| a == "app-mcp") {
+        if let Err(error) = monocode_core::mono::bridge::mcp_stdio() {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -672,8 +688,8 @@ mod native_tests {
     use super::*;
     use crate::{input, transcript::TranscriptView};
     use gpui::{
-        Bounds, Context, Entity, EntityInputHandler, ListOffset, Render, StyleRefinement, TestAppContext,
-        Window, WindowBounds, WindowOptions, div, point, px, size,
+        Bounds, Context, Entity, EntityInputHandler, ListOffset, Render, StyleRefinement,
+        TestAppContext, Window, WindowBounds, WindowOptions, div, point, px, size,
     };
     use monocode_core::transcript::Row;
     struct Surface {

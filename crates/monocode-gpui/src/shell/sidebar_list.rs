@@ -318,13 +318,31 @@ impl Shell {
             let mut ids = self.sidebar_session_ids(cx);
             ids.retain(|id| !self.rails.children.contains(id));
             let empty = ids.is_empty();
-            if let Some(entry @ Entry::Pinned { sessions }) = entries.iter().find(|entry| matches!(entry, Entry::Pinned { .. })) {
-                let pinned: HashSet<_> = sessions.iter().copied()
-                    .filter(|id| !self.rails.children.contains(id)).collect();
+            if let Some(entry @ Entry::Pinned { sessions }) = entries
+                .iter()
+                .find(|entry| matches!(entry, Entry::Pinned { .. }))
+            {
+                let pinned: HashSet<_> = sessions
+                    .iter()
+                    .copied()
+                    .filter(|id| !self.rails.children.contains(id))
+                    .collect();
                 if !pinned.is_empty() {
-                    rows.push(if self.workspace.classic_layout { Row::Group(entry.clone()) } else { Row::Pinned });
-                    if !self.workspace.classic_layout || !self.project_groups().pinned_collapsed || !self.query.is_empty() {
-                        rows.extend(sessions.iter().filter(|id| pinned.contains(id)).map(|id| Row::Session(*id)));
+                    rows.push(if self.workspace.classic_layout {
+                        Row::Group(entry.clone())
+                    } else {
+                        Row::Pinned
+                    });
+                    if !self.workspace.classic_layout
+                        || !self.project_groups().pinned_collapsed
+                        || !self.query.is_empty()
+                    {
+                        rows.extend(
+                            sessions
+                                .iter()
+                                .filter(|id| pinned.contains(id))
+                                .map(|id| Row::Session(*id)),
+                        );
                     }
                     rows.push(Row::Gap);
                     ids.retain(|id| !pinned.contains(id));
@@ -585,8 +603,11 @@ impl Shell {
             rows.push(Row::Group(entry.clone()));
             let expanded = !collapsed || !self.query.is_empty();
             if expanded {
-                let members: Vec<_> = members.iter().copied()
-                    .filter(|id| !self.rails.children.contains(id)).collect();
+                let members: Vec<_> = members
+                    .iter()
+                    .copied()
+                    .filter(|id| !self.rails.children.contains(id))
+                    .collect();
                 rows.extend(
                     members
                         .iter()
@@ -783,6 +804,10 @@ impl Shell {
 impl Shell {
     pub(super) fn sidebar_options_menu_items(&self) -> Vec<MenuItem> {
         let mut items = vec![
+            MenuAction::new("sidebar-search", crate::i18n::t("Search"))
+                .icon("search")
+                .toggle(self.workspace.sidebar_search_visible)
+                .into(),
             MenuAction::new("sidebar-notes", crate::i18n::t("Notes"))
                 .icon("note")
                 .toggle(self.workspace.sidebar_notes_visible)
@@ -819,6 +844,7 @@ impl Shell {
 
     pub(super) fn change_sidebar_option(&mut self, action: &str, cx: &mut Context<Self>) {
         let value = match action {
+            "sidebar-search" => &mut self.workspace.sidebar_search_visible,
             "sidebar-notes" => &mut self.workspace.sidebar_notes_visible,
             "sidebar-automations" => &mut self.workspace.sidebar_automations_visible,
             "sidebar-inbox" => &mut self.workspace.sidebar_inbox_visible,
@@ -855,78 +881,81 @@ impl Shell {
             .flex()
             .flex_col()
             .gap_px()
-            .child(
-                div()
-                    .id("rail-search")
-                    .debug_selector(|| "sidebar-search-field".into())
-                    .group("rail-search")
-                    .w_full()
-                    .h(px(32.))
-                    .mb(px(if self.workspace.classic_layout {
-                        2.
-                    } else {
-                        4.
-                    }))
-                    .px_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(content(0.08))
-                    // RailSearch's Tailwind shadow-sm, including
-                    // its tighter second layer below the border.
-                    // The vendored shader keeps it outside the
-                    // box, as CSS does.
-                    .shadow(vec![
-                        BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into()).blur_radius(px(3.)),
-                        BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
-                            .blur_radius(px(2.))
-                            .spread_radius(px(-1.)),
-                    ])
-                    .text_color(content(if self.sidebar_hover == Some("Search") {
-                        1.
-                    } else {
-                        0.5
-                    }))
-                    .font_weight(FontWeight::MEDIUM)
-                    .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
-                    .on_hover(cx.listener(|this, hovered, _, cx| {
-                        this.sidebar_hover = if *hovered { Some("Search") } else { None };
-                        this.notify_navigation(cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.focus_search(window, cx);
-                        }),
-                    )
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(14.))
-                    .child(
-                        icon("search", 16.)
-                            .text_color(content(0.35))
-                            .group_hover("rail-search", |s| s.text_color(content(0.7))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(20.))
-                            .child(crate::i18n::t("Search")),
-                    )
-                    .child(
-                        // The shortcut span sits outside the label's `font-medium`.
-                        div()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(content(0.4))
-                            .child(if cfg!(target_os = "macos") {
-                                "⌘K"
-                            } else {
-                                "Ctrl K"
+            .when(self.workspace.sidebar_search_visible, |d| {
+                d.child(
+                    div()
+                        .id("rail-search")
+                        .debug_selector(|| "sidebar-search-field".into())
+                        .group("rail-search")
+                        .w_full()
+                        .h(px(32.))
+                        .mb(px(if self.workspace.classic_layout {
+                            2.
+                        } else {
+                            4.
+                        }))
+                        .px_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(content(0.08))
+                        // RailSearch's Tailwind shadow-sm, including
+                        // its tighter second layer below the border.
+                        // The vendored shader keeps it outside the
+                        // box, as CSS does.
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
+                                .blur_radius(px(3.)),
+                            BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
+                                .blur_radius(px(2.))
+                                .spread_radius(px(-1.)),
+                        ])
+                        .text_color(content(if self.sidebar_hover == Some("Search") {
+                            1.
+                        } else {
+                            0.5
+                        }))
+                        .font_weight(FontWeight::MEDIUM)
+                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                        .on_hover(cx.listener(|this, hovered, _, cx| {
+                            this.sidebar_hover = if *hovered { Some("Search") } else { None };
+                            this.notify_navigation(cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.focus_search(window, cx);
                             }),
-                    ),
-            )
+                        )
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(14.))
+                        .child(
+                            icon("search", 16.)
+                                .text_color(content(0.35))
+                                .group_hover("rail-search", |s| s.text_color(content(0.7))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(20.))
+                                .child(crate::i18n::t("Search")),
+                        )
+                        .child(
+                            // The shortcut span sits outside the label's `font-medium`.
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(content(0.4))
+                                .child(if cfg!(target_os = "macos") {
+                                    "⌘K"
+                                } else {
+                                    "Ctrl K"
+                                }),
+                        ),
+                )
+            })
             .children(
                 [
                     ("Inbox", "inbox"),
@@ -1128,7 +1157,10 @@ mod tests {
     ) {
         let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
         let project = store
-            .remember_remote_project("paseo-hierarchy", &serde_json::json!({"id":"p","cwd":"/fixture"}))
+            .remember_remote_project(
+                "paseo-hierarchy",
+                &serde_json::json!({"id":"p","cwd":"/fixture"}),
+            )
             .unwrap();
         let rows = [
             serde_json::json!({"id":"child","title":"Research child","harness":"codex","paseoParentAgentId":"root","pinned":false}),
@@ -1147,44 +1179,81 @@ mod tests {
         crate::paseo_host::restrict_workspace(&mut state);
         let saved = serde_json::to_string(&state).unwrap();
         let store = Arc::new(Mutex::new(store));
-        let window = cx.add_window(move |_, cx| {
-            Shell::new(store, summaries, project.key, Some(saved), cx)
-        });
+        let window =
+            cx.add_window(move |_, cx| Shell::new(store, summaries, project.key, Some(saved), cx));
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         static ROOT_SELECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         static CHILD_SELECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        let root_selector = ROOT_SELECTOR.get_or_init(|| format!("sidebar-session-{root}")).as_str();
-        let child_selector = CHILD_SELECTOR.get_or_init(|| format!("sidebar-session-{child}")).as_str();
+        let root_selector = ROOT_SELECTOR
+            .get_or_init(|| format!("sidebar-session-{root}"))
+            .as_str();
+        let child_selector = CHILD_SELECTOR
+            .get_or_init(|| format!("sidebar-session-{child}"))
+            .as_str();
         for (classic, status) in [(false, false), (false, true), (true, false)] {
-            window.update(visual, |shell, _, cx| {
-                shell.workspace.classic_layout = classic;
-                shell.workspace.preferences.extra.insert("paseo_group".into(), serde_json::json!(if status {"status"} else {"project"}));
-                shell.invalidate_chrome(cx);
-                shell.refresh_sidebar_structure(cx);
-                assert_eq!(shell.started_by.get(&child), Some(&root));
-                assert!(shell.rails.children.contains(&child));
-                let top: Vec<_> = shell.sidebar_list.rows.iter().filter_map(|row| match row {
-                    Row::Session(id) | Row::GroupedSession{id, ..} | Row::ClassicGroupMember{id, ..} => Some(*id),
-                    _ => None,
-                }).collect();
-                assert!(top.contains(&root));
-                assert!(!top.contains(&child), "child must not be an independent sidebar row");
-            }).unwrap();
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.workspace.classic_layout = classic;
+                    shell.workspace.preferences.extra.insert(
+                        "paseo_group".into(),
+                        serde_json::json!(if status { "status" } else { "project" }),
+                    );
+                    shell.invalidate_chrome(cx);
+                    shell.refresh_sidebar_structure(cx);
+                    assert_eq!(shell.started_by.get(&child), Some(&root));
+                    assert!(shell.rails.children.contains(&child));
+                    let top: Vec<_> = shell
+                        .sidebar_list
+                        .rows
+                        .iter()
+                        .filter_map(|row| match row {
+                            Row::Session(id)
+                            | Row::GroupedSession { id, .. }
+                            | Row::ClassicGroupMember { id, .. } => Some(*id),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(top.contains(&root));
+                    assert!(
+                        !top.contains(&child),
+                        "child must not be an independent sidebar row"
+                    );
+                })
+                .unwrap();
             visual.run_until_parked();
-            let parent_bounds = visual.debug_bounds(root_selector).expect("workspace is visible");
-            let child_bounds = visual.debug_bounds(child_selector).expect("child rail is expanded");
+            let parent_bounds = visual
+                .debug_bounds(root_selector)
+                .expect("workspace is visible");
+            let child_bounds = visual
+                .debug_bounds(child_selector)
+                .expect("child rail is expanded");
             assert!(child_bounds.left() > parent_bounds.left());
             assert!(child_bounds.top() >= parent_bounds.bottom());
         }
-        window.update(visual, |shell, _, cx| {
-            shell.workspace.classic_layout = false;
-            shell.workspace.preferences.extra.insert("paseo_group".into(), serde_json::json!("project"));
-            shell.query = "research child".into();
-            shell.invalidate_chrome(cx);
-            shell.refresh_sidebar_structure(cx);
-            assert!(!shell.rails.children.contains(&child), "search must keep a matching child reachable when its parent is filtered out");
-            assert!(shell.sidebar_list.rows.iter().any(|row| matches!(row, Row::Session(id) if *id == child)));
-        }).unwrap();
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.classic_layout = false;
+                shell
+                    .workspace
+                    .preferences
+                    .extra
+                    .insert("paseo_group".into(), serde_json::json!("project"));
+                shell.query = "research child".into();
+                shell.invalidate_chrome(cx);
+                shell.refresh_sidebar_structure(cx);
+                assert!(
+                    !shell.rails.children.contains(&child),
+                    "search must keep a matching child reachable when its parent is filtered out"
+                );
+                assert!(
+                    shell
+                        .sidebar_list
+                        .rows
+                        .iter()
+                        .any(|row| matches!(row, Row::Session(id) if *id == child))
+                );
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn paseo_status_grouping_keeps_pinned_sessions_visible_when_done_collapses(
@@ -1192,46 +1261,90 @@ mod tests {
     ) {
         let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
         let project = store
-            .remember_remote_project("paseo-pins", &serde_json::json!({"id":"p","cwd":"/fixture"}))
+            .remember_remote_project(
+                "paseo-pins",
+                &serde_json::json!({"id":"p","cwd":"/fixture"}),
+            )
             .unwrap();
         let registered = store.sync_remote_summaries(&project, &[
             serde_json::json!({"id":"root","title":"Pinned workspace","harness":"codex","pinned":true}),
             serde_json::json!({"id":"child","title":"Nested child","harness":"codex","paseoParentAgentId":"root"}),
             serde_json::json!({"id":"done","title":"Unpinned done","harness":"codex"}),
         ]).unwrap();
-        let (root, child, done) = (registered[0].summary.id, registered[1].summary.id, registered[2].summary.id);
+        let (root, child, done) = (
+            registered[0].summary.id,
+            registered[1].summary.id,
+            registered[2].summary.id,
+        );
         let summaries = store.sessions().unwrap();
         let mut state = Workspace::default();
         state.add_project(&project.key);
         state.open(root);
-        state.preferences.extra.insert(crate::paseo_host::PROJECT_SELECTION.into(), serde_json::json!({}));
+        state.preferences.extra.insert(
+            crate::paseo_host::PROJECT_SELECTION.into(),
+            serde_json::json!({}),
+        );
         crate::paseo_host::restrict_workspace(&mut state);
         let saved = serde_json::to_string(&state).unwrap();
         let window = cx.add_window(move |_, cx| {
-            Shell::new(Arc::new(Mutex::new(store)), summaries, project.key, Some(saved), cx)
+            Shell::new(
+                Arc::new(Mutex::new(store)),
+                summaries,
+                project.key,
+                Some(saved),
+                cx,
+            )
         });
         for classic in [false, true] {
             for collapsed in [true, false] {
                 for grouping in ["status", "project", "status"] {
-                    window.update(cx, |shell, _, cx| {
-                        shell.workspace.classic_layout = classic;
-                        shell.workspace.preferences.extra.insert("paseo_done_collapsed".into(), serde_json::json!(collapsed));
-                        shell.change_session_filter(&format!("paseo-group:{grouping}"), cx);
-                        shell.refresh_sidebar_structure(cx);
-                        let rows = &shell.sidebar_list.rows;
-                        let positions = |id| rows.iter().enumerate().filter_map(|(ix, row)| match row {
-                            Row::Session(value) | Row::GroupedSession{id:value, ..} | Row::ClassicGroupMember{id:value, ..} if *value == id => Some(ix),
-                            _ => None,
-                        }).collect::<Vec<_>>();
-                        assert_eq!(positions(root).len(), 1, "pins remain visible exactly once across grouping switches");
-                        assert!(positions(child).is_empty(), "sub agents stay nested");
-                        let pin_header = rows.iter().position(|row| matches!(row, Row::Pinned | Row::Group(Entry::Pinned{..}))).expect("pinned section remains available");
-                        assert!(pin_header < positions(root)[0]);
-                        if grouping == "status" {
-                            assert_eq!(positions(done).is_empty(), collapsed);
-                            assert!(rows.iter().any(|row| matches!(row, Row::Status(crate::paseo_host::StatusBucket::Done, 1))));
-                        }
-                    }).unwrap();
+                    window
+                        .update(cx, |shell, _, cx| {
+                            shell.workspace.classic_layout = classic;
+                            shell.workspace.preferences.extra.insert(
+                                "paseo_done_collapsed".into(),
+                                serde_json::json!(collapsed),
+                            );
+                            shell.change_session_filter(&format!("paseo-group:{grouping}"), cx);
+                            shell.refresh_sidebar_structure(cx);
+                            let rows = &shell.sidebar_list.rows;
+                            let positions = |id| {
+                                rows.iter()
+                                    .enumerate()
+                                    .filter_map(|(ix, row)| match row {
+                                        Row::Session(value)
+                                        | Row::GroupedSession { id: value, .. }
+                                        | Row::ClassicGroupMember { id: value, .. }
+                                            if *value == id =>
+                                        {
+                                            Some(ix)
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                            };
+                            assert_eq!(
+                                positions(root).len(),
+                                1,
+                                "pins remain visible exactly once across grouping switches"
+                            );
+                            assert!(positions(child).is_empty(), "sub agents stay nested");
+                            let pin_header = rows
+                                .iter()
+                                .position(|row| {
+                                    matches!(row, Row::Pinned | Row::Group(Entry::Pinned { .. }))
+                                })
+                                .expect("pinned section remains available");
+                            assert!(pin_header < positions(root)[0]);
+                            if grouping == "status" {
+                                assert_eq!(positions(done).is_empty(), collapsed);
+                                assert!(rows.iter().any(|row| matches!(
+                                    row,
+                                    Row::Status(crate::paseo_host::StatusBucket::Done, 1)
+                                )));
+                            }
+                        })
+                        .unwrap();
                 }
             }
         }
@@ -1358,7 +1471,9 @@ mod tests {
                 assert_eq!(bounds.size.width, px(184.));
             })
             .unwrap();
+        let search = visual.debug_bounds("menu-action-sidebar-search").unwrap();
         let notes = visual.debug_bounds("menu-action-sidebar-notes").unwrap();
+        assert!(search.bottom() <= notes.top());
         let automations = visual
             .debug_bounds("menu-action-sidebar-automations")
             .unwrap();
@@ -1375,6 +1490,7 @@ mod tests {
             "a divider separates Compact view"
         );
         for (action, navigation) in [
+            ("menu-action-sidebar-search", "sidebar-search-field"),
             ("menu-action-sidebar-notes", "sidebar-navigation-Notes"),
             (
                 "menu-action-sidebar-automations",
@@ -1404,6 +1520,7 @@ mod tests {
                 );
                 let menu = shell.menu.as_ref().unwrap().menu.read(cx);
                 for id in [
+                    "sidebar-search",
                     "sidebar-notes",
                     "sidebar-automations",
                     "sidebar-inbox",
@@ -1414,6 +1531,7 @@ mod tests {
                 assert!(!cx.global::<crate::settings::Preferences>().monos);
                 let saved = shell.latest_state.lock().unwrap().clone();
                 let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+                assert!(!restored.sidebar_search_visible);
                 assert!(!restored.sidebar_notes_visible);
                 assert!(!restored.sidebar_automations_visible);
                 assert!(!restored.sidebar_inbox_visible);
@@ -1421,6 +1539,7 @@ mod tests {
             })
             .unwrap();
         for (action, navigation) in [
+            ("menu-action-sidebar-search", "sidebar-search-field"),
             ("menu-action-sidebar-notes", "sidebar-navigation-Notes"),
             (
                 "menu-action-sidebar-automations",

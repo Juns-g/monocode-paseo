@@ -606,9 +606,9 @@ impl TranscriptView {
                     if copied { "Copied" } else { "Copy" },
                     if copied { "check" } else { "copy" },
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.copy_menu_selection(copy.clone(), cx)
-                })),
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.copy_menu_selection(copy.clone(), cx)),
+                ),
             )
             .when(quote, |d| {
                 d.child(
@@ -700,11 +700,35 @@ mod tests {
             view.selection.clear();assert!(view.selected_text().is_none());
         });
     }
-    fn select_hello(view: &mut TranscriptView, cx: &mut Context<TranscriptView>) -> ((usize, usize), String) {
-        view.patch(0,vec![Row{role:"assistant".into(),text:"Hello **café**.".into(),first:true,sent_at:None}],cx);
-        let key=view.rows.iter().find(|row|matches!(&row.body,Body::Markdown(_))).unwrap().key;
-        {let mut selection=view.selection.0.borrow_mut();selection.response=0;selection.quote=true;selection.anchor=Some(Position{row:key,byte:0});selection.head=Some(Position{row:key,byte:5});selection.menu=Some(gpui::point(px(10.),px(10.)));}
-        (key,view.selected_text().unwrap())
+    fn select_hello(
+        view: &mut TranscriptView,
+        cx: &mut Context<TranscriptView>,
+    ) -> ((usize, usize), String) {
+        view.patch(
+            0,
+            vec![Row {
+                role: "assistant".into(),
+                text: "Hello **café**.".into(),
+                first: true,
+                sent_at: None,
+            }],
+            cx,
+        );
+        let key = view
+            .rows
+            .iter()
+            .find(|row| matches!(&row.body, Body::Markdown(_)))
+            .unwrap()
+            .key;
+        {
+            let mut selection = view.selection.0.borrow_mut();
+            selection.response = 0;
+            selection.quote = true;
+            selection.anchor = Some(Position { row: key, byte: 0 });
+            selection.head = Some(Position { row: key, byte: 5 });
+            selection.menu = Some(gpui::point(px(10.), px(10.)));
+        }
+        (key, view.selected_text().unwrap())
     }
     #[gpui::test]
     fn menu_copy_shows_copied_then_closes_the_menu(cx: &mut TestAppContext) {
@@ -717,7 +741,12 @@ mod tests {
             assert!(view.selection.0.borrow().menu.is_some());
             assert!(view.selection_menu(cx).is_some());
         });
-        assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some("Hello"));
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("Hello")
+        );
         cx.executor().advance_clock(COPIED_DELAY / 2);
         cx.run_until_parked();
         view.update(cx, |view, _| {
@@ -749,7 +778,9 @@ mod tests {
         });
         cx.executor().advance_clock(COPIED_DELAY * 2);
         cx.run_until_parked();
-        view.update(cx, |view, _| assert!(view.selection.0.borrow().anchor.is_some()));
+        view.update(cx, |view, _| {
+            assert!(view.selection.0.borrow().anchor.is_some())
+        });
     }
     fn link_window(cx: &mut TestAppContext, text: &str) -> gpui::WindowHandle<TranscriptView> {
         let window = cx.update(|cx| {
@@ -768,7 +799,16 @@ mod tests {
         window
             .update(cx, |view, _, cx| {
                 view.smooth_reveal = false;
-                view.patch(0, vec![Row { role: "assistant".into(), text: text.into(), first: true, sent_at: None }], cx)
+                view.patch(
+                    0,
+                    vec![Row {
+                        role: "assistant".into(),
+                        text: text.into(),
+                        first: true,
+                        sent_at: None,
+                    }],
+                    cx,
+                )
             })
             .unwrap();
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
@@ -780,12 +820,25 @@ mod tests {
     fn clicking_a_markdown_link_in_an_answer_opens_it(cx: &mut TestAppContext) {
         let window = link_window(cx, "[docs](https://example.com/x) tail");
         let bounds = window
-            .update(cx, |view, _, _| view.selection.0.borrow().layouts.values().next().unwrap().layout.bounds())
+            .update(cx, |view, _, _| {
+                view.selection
+                    .0
+                    .borrow()
+                    .layouts
+                    .values()
+                    .next()
+                    .unwrap()
+                    .layout
+                    .bounds()
+            })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         let at = gpui::point(bounds.left() + px(8.), bounds.center().y);
         visual.simulate_click(at, Default::default());
-        assert_eq!(visual.opened_url().as_deref(), Some("https://example.com/x"));
+        assert_eq!(
+            visual.opened_url().as_deref(),
+            Some("https://example.com/x")
+        );
     }
     #[gpui::test]
     fn clicking_links_in_every_markdown_layout_opens_them(cx: &mut TestAppContext) {
@@ -795,13 +848,23 @@ mod tests {
             (false, true, "- one\n- [docs](https://example.com/x)"),
             (false, true, "# [docs](https://example.com/x)"),
             (false, true, "> [docs](https://example.com/x)"),
-            (false, true, "| a | b |\n|---|---|\n| [docs](https://example.com/x) | c |"),
-            (false, true, "see `code` and [docs](https://example.com/x) tail"),
+            (
+                false,
+                true,
+                "| a | b |\n|---|---|\n| [docs](https://example.com/x) | c |",
+            ),
+            (
+                false,
+                true,
+                "see `code` and [docs](https://example.com/x) tail",
+            ),
             (false, true, "first\n\nsecond [docs](https://example.com/x)"),
         ] {
             let window = link_window(cx, text);
             if mono {
-                window.update(cx, |view, _, _| view.mono_mode("cat", 0xe86b5f, "MonoCat")).unwrap();
+                window
+                    .update(cx, |view, _, _| view.mono_mode("cat", 0xe86b5f, "MonoCat"))
+                    .unwrap();
                 window.update(cx, |_, _, cx| cx.notify()).unwrap();
                 cx.refresh().unwrap();
                 cx.run_until_parked();
@@ -809,7 +872,11 @@ mod tests {
             let at = window
                 .update(cx, |view, _, _| {
                     let state = view.selection.0.borrow();
-                    let fragment = state.layouts.values().find(|f| f.text.contains("docs")).unwrap();
+                    let fragment = state
+                        .layouts
+                        .values()
+                        .find(|f| f.text.contains("docs"))
+                        .unwrap();
                     let ix = fragment.text.find("docs").unwrap() + 1;
                     fragment.layout.position_for_index(ix).unwrap() + gpui::point(px(3.), px(12.))
                 })
@@ -819,7 +886,11 @@ mod tests {
                 visual.simulate_mouse_move(at, None, Default::default());
             }
             visual.simulate_click(at, Default::default());
-            assert_eq!(visual.opened_url().as_deref(), Some("https://example.com/x"), "{text:?} mono={mono}");
+            assert_eq!(
+                visual.opened_url().as_deref(),
+                Some("https://example.com/x"),
+                "{text:?} mono={mono}"
+            );
         }
     }
     #[gpui::test]
@@ -833,7 +904,14 @@ mod tests {
                     ))),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| TranscriptView::document("# T\n\n[docs](https://example.com/x) tail".into(), cx)),
+                |_, cx| {
+                    cx.new(|cx| {
+                        TranscriptView::document(
+                            "# T\n\n[docs](https://example.com/x) tail".into(),
+                            cx,
+                        )
+                    })
+                },
             )
             .unwrap()
         });
@@ -878,39 +956,77 @@ mod tests {
         let transcript = window.update(cx, |c, _, _| c.transcript.clone()).unwrap();
         transcript.update(cx, |view, cx| {
             view.smooth_reveal = false;
-            view.patch(0, vec![Row { role: "assistant".into(), text: format!("{}[docs](https://example.com/x) tail", "A long earlier paragraph of prose.\n\n".repeat(40)), first: true, sent_at: None }], cx)
+            view.patch(
+                0,
+                vec![Row {
+                    role: "assistant".into(),
+                    text: format!(
+                        "{}[docs](https://example.com/x) tail",
+                        "A long earlier paragraph of prose.\n\n".repeat(40)
+                    ),
+                    first: true,
+                    sent_at: None,
+                }],
+                cx,
+            )
         });
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
         cx.refresh().unwrap();
         cx.run_until_parked();
         let at = transcript.update(cx, |view, _| {
             let state = view.selection.0.borrow();
-            let fragment = state.layouts.values().find(|f| f.text.contains("docs")).unwrap();
+            let fragment = state
+                .layouts
+                .values()
+                .find(|f| f.text.contains("docs"))
+                .unwrap();
             fragment.layout.position_for_index(1).unwrap() + gpui::point(px(3.), px(12.))
         });
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.simulate_mouse_move(at, None, Default::default());
         visual.simulate_click(at, Default::default());
-        assert_eq!(visual.opened_url().as_deref(), Some("https://example.com/x"));
+        assert_eq!(
+            visual.opened_url().as_deref(),
+            Some("https://example.com/x")
+        );
     }
     #[gpui::test]
     fn clicking_a_link_in_the_shell_opens_it(cx: &mut TestAppContext) {
-        shell_link(cx, "[docs](https://example.com/x) tail", |visual| visual.opened_url().is_some());
+        shell_link(cx, "[docs](https://example.com/x) tail", |visual| {
+            visual.opened_url().is_some()
+        });
     }
     #[gpui::test]
     fn clicking_a_file_link_in_the_shell_opens_the_file(cx: &mut TestAppContext) {
-        let folder = std::env::temp_dir().join(format!("monocode-link-click-{}", std::process::id()));
+        let folder =
+            std::env::temp_dir().join(format!("monocode-link-click-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("README.md");
         std::fs::write(&path, "# Heading\n").unwrap();
-        shell_link(cx, &format!("[docs]({}) tail", path.display()), |visual| visual.debug_bounds("review-tab-strip").is_some());
+        shell_link(cx, &format!("[docs]({}) tail", path.display()), |visual| {
+            visual.debug_bounds("review-tab-strip").is_some()
+        });
         std::fs::remove_dir_all(folder).unwrap();
     }
-    fn shell_link(cx: &mut TestAppContext, text: &str, done: impl Fn(&mut gpui::VisualTestContext) -> bool) {
-        let mut store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+    fn shell_link(
+        cx: &mut TestAppContext,
+        text: &str,
+        done: impl Fn(&mut gpui::VisualTestContext) -> bool,
+    ) {
+        let mut store =
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
         let mut a = store.create("codex", "/work/monocode").unwrap();
         store
-            .write_rows(a.id, 0, &[Row { role: "assistant".into(), text: text.into(), first: true, sent_at: None }])
+            .write_rows(
+                a.id,
+                0,
+                &[Row {
+                    role: "assistant".into(),
+                    text: text.into(),
+                    first: true,
+                    sent_at: None,
+                }],
+            )
             .unwrap();
         a.has_messages = true;
         let mut state = crate::workspace::Workspace::default();
@@ -920,7 +1036,15 @@ mod tests {
         let store = std::sync::Arc::new(std::sync::Mutex::new(store));
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |_, cx| {
-                cx.new(|cx| crate::shell::Shell::new(store, vec![a], "/work/monocode".into(), Some(saved), cx))
+                cx.new(|cx| {
+                    crate::shell::Shell::new(
+                        store,
+                        vec![a],
+                        "/work/monocode".into(),
+                        Some(saved),
+                        cx,
+                    )
+                })
             })
             .unwrap()
         });
@@ -961,37 +1085,92 @@ mod tests {
         window
             .update(cx, |view, _, cx| {
                 view.smooth_reveal = false;
-                view.patch(0, vec![Row { role: "assistant".into(), text: "[main](src/main.rs:12) tail".into(), first: true, sent_at: None }], cx)
+                view.patch(
+                    0,
+                    vec![Row {
+                        role: "assistant".into(),
+                        text: "[main](src/main.rs:12) tail".into(),
+                        first: true,
+                        sent_at: None,
+                    }],
+                    cx,
+                )
             })
             .unwrap();
         cx.refresh().unwrap();
         cx.run_until_parked();
         let bounds = window
-            .update(cx, |view, _, _| view.selection.0.borrow().layouts.values().next().unwrap().layout.bounds())
+            .update(cx, |view, _, _| {
+                view.selection
+                    .0
+                    .borrow()
+                    .layouts
+                    .values()
+                    .next()
+                    .unwrap()
+                    .layout
+                    .bounds()
+            })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_click(gpui::point(bounds.left() + px(8.), bounds.center().y), Default::default());
-        assert_eq!(visual.opened_url(), None, "a project file is not a URL for the system");
-        assert_eq!(*opened.borrow(), ["remote://fixture/work/p/src/main.rs:12:1"]);
+        visual.simulate_click(
+            gpui::point(bounds.left() + px(8.), bounds.center().y),
+            Default::default(),
+        );
+        assert_eq!(
+            visual.opened_url(),
+            None,
+            "a project file is not a URL for the system"
+        );
+        assert_eq!(
+            *opened.borrow(),
+            ["remote://fixture/work/p/src/main.rs:12:1"]
+        );
     }
     #[gpui::test]
     fn clicking_a_link_with_another_scheme_hands_it_to_the_system(cx: &mut TestAppContext) {
         let window = link_window(cx, "[docs](custom-app://open/x) tail");
         let bounds = window
-            .update(cx, |view, _, _| view.selection.0.borrow().layouts.values().next().unwrap().layout.bounds())
+            .update(cx, |view, _, _| {
+                view.selection
+                    .0
+                    .borrow()
+                    .layouts
+                    .values()
+                    .next()
+                    .unwrap()
+                    .layout
+                    .bounds()
+            })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_click(gpui::point(bounds.left() + px(8.), bounds.center().y), Default::default());
+        visual.simulate_click(
+            gpui::point(bounds.left() + px(8.), bounds.center().y),
+            Default::default(),
+        );
         assert_eq!(visual.opened_url().as_deref(), Some("custom-app://open/x"));
     }
     #[gpui::test]
     fn clicking_an_in_page_anchor_opens_nothing(cx: &mut TestAppContext) {
         let window = link_window(cx, "[docs](#top) tail");
         let bounds = window
-            .update(cx, |view, _, _| view.selection.0.borrow().layouts.values().next().unwrap().layout.bounds())
+            .update(cx, |view, _, _| {
+                view.selection
+                    .0
+                    .borrow()
+                    .layouts
+                    .values()
+                    .next()
+                    .unwrap()
+                    .layout
+                    .bounds()
+            })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_click(gpui::point(bounds.left() + px(8.), bounds.center().y), Default::default());
+        visual.simulate_click(
+            gpui::point(bounds.left() + px(8.), bounds.center().y),
+            Default::default(),
+        );
         assert_eq!(visual.opened_url(), None);
     }
     #[gpui::test]
@@ -1000,14 +1179,27 @@ mod tests {
     ) {
         let window = link_window(cx, "[docs](https://example.com/x) tail");
         let bounds = window
-            .update(cx, |view, _, _| view.selection.0.borrow().layouts.values().next().unwrap().layout.bounds())
+            .update(cx, |view, _, _| {
+                view.selection
+                    .0
+                    .borrow()
+                    .layouts
+                    .values()
+                    .next()
+                    .unwrap()
+                    .layout
+                    .bounds()
+            })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         let at = gpui::point(bounds.left() + px(8.), bounds.center().y);
         visual.simulate_mouse_down(at, MouseButton::Left, Default::default());
         visual.refresh().unwrap();
         visual.simulate_mouse_up(at, MouseButton::Left, Default::default());
-        assert_eq!(visual.opened_url().as_deref(), Some("https://example.com/x"));
+        assert_eq!(
+            visual.opened_url().as_deref(),
+            Some("https://example.com/x")
+        );
     }
     #[test]
     fn selection_ranges_are_direction_independent_and_response_scoped() {

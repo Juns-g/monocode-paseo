@@ -209,6 +209,10 @@ pub(crate) struct Conversation {
     preparing_worktree: bool,
     context: Option<monocode_core::context::Usage>,
     context_hovered: bool,
+    /// The submit button's morph between square and labelled pill.
+    send_morph: std::cell::RefCell<crate::send_morph::Morph>,
+    /// ⌘ (Ctrl elsewhere) as last seen, which flips Queue and Steer.
+    send_alternate: bool,
     menu: Option<OpenMenu>,
     add_anchor: AnchorSlot,
     model_anchor: AnchorSlot,
@@ -475,7 +479,8 @@ impl Conversation {
         let input = cx.new(input::Input::new);
         let mut remote_state = remote::State::default();
         if summary.cwd.starts_with("remote://") {
-            remote_state.unbound = locked(&store).ok()
+            remote_state.unbound = locked(&store)
+                .ok()
                 .and_then(|store| store.remote_session(summary.id).ok().flatten())
                 .is_some_and(|remote| remote.session_id.is_none());
         }
@@ -667,6 +672,8 @@ impl Conversation {
             preparing_worktree: false,
             context: None,
             context_hovered: false,
+            send_morph: Default::default(),
+            send_alternate: false,
             menu: None,
             add_anchor: AnchorSlot::default(),
             model_anchor: AnchorSlot::default(),
@@ -1122,7 +1129,10 @@ impl Conversation {
             || self.settings.access == AccessMode::ReadOnly;
         let mut settings = self.settings.clone();
         if self.paseo_follow_ups() {
-            settings.remote_action.get_or_insert_with(|| serde_json::json!({"type":"send"}))["paseoFollowUps"] = serde_json::json!(true);
+            settings
+                .remote_action
+                .get_or_insert_with(|| serde_json::json!({"type":"send"}))["paseoFollowUps"] =
+                serde_json::json!(true);
         }
         if let Some(model) = self.model_info() {
             for control in &model.controls {
@@ -1357,7 +1367,9 @@ impl Conversation {
                             }
                         }
                         for id in update.follow_up_deferred {
-                            if this.paseo_follow_ups() && this.follow_ups.sending.as_deref() == Some(&id) {
+                            if this.paseo_follow_ups()
+                                && this.follow_ups.sending.as_deref() == Some(&id)
+                            {
                                 this.follow_ups.sending = None;
                                 this.follow_ups.ready = false;
                             }
@@ -1495,8 +1507,12 @@ impl Conversation {
                             }
                             // A steer may enter the channel just after the observer's last drain.
                             // Only a clean idle snapshot can release it back to the unsent queue.
-                            if this.paseo_follow_ups() && this.status == "Ready"
-                                && this.follow_ups.state.messages.iter().any(|m| m.steer && this.follow_ups.sending.as_deref() == Some(&m.id)) {
+                            if this.paseo_follow_ups()
+                                && this.status == "Ready"
+                                && this.follow_ups.state.messages.iter().any(|m| {
+                                    m.steer && this.follow_ups.sending.as_deref() == Some(&m.id)
+                                })
+                            {
                                 this.follow_ups.sending = None;
                             }
                             if let Some(id) = this.follow_ups.sending.clone() {
@@ -2051,7 +2067,12 @@ impl Conversation {
             let selected = if id == "workspace:paseo:new" {
                 None
             } else if let Some(workspace) = id.strip_prefix("workspace:paseo:existing:") {
-                if !self.remote_state.workspace_choices.iter().any(|w| w["id"] == workspace) {
+                if !self
+                    .remote_state
+                    .workspace_choices
+                    .iter()
+                    .any(|w| w["id"] == workspace)
+                {
                     self.status = "所选 Paseo 工作区已不可用，请重新打开新建页".into();
                     cx.notify();
                     return;
@@ -2492,7 +2513,8 @@ impl Conversation {
         cx.notify();
     }
     fn toggle_menu(&mut self, kind: ComposerMenu, window: &mut Window, cx: &mut Context<Self>) {
-        if kind == ComposerMenu::Workspace && self.paseo_controls() && !self.paseo_workspace_draft() {
+        if kind == ComposerMenu::Workspace && self.paseo_controls() && !self.paseo_workspace_draft()
+        {
             self.status = "已有 Paseo 对话不能在这里变更工作区归属".into();
             cx.notify();
             return;
@@ -2612,15 +2634,19 @@ impl Conversation {
                         items.push(MenuItem::Separator);
                         items.push(MenuItem::Header("加入已有工作区（同项目）".into()));
                         for workspace in &self.remote_state.workspace_choices {
-                            let Some(id) = workspace["id"].as_str() else { continue };
-                            items.push(MenuAction::new(
-                                format!("workspace:paseo:existing:{id}"),
-                                workspace["title"].as_str().unwrap_or(id).to_owned(),
-                            )
-                            .description(workspace["cwd"].as_str().unwrap_or(id).to_owned())
-                            .icon("folder")
-                            .checked(self.settings.remote_workspace_id.as_deref() == Some(id))
-                            .into());
+                            let Some(id) = workspace["id"].as_str() else {
+                                continue;
+                            };
+                            items.push(
+                                MenuAction::new(
+                                    format!("workspace:paseo:existing:{id}"),
+                                    workspace["title"].as_str().unwrap_or(id).to_owned(),
+                                )
+                                .description(workspace["cwd"].as_str().unwrap_or(id).to_owned())
+                                .icon("folder")
+                                .checked(self.settings.remote_workspace_id.as_deref() == Some(id))
+                                .into(),
+                            );
                         }
                     }
                     return ("Paseo workspace", items, 340., MenuStyle::Settings);
@@ -3216,11 +3242,21 @@ impl Conversation {
         let new = draft && self.settings.new_worktree;
         let paseo_draft = self.paseo_workspace_draft();
         let label: SharedString = if paseo_draft {
-            self.settings.remote_workspace_id.as_deref().map(|id| {
-                let title = self.remote_state.workspace_choices.iter()
-                    .find(|w| w["id"] == id).and_then(|w| w["title"].as_str()).unwrap_or(id);
-                format!("加入：{title}")
-            }).unwrap_or_else(|| "新建独立工作区".into()).into()
+            self.settings
+                .remote_workspace_id
+                .as_deref()
+                .map(|id| {
+                    let title = self
+                        .remote_state
+                        .workspace_choices
+                        .iter()
+                        .find(|w| w["id"] == id)
+                        .and_then(|w| w["title"].as_str())
+                        .unwrap_or(id);
+                    format!("加入：{title}")
+                })
+                .unwrap_or_else(|| "新建独立工作区".into())
+                .into()
         } else if self.paseo_controls() {
             "Paseo 工作区".into()
         } else if new {
@@ -3230,10 +3266,14 @@ impl Conversation {
         } else {
             "Current checkout".into()
         };
-        let enabled = !self.busy && !self.preparing_worktree
+        let enabled = !self.busy
+            && !self.preparing_worktree
             && if self.paseo_controls() {
-                !self.stopping && paseo_draft && self.loaded
-                    && self.remote_state.online && !self.remote_state.pending
+                !self.stopping
+                    && paseo_draft
+                    && self.loaded
+                    && self.remote_state.online
+                    && !self.remote_state.pending
             } else {
                 self.git.is_some()
             };
@@ -3251,7 +3291,9 @@ impl Conversation {
             )
             .aria_label(format!("Workspace {label}"))
             .aria_expanded(self.menu_is(ComposerMenu::Workspace))
-            .when(paseo_draft, |d| d.debug_selector(|| "paseo-workspace-selector".into()))
+            .when(paseo_draft, |d| {
+                d.debug_selector(|| "paseo-workspace-selector".into())
+            })
             .child(self.workspace_anchor.probe())
             .when(dimmed, |d| d.opacity(0.4))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -3448,35 +3490,62 @@ impl Conversation {
             && (!self.preparing_worktree || self.busy || self.stopping)
             && (busy || (has_value && self.loaded))
             && (busy || !draft || (!self.busy && self.follow_ups.state.draft.is_none()));
-        send_button(
-            "send-or-stop",
-            if busy {
+        // Something to send grows the button into a pill naming the action;
+        // empty or stopping, it rests as a square.
+        let face = crate::send_morph::Face {
+            label: if busy {
                 "Stop"
             } else if draft {
                 "Save draft"
             } else {
                 follow_up.map_or("Send", |(label, _)| label)
             },
-            busy,
-            follow_up.map_or("send", |(_, glyph)| glyph),
-            enabled,
-        )
-        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-            if !enabled {
-                return;
-            }
-            if busy {
-                this.stop(cx);
-            } else {
-                let modifiers = event.modifiers();
-                let alternate = if cfg!(target_os = "macos") {
-                    modifiers.platform
+            glyph: follow_up.map_or("send", |(_, glyph)| glyph),
+            stop: busy,
+            expanded: !busy && has_value,
+        };
+        let frame = self.send_morph.borrow_mut().frame(
+            face,
+            crate::send_morph::expanded_width(face.label, window),
+            !cx.reduce_motion(),
+        );
+        if frame.moving {
+            window.request_animation_frame();
+        }
+        crate::send_morph::button("send-or-stop", face, &frame, enabled)
+            // Holding ⌘ (Ctrl elsewhere) flips Queue and Steer; redraw so the
+            // label rolls to it while the key is down.
+            // Only ⌘'s own changes matter, and only while it changes the action.
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    let alternate = if cfg!(target_os = "macos") {
+                        event.modifiers.platform
+                    } else {
+                        event.modifiers.control
+                    };
+                    if std::mem::replace(&mut this.send_alternate, alternate) != alternate
+                        && this.follow_up_action(alternate, cx).is_some()
+                    {
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                if !enabled {
+                    return;
+                }
+                if busy {
+                    this.stop(cx);
                 } else {
-                    modifiers.control
-                };
-                this.send_follow_up(alternate, cx);
-            }
-        }))
+                    let modifiers = event.modifiers();
+                    let alternate = if cfg!(target_os = "macos") {
+                        modifiers.platform
+                    } else {
+                        modifiers.control
+                    };
+                    this.send_follow_up(alternate, cx);
+                }
+            }))
     }
     // EmptySession.tsx: the composer centred under its question, or resting
     // where it will dock once a neighbouring pane squeezes it narrower than
@@ -3877,8 +3946,11 @@ mod composer_motion_tests {
 impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(started) = self.remote_state.first_content_trace.take() {
-            eprintln!("native remote-open-render {}", serde_json::json!({"session":self.summary.id,
-                "loadToRenderMs":started.elapsed().as_secs_f64()*1000.}));
+            eprintln!(
+                "native remote-open-render {}",
+                serde_json::json!({"session":self.summary.id,
+                "loadToRenderMs":started.elapsed().as_secs_f64()*1000.})
+            );
         }
         if self._input_focus.is_none() {
             let focus = self.input.focus_handle(cx);
@@ -4170,11 +4242,15 @@ pub(crate) fn git_branch(cwd: &Path) -> Option<String> {
 impl Conversation {
     pub(crate) fn test_queue_fixture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menu(window, cx);
-        self.remote_state.capabilities.extend(["paseo.configure".into(), "paseo.steer".into()]);
+        self.remote_state
+            .capabilities
+            .extend(["paseo.configure".into(), "paseo.steer".into()]);
         self.busy = true;
         self.follow_ups.ready = false;
         self.follow_ups.state.messages = vec![monocode_core::follow_up::Message {
-            id: "synthetic-queued".into(), text: "Synthetic queued follow-up".into(), ..Default::default()
+            id: "synthetic-queued".into(),
+            text: "Synthetic queued follow-up".into(),
+            ..Default::default()
         }];
         cx.notify();
     }

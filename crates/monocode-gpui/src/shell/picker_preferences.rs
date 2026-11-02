@@ -64,7 +64,7 @@ mod tests {
         cx.run_until_parked();
         let favorite = crate::settings::ModelChoice {
             provider: "hermes".into(),
-            model: Some("hermes:openai-codex:gpt-6.1-sol".into()),
+            model: Some("hermes:example-vendor:example-model".into()),
         };
         let stored = |favorites: &[crate::settings::ModelChoice]| {
             let state = locked(&database).unwrap().ui_state().unwrap().unwrap();

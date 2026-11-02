@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A fork of the native GPUI client of [MonoCode](https://github.com/hardbeat920/monocode) (synced to `native-v0.16.0-preview.11`) that uses a local [Paseo](https://github.com/getpaseo/paseo) daemon as its backend. The UI is the original MonoCode native shell; conversations, execution and history stay in Paseo, so the Paseo apps and this client see the same conversations and can continue each other's work.
+A fork of the native GPUI client of [MonoCode](https://github.com/hardbeat920/monocode) (synced to `main` (`d2d0640c`, 2026-11-02)) that uses a local [Paseo](https://github.com/getpaseo/paseo) daemon as its backend. The UI is the original MonoCode native shell; conversations, execution and history stay in Paseo, so the Paseo apps and this client see the same conversations and can continue each other's work.
 
 > ⚠️ **Personal experiment.** Only used on the author's own macOS (Apple Silicon) machine with Paseo 0.14.0. No guarantees on behavior, compatibility or stability, and no support. For the real thing, use upstream MonoCode. The upstream README is kept as [README.upstream.md](README.upstream.md).
 

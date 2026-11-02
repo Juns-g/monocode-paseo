@@ -95,6 +95,8 @@ pub(crate) struct Workspace {
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
     pub compact_session_cards: bool,
+    /// The Search field heading the sidebar; ⌘K opens search either way.
+    pub sidebar_search_visible: bool,
     pub sidebar_notes_visible: bool,
     pub sidebar_automations_visible: bool,
     pub sidebar_inbox_visible: bool,
@@ -136,6 +138,8 @@ pub(crate) struct Workspace {
     pub classic_sidebar_tabs: HashMap<String, String>,
     pub classic_sidebar_tab_order: Vec<String>,
     pub new_layout_prompt_dismissed: bool,
+    /// The rail stops asking for a GitHub star once dismissed.
+    pub github_star_prompt_dismissed: bool,
     pub preferences: crate::settings::Preferences,
     pub session_filters: monocode_core::session_filters::Filters,
     pub project_appearance: HashMap<String, monocode_core::project_appearance::ProjectAppearance>,
@@ -310,6 +314,7 @@ impl Default for Workspace {
             sidebar_visible: true,
             sidebar_width: 260.,
             compact_session_cards: true,
+            sidebar_search_visible: true,
             sidebar_notes_visible: true,
             sidebar_automations_visible: true,
             sidebar_inbox_visible: true,
@@ -339,6 +344,7 @@ impl Default for Workspace {
             classic_sidebar_tabs: HashMap::new(),
             classic_sidebar_tab_order: Vec::new(),
             new_layout_prompt_dismissed: false,
+            github_star_prompt_dismissed: false,
             preferences: crate::settings::Preferences::default(),
             session_filters: Default::default(),
             project_appearance: Default::default(),
@@ -767,7 +773,9 @@ impl Workspace {
     }
     /// Make a preview tab permanent. True when `tab` was the preview.
     pub fn pin_tab(&mut self, tab: i64) -> bool {
-        self.preview_tab.take_if(|preview| *preview == tab).is_some()
+        self.preview_tab
+            .take_if(|preview| *preview == tab)
+            .is_some()
     }
     /// A tab holding one conversation and nothing else.
     fn plain_tab(&self, tab: i64) -> bool {
@@ -1476,7 +1484,10 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let sessions = [(1, "/p".to_string()), (2, "/p".to_string())];
         let restored = Workspace::restore(Some(&json), &sessions, "/p");
-        assert_eq!((restored.tabs.clone(), restored.preview_tab), (vec![1, 2], Some(2)));
+        assert_eq!(
+            (restored.tabs.clone(), restored.preview_tab),
+            (vec![1, 2], Some(2))
+        );
         // Snapshots from before preview tabs have none.
         let mut value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
         value.as_object_mut().unwrap().remove("preview_tab");

@@ -377,7 +377,10 @@ impl Conversation {
                 }
                 return;
             }
-            if self.paseo_follow_ups() && (self.needs_approval() || !message.attachments.is_empty()) { return; }
+            if self.paseo_follow_ups() && (self.needs_approval() || !message.attachments.is_empty())
+            {
+                return;
+            }
             if !message.steer
                 || (!self.paseo_follow_ups() && !Kind::from_id(&self.summary.provider).can_steer())
                 || !message.can_steer()
@@ -567,7 +570,9 @@ impl Conversation {
         });
         if self.follow_ups.state.messages.is_empty() {
             return match hint {
-                Some(hint) => composer_shelf::shelf("message-queue").child(hint).into_any_element(),
+                Some(hint) => composer_shelf::shelf("message-queue")
+                    .child(hint)
+                    .into_any_element(),
                 None => div().into_any_element(),
             };
         }
@@ -1161,7 +1166,9 @@ mod tests {
                     if paseo {
                         view.summary.cwd = "remote://paseo-hint/home/me/project".into();
                         view.remote_state.online = true;
-                        view.remote_state.capabilities.extend(["paseo.configure".into(), "paseo.steer".into()]);
+                        view.remote_state
+                            .capabilities
+                            .extend(["paseo.configure".into(), "paseo.steer".into()]);
                     }
                     view.busy = true;
                     view.controls = Some(controls);
@@ -1210,7 +1217,9 @@ mod tests {
                 .unwrap();
             cx.executor().advance_clock(STEER_HINT / 2);
             window
-                .update(cx, |view, _, _| assert_eq!(view.follow_ups.steered.is_some(), paseo))
+                .update(cx, |view, _, _| {
+                    assert_eq!(view.follow_ups.steered.is_some(), paseo)
+                })
                 .unwrap();
             cx.executor().advance_clock(STEER_HINT);
             cx.run_until_parked();

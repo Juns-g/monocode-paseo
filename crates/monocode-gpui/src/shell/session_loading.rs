@@ -27,7 +27,8 @@ impl Metadata<'_> {
     }
     /// Explicit cancellation: idle in the UI while the worker finishes saving.
     pub(super) fn cancelling(&self) -> bool {
-        self.live.is_some_and(|live| live.busy && !live.responding())
+        self.live
+            .is_some_and(|live| live.busy && !live.responding())
     }
     pub(super) fn has_saved_draft(&self) -> bool {
         self.live.map_or(self.draft, Conversation::has_saved_draft)
@@ -65,8 +66,11 @@ impl Shell {
         let started = std::time::Instant::now();
         self.add_loaded(summary, cx);
         if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
-            eprintln!("native session-materialize {}", serde_json::json!({"session":id,
-                "ensureSessionMs":started.elapsed().as_secs_f64()*1000.}));
+            eprintln!(
+                "native session-materialize {}",
+                serde_json::json!({"session":id,
+                "ensureSessionMs":started.elapsed().as_secs_f64()*1000.})
+            );
         }
         self.sessions.get(&id).cloned()
     }
@@ -459,7 +463,10 @@ mod tests {
         shell.apply_remote_row(id, previous.as_deref(), running, waiting, cx);
     }
     fn mark(shell: &Shell, id: i64, cx: &App) -> Option<MarkState> {
-        shell.session_marks.get(&id).map(|mark| mark.read(cx).state())
+        shell
+            .session_marks
+            .get(&id)
+            .map(|mark| mark.read(cx).state())
     }
 
     #[gpui::test]
@@ -545,7 +552,9 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 let id = ids[0];
-                shell.remote_details.insert(id, serde_json::json!({ "bucket": null }));
+                shell
+                    .remote_details
+                    .insert(id, serde_json::json!({ "bucket": null }));
                 shell.apply_remote_row(id, Some("attention"), false, false, cx);
                 shell.apply_remote_row(id, None, false, false, cx);
                 assert!(!shell.unseen_finished.contains(&id));
@@ -562,9 +571,7 @@ mod tests {
         let (window, ids) = paseo_rows(cx, 2);
         window
             .update(cx, |shell, _, cx| {
-                let [id, other] = ids[..] else {
-                    unreachable!()
-                };
+                let [id, other] = ids[..] else { unreachable!() };
                 poll_row(shell, id, "attention".into(), (false, false), cx);
                 poll_row(shell, other, "attention".into(), (false, false), cx);
                 assert!(shell.unseen_finished.contains(&id));

@@ -826,24 +826,51 @@ fn paseo_draft_journals_naming_context_and_explicit_workspace_without_sending_tw
         });
         let settings: Settings = serde_json::from_value(json!({
             "model":"codex:fixture-model", "remote_workspace_id":selected
-        })).unwrap();
-        locked(&store).unwrap().save_agent_settings(binding.summary.id, &settings).unwrap();
-        let saved = locked(&store).unwrap().agent_settings(binding.summary.id).unwrap().unwrap();
-        assert_eq!(serde_json::to_value(&saved).unwrap()["remote_workspace_id"], json!(selected));
+        }))
+        .unwrap();
+        locked(&store)
+            .unwrap()
+            .save_agent_settings(binding.summary.id, &settings)
+            .unwrap();
+        let saved = locked(&store)
+            .unwrap()
+            .agent_settings(binding.summary.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap()["remote_workspace_id"],
+            json!(selected)
+        );
         if selected.is_none() {
-            assert!(serde_json::to_value(&saved).unwrap().get("remote_workspace_id").is_none());
+            assert!(
+                serde_json::to_value(&saved)
+                    .unwrap()
+                    .get("remote_workspace_id")
+                    .is_none()
+            );
         }
         let (tx, rx) = async_channel::unbounded();
         let (_controls_tx, controls) = std::sync::mpsc::channel();
-        run_with_client(host.client.clone(), binding.summary.clone(), "Name this new task".into(),
-            saved, controls, store.clone(), Arc::new(AtomicBool::new(false)), tx);
+        run_with_client(
+            host.client.clone(),
+            binding.summary.clone(),
+            "Name this new task".into(),
+            saved,
+            controls,
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
         let result = receive(&rx);
         assert!(result.finished, "{}", result.status);
         let commands = commands.lock().unwrap();
         assert_eq!(commands.len(), 2, "{commands:?}");
         assert_eq!(commands[0]["type"], "create");
         assert_eq!(commands[0]["workspaceId"], json!(selected));
-        assert_eq!(commands[0]["firstAgentContext"], json!({"prompt":"Name this new task","attachments":[]}));
+        assert_eq!(
+            commands[0]["firstAgentContext"],
+            json!({"prompt":"Name this new task","attachments":[]})
+        );
         assert!(commands[0].get("initialPrompt").is_none());
         assert_eq!(commands[1]["type"], "send");
         assert_eq!(commands[1]["sessionId"], "host-session");
@@ -855,92 +882,265 @@ fn paseo_draft_journals_naming_context_and_explicit_workspace_without_sending_tw
 #[test]
 fn paseo_attached_turn_becomes_ready_and_steer_has_an_exact_durable_delivery_receipt() {
     for lost in [false, true] {
-    let dir = Directory::new(); let store = dir.store(); let mut bound = binding(&store);
-    bound.session_id = Some("host-session".into()); journal(&store,&bound).unwrap();
-    let commands = Arc::new(Mutex::new(Vec::new())); let recorded = commands.clone();
-    let host = Host::with_capabilities(vec!["paseo.steer"], move |r| {
-        if r["method"] == "commands.dispatch" { let c = r["params"].clone(); recorded.lock().unwrap().push(c.clone()); if lost {None} else {Some(receipt(&c))} }
-        else { Some(json!({"kind":"snapshot","value":snapshot("running",1)})) }
-    });
-    let (tx,rx) = async_channel::unbounded(); let (control_tx,controls) = std::sync::mpsc::channel();
-    let client = host.client.clone(); let saved = store.clone(); let summary = bound.summary.clone();
-    let settings = Settings { remote_action: Some(json!({"type":"attach","paseoFollowUps":true})), ..Default::default() };
-    let worker = thread::spawn(move ||run_with_client(client,summary,String::new(),settings,controls,saved,Arc::new(AtomicBool::new(false)),tx));
-    assert!(receive(&rx).turn_ready);
-    control_tx.send(Control {id:"queued-steer".into(), decision:Decision::Steer(monocode_core::follow_up::Message {id:"queued-steer".into(),text:"Synthetic steer".into(),..Default::default()})}).unwrap();
-    let delivered = receive(&rx);
-    if lost {
-        assert!(delivered.follow_up_delivered.is_empty());assert_eq!(delivered.follow_up_errors[0].0,"queued-steer");
-        let binding=locked(&store).unwrap().remote_session(bound.summary.id).unwrap().unwrap();
-        assert!(binding.outbox.is_empty());assert_eq!(binding.rejected.unwrap()["commands"][0]["commandId"],"queued-steer");
-        assert!(!delivered.finished, "a failed steer keeps observing the remote agent");
-    } else {assert_eq!(delivered.follow_up_delivered,["queued-steer"]);assert!(delivered.follow_up_errors.is_empty());}
-    let cmds = commands.lock().unwrap();assert_eq!(cmds.len(),1);assert_eq!(cmds[0]["activeTurnBehavior"],"steer");assert_eq!(cmds[0]["runId"],"host-run");assert_eq!(cmds[0]["commandId"],"queued-steer");drop(cmds);
-    assert_eq!(locked(&store).unwrap().setting(&format!("mono-delivered:{}:queued-steer",bound.summary.id)).unwrap().as_deref(),if lost {None} else {Some("1")} );
-    drop(rx);worker.join().unwrap();
+        let dir = Directory::new();
+        let store = dir.store();
+        let mut bound = binding(&store);
+        bound.session_id = Some("host-session".into());
+        journal(&store, &bound).unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = commands.clone();
+        let host = Host::with_capabilities(vec!["paseo.steer"], move |r| {
+            if r["method"] == "commands.dispatch" {
+                let c = r["params"].clone();
+                recorded.lock().unwrap().push(c.clone());
+                if lost { None } else { Some(receipt(&c)) }
+            } else {
+                Some(json!({"kind":"snapshot","value":snapshot("running",1)}))
+            }
+        });
+        let (tx, rx) = async_channel::unbounded();
+        let (control_tx, controls) = std::sync::mpsc::channel();
+        let client = host.client.clone();
+        let saved = store.clone();
+        let summary = bound.summary.clone();
+        let settings = Settings {
+            remote_action: Some(json!({"type":"attach","paseoFollowUps":true})),
+            ..Default::default()
+        };
+        let worker = thread::spawn(move || {
+            run_with_client(
+                client,
+                summary,
+                String::new(),
+                settings,
+                controls,
+                saved,
+                Arc::new(AtomicBool::new(false)),
+                tx,
+            )
+        });
+        assert!(receive(&rx).turn_ready);
+        control_tx
+            .send(Control {
+                id: "queued-steer".into(),
+                decision: Decision::Steer(monocode_core::follow_up::Message {
+                    id: "queued-steer".into(),
+                    text: "Synthetic steer".into(),
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        let delivered = receive(&rx);
+        if lost {
+            assert!(delivered.follow_up_delivered.is_empty());
+            assert_eq!(delivered.follow_up_errors[0].0, "queued-steer");
+            let binding = locked(&store)
+                .unwrap()
+                .remote_session(bound.summary.id)
+                .unwrap()
+                .unwrap();
+            assert!(binding.outbox.is_empty());
+            assert_eq!(
+                binding.rejected.unwrap()["commands"][0]["commandId"],
+                "queued-steer"
+            );
+            assert!(
+                !delivered.finished,
+                "a failed steer keeps observing the remote agent"
+            );
+        } else {
+            assert_eq!(delivered.follow_up_delivered, ["queued-steer"]);
+            assert!(delivered.follow_up_errors.is_empty());
+        }
+        let cmds = commands.lock().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["activeTurnBehavior"], "steer");
+        assert_eq!(cmds[0]["runId"], "host-run");
+        assert_eq!(cmds[0]["commandId"], "queued-steer");
+        drop(cmds);
+        assert_eq!(
+            locked(&store)
+                .unwrap()
+                .setting(&format!("mono-delivered:{}:queued-steer", bound.summary.id))
+                .unwrap()
+                .as_deref(),
+            if lost { None } else { Some("1") }
+        );
+        drop(rx);
+        worker.join().unwrap();
     }
 }
 
 #[test]
 fn paseo_queued_send_is_delivered_only_on_a_valid_receipt_and_unknown_ack_is_not_delivery() {
-    for lost in [false,true] {
-        let dir = Directory::new(); let store = dir.store(); let mut bound = binding(&store);
-        bound.session_id = Some("host-session".into()); journal(&store,&bound).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0)); let count = calls.clone();
+    for lost in [false, true] {
+        let dir = Directory::new();
+        let store = dir.store();
+        let mut bound = binding(&store);
+        bound.session_id = Some("host-session".into());
+        journal(&store, &bound).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
         let host = Host::with_capabilities(vec!["paseo.steer"], move |r| {
             if r["method"] == "commands.dispatch" {
                 if r["params"]["type"] == "send" {
-                    count.fetch_add(1, Ordering::Relaxed); assert_eq!(r["params"]["commandId"],"queued-normal");
-                    if lost {return None;}
+                    count.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(r["params"]["commandId"], "queued-normal");
+                    if lost {
+                        return None;
+                    }
                 }
                 Some(receipt(&r["params"]))
-            } else {Some(json!({"kind":"snapshot","value":snapshot("idle",2)}))}
+            } else {
+                Some(json!({"kind":"snapshot","value":snapshot("idle",2)}))
+            }
         });
-        let (tx,rx) = async_channel::unbounded(); let (_control_tx,controls) = std::sync::mpsc::channel();
-        run_with_client(host.client.clone(), bound.summary.clone(), "Synthetic queued".into(),
-            Settings {model:Some("codex:fixture".into()),mono_message_id:Some("queued-normal".into()),remote_action:Some(json!({"type":"send","paseoFollowUps":true})),..Default::default()},
-            controls,store.clone(),Arc::new(AtomicBool::new(false)),tx);
-        let next = receive(&rx);assert!(next.finished);assert_eq!(calls.load(Ordering::Relaxed),1);
+        let (tx, rx) = async_channel::unbounded();
+        let (_control_tx, controls) = std::sync::mpsc::channel();
+        run_with_client(
+            host.client.clone(),
+            bound.summary.clone(),
+            "Synthetic queued".into(),
+            Settings {
+                model: Some("codex:fixture".into()),
+                mono_message_id: Some("queued-normal".into()),
+                remote_action: Some(json!({"type":"send","paseoFollowUps":true})),
+                ..Default::default()
+            },
+            controls,
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let next = receive(&rx);
+        assert!(next.finished);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         if lost {
-            assert!(next.delivered.is_none());assert_eq!(next.follow_up_errors[0].0,"queued-normal");
-            assert_eq!(locked(&store).unwrap().remote_session(bound.summary.id).unwrap().unwrap().outbox[0]["commandId"],"queued-normal");
-        } else {assert_eq!(next.delivered.as_deref(),Some("queued-normal"));}
+            assert!(next.delivered.is_none());
+            assert_eq!(next.follow_up_errors[0].0, "queued-normal");
+            assert_eq!(
+                locked(&store)
+                    .unwrap()
+                    .remote_session(bound.summary.id)
+                    .unwrap()
+                    .unwrap()
+                    .outbox[0]["commandId"],
+                "queued-normal"
+            );
+        } else {
+            assert_eq!(next.delivered.as_deref(), Some("queued-normal"));
+        }
     }
 }
 
 #[test]
 fn paseo_steer_pre_send_deferral_releases_the_message_without_a_delivery_receipt() {
-    let dir = Directory::new(); let store = dir.store(); let mut bound = binding(&store);
-    bound.session_id = Some("host-session".into()); journal(&store,&bound).unwrap();
-    let calls = Arc::new(AtomicUsize::new(0)); let count = calls.clone();
+    let dir = Directory::new();
+    let store = dir.store();
+    let mut bound = binding(&store);
+    bound.session_id = Some("host-session".into());
+    journal(&store, &bound).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
     let host = Host::with_capabilities(vec!["paseo.steer"], move |r| {
-        if r["method"] == "commands.dispatch" {count.fetch_add(1,Ordering::Relaxed);let mut v=receipt(&r["params"]);v["deferred"]=json!(true);Some(v)}
-        else {Some(json!({"kind":"snapshot","value":snapshot("running",1)}))}
+        if r["method"] == "commands.dispatch" {
+            count.fetch_add(1, Ordering::Relaxed);
+            let mut v = receipt(&r["params"]);
+            v["deferred"] = json!(true);
+            Some(v)
+        } else {
+            Some(json!({"kind":"snapshot","value":snapshot("running",1)}))
+        }
     });
-    let (tx,rx) = async_channel::unbounded();let (control_tx,controls) = std::sync::mpsc::channel();
-    let client=host.client.clone();let saved=store.clone();let summary=bound.summary.clone();
-    let worker=thread::spawn(move||run_with_client(client,summary,String::new(),Settings {remote_action:Some(json!({"type":"attach","paseoFollowUps":true})),..Default::default()},controls,saved,Arc::new(AtomicBool::new(false)),tx));
+    let (tx, rx) = async_channel::unbounded();
+    let (control_tx, controls) = std::sync::mpsc::channel();
+    let client = host.client.clone();
+    let saved = store.clone();
+    let summary = bound.summary.clone();
+    let worker = thread::spawn(move || {
+        run_with_client(
+            client,
+            summary,
+            String::new(),
+            Settings {
+                remote_action: Some(json!({"type":"attach","paseoFollowUps":true})),
+                ..Default::default()
+            },
+            controls,
+            saved,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+    });
     assert!(receive(&rx).turn_ready);
-    control_tx.send(Control {id:"deferred".into(),decision:Decision::Steer(monocode_core::follow_up::Message {id:"deferred".into(),text:"Synthetic".into(),..Default::default()})}).unwrap();
-    let next=receive(&rx);assert_eq!(next.follow_up_deferred,["deferred"]);assert!(next.follow_up_delivered.is_empty());assert!(next.follow_up_errors.is_empty());
-    assert_eq!(calls.load(Ordering::Relaxed),1);assert!(locked(&store).unwrap().setting(&format!("mono-delivered:{}:deferred",bound.summary.id)).unwrap().is_none());
-    drop(rx);worker.join().unwrap();
+    control_tx
+        .send(Control {
+            id: "deferred".into(),
+            decision: Decision::Steer(monocode_core::follow_up::Message {
+                id: "deferred".into(),
+                text: "Synthetic".into(),
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+    let next = receive(&rx);
+    assert_eq!(next.follow_up_deferred, ["deferred"]);
+    assert!(next.follow_up_delivered.is_empty());
+    assert!(next.follow_up_errors.is_empty());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(
+        locked(&store)
+            .unwrap()
+            .setting(&format!("mono-delivered:{}:deferred", bound.summary.id))
+            .unwrap()
+            .is_none()
+    );
+    drop(rx);
+    worker.join().unwrap();
 }
 
 #[test]
 fn paseo_explicit_retry_reports_the_queued_send_id_without_transient_composer_settings() {
-    let dir=Directory::new();let store=dir.store();let mut bound=binding(&store);
-    bound.session_id=Some("host-session".into());
-    bound.outbox=vec![json!({"type":"send","commandId":"queued-retry","followUpId":"queued-retry","sessionId":"host-session","text":"Synthetic queued retry"})];
-    journal(&store,&bound).unwrap();
-    let host=Host::with_capabilities(vec!["paseo.steer"], |r| {
-        if r["method"]=="commands.dispatch" {Some(receipt(&r["params"]))}
-        else {Some(json!({"kind":"snapshot","value":snapshot("idle",2)}))}
+    let dir = Directory::new();
+    let store = dir.store();
+    let mut bound = binding(&store);
+    bound.session_id = Some("host-session".into());
+    bound.outbox = vec![
+        json!({"type":"send","commandId":"queued-retry","followUpId":"queued-retry","sessionId":"host-session","text":"Synthetic queued retry"}),
+    ];
+    journal(&store, &bound).unwrap();
+    let host = Host::with_capabilities(vec!["paseo.steer"], |r| {
+        if r["method"] == "commands.dispatch" {
+            Some(receipt(&r["params"]))
+        } else {
+            Some(json!({"kind":"snapshot","value":snapshot("idle",2)}))
+        }
     });
-    let (tx,rx)=async_channel::unbounded();let (_control_tx,controls)=std::sync::mpsc::channel();
-    run_with_client(host.client.clone(),bound.summary.clone(),String::new(),Settings {remote_action:Some(json!({"type":"retry","paseoFollowUps":true})),..Default::default()},controls,store.clone(),Arc::new(AtomicBool::new(false)),tx);
-    assert_eq!(receive(&rx).delivered.as_deref(),Some("queued-retry"));
-    assert!(locked(&store).unwrap().remote_session(bound.summary.id).unwrap().unwrap().outbox.is_empty());
+    let (tx, rx) = async_channel::unbounded();
+    let (_control_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        bound.summary.clone(),
+        String::new(),
+        Settings {
+            remote_action: Some(json!({"type":"retry","paseoFollowUps":true})),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    assert_eq!(receive(&rx).delivered.as_deref(), Some("queued-retry"));
+    assert!(
+        locked(&store)
+            .unwrap()
+            .remote_session(bound.summary.id)
+            .unwrap()
+            .unwrap()
+            .outbox
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1019,7 +1219,11 @@ fn observer_reports_a_host_title_change_once_and_never_writes_it_back() {
 
 fn windowed(revision: u64, status: &str, ids: &[&str]) -> Value {
     let mut value = snapshot(status, revision);
-    value["session"]["blocks"] = json!(ids.iter().map(|id| json!({"id":id,"role":"user","text":format!("message {id}")})).collect::<Vec<_>>());
+    value["session"]["blocks"] = json!(
+        ids.iter()
+            .map(|id| json!({"id":id,"role":"user","text":format!("message {id}")}))
+            .collect::<Vec<_>>()
+    );
     value
 }
 fn observe_window(capabilities: Vec<&'static str>) -> Vec<Update> {
@@ -1045,7 +1249,10 @@ fn observe_window(capabilities: Vec<&'static str>) -> Vec<Update> {
         host.client.clone(),
         bound.summary.clone(),
         String::new(),
-        Settings { remote_action: Some(json!({"type":"attach","paseoFollowUps":true})), ..Default::default() },
+        Settings {
+            remote_action: Some(json!({"type":"attach","paseoFollowUps":true})),
+            ..Default::default()
+        },
         controls,
         store,
         Arc::new(AtomicBool::new(false)),
@@ -1062,19 +1269,35 @@ fn observe_window(capabilities: Vec<&'static str>) -> Vec<Update> {
 fn paged_paseo_live_window_slide_is_relative_to_the_slid_window() {
     let updates = observe_window(vec!["paseo.steer", "paseo.history-pages"]);
     let layouts: Vec<_> = updates.iter().filter_map(|u| u.window.clone()).collect();
-    let ids = |layout: &crate::transcript::WindowLayout| -> Vec<String> { layout.iter().map(|(id, _)| id.clone()).collect() };
+    let ids = |layout: &crate::transcript::WindowLayout| -> Vec<String> {
+        layout.iter().map(|(id, _)| id.clone()).collect()
+    };
     assert_eq!(layouts.len(), 3, "{} updates", updates.len());
     assert_eq!(ids(&layouts[0]), ["a", "b", "c"]);
     assert_eq!(ids(&layouts[1]), ["b", "c", "d"]);
     assert_eq!(ids(&layouts[2]), ["c", "d", "e"]);
-    let rows = |layout: &crate::transcript::WindowLayout, id: &str| layout.iter().find(|(i, _)| i == id).unwrap().1;
+    let rows = |layout: &crate::transcript::WindowLayout, id: &str| {
+        layout.iter().find(|(i, _)| i == id).unwrap().1
+    };
     assert!(rows(&layouts[0], "a") > 0);
     let sent: Vec<_> = updates.iter().filter(|u| u.window.is_some()).collect();
-    assert_eq!((sent[0].start, sent[0].rows.len()), (0, rows(&layouts[0], "a") + rows(&layouts[0], "b") + rows(&layouts[0], "c")));
+    assert_eq!(
+        (sent[0].start, sent[0].rows.len()),
+        (
+            0,
+            rows(&layouts[0], "a") + rows(&layouts[0], "b") + rows(&layouts[0], "c")
+        )
+    );
     // "a" slid out: the two kept blocks match, so only "d" is new at their end.
-    assert_eq!(sent[1].start, rows(&layouts[1], "b") + rows(&layouts[1], "c"));
+    assert_eq!(
+        sent[1].start,
+        rows(&layouts[1], "b") + rows(&layouts[1], "c")
+    );
     assert_eq!(sent[1].rows.len(), rows(&layouts[1], "d"));
-    assert_eq!(sent[2].start, rows(&layouts[2], "c") + rows(&layouts[2], "d"));
+    assert_eq!(
+        sent[2].start,
+        rows(&layouts[2], "c") + rows(&layouts[2], "d")
+    );
     assert_eq!(sent[2].rows.len(), rows(&layouts[2], "e"));
 }
 

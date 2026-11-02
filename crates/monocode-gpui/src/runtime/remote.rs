@@ -291,10 +291,14 @@ fn dispatch_outbox(
             durable.session_id = Some(id.into());
         }
         durable.outbox.remove(0);
-        if next["type"] == "send" && receipt["deferred"] != true
+        if next["type"] == "send"
+            && receipt["deferred"] != true
             && let Some(message) = next["followUpId"].as_str()
         {
-            locked(store)?.save_setting(&format!("mono-delivered:{}:{message}", binding.summary.id), "1")?;
+            locked(store)?.save_setting(
+                &format!("mono-delivered:{}:{message}", binding.summary.id),
+                "1",
+            )?;
         }
         commit(store, binding, durable)?;
         if next["type"] == "send" && receipt["deferred"] != true {
@@ -617,12 +621,23 @@ pub(crate) fn run_with_client(
             .unwrap_or_else(|| json!({"type":"send"}));
         let attaching = action["type"] == "attach";
         let capabilities = if crate::paseo_host::active() || action["paseoFollowUps"] == true {
-            Some(client.request(&binding.machine(&client)?.id, "environment.describe", json!({}))?["capabilities"].clone())
+            Some(
+                client.request(
+                    &binding.machine(&client)?.id,
+                    "environment.describe",
+                    json!({}),
+                )?["capabilities"]
+                    .clone(),
+            )
         } else {
             None
         };
-        let has = |name: &str| capabilities.as_ref().and_then(Value::as_array)
-            .is_some_and(|caps| caps.iter().any(|c| c == name));
+        let has = |name: &str| {
+            capabilities
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|caps| caps.iter().any(|c| c == name))
+        };
         let paseo = has("paseo.steer");
         // A paged Paseo host slides its bounded window; track it in memory only.
         let windowed = paseo && has("paseo.history-pages");
@@ -711,7 +726,10 @@ pub(crate) fn run_with_client(
                 operation
             };
             let mut send = command(operation, binding.session_id.as_deref());
-            if paseo && operation == "send" && let Some(message) = &settings.mono_message_id {
+            if paseo
+                && operation == "send"
+                && let Some(message) = &settings.mono_message_id
+            {
                 send["commandId"] = json!(message);
                 send["followUpId"] = json!(message);
             }
@@ -760,7 +778,10 @@ pub(crate) fn run_with_client(
             upload_pending(&client, &machine.id, &store, &mut binding)?;
             let receipts = dispatch_outbox(&client, &machine.id, &store, &mut binding)?;
             if paseo {
-                initial_deliveries = receipts.iter().filter_map(|r| r["commandId"].as_str().map(str::to_owned)).collect();
+                initial_deliveries = receipts
+                    .iter()
+                    .filter_map(|r| r["commandId"].as_str().map(str::to_owned))
+                    .collect();
             }
         }
         drop(guard);
@@ -790,8 +811,11 @@ pub(crate) fn run_with_client(
             next.start = latest_rows.len();
             next.delivered = initial_deliveries.pop();
             next.follow_up_delivered.append(&mut initial_deliveries);
-            next.turn_ready = paseo && running && snapshot["runId"].as_str().is_some_and(|s| !s.is_empty())
-                && current_approvals.is_empty() && current_question.is_none();
+            next.turn_ready = paseo
+                && running
+                && snapshot["runId"].as_str().is_some_and(|s| !s.is_empty())
+                && current_approvals.is_empty()
+                && current_question.is_none();
             if revision != last_revision {
                 let mut projected = snapshot.clone();
                 monocode_core::remote::attachments::qualify_snapshot(
@@ -886,20 +910,32 @@ pub(crate) fn run_with_client(
                     }
                     let mut attempted = false;
                     let result = (|| -> Result<bool, String> {
-                        if !binding.outbox.is_empty() { return Err("A remote command needs confirmation before steering.".into()); }
-                        if !message.attachments.is_empty() || message.mode.is_some() { return Err("Paseo steering supports text only.".into()); }
-                        let run = snapshot["runId"].as_str().filter(|s| !s.is_empty()).ok_or("Running host session has no run identity")?;
+                        if !binding.outbox.is_empty() {
+                            return Err(
+                                "A remote command needs confirmation before steering.".into()
+                            );
+                        }
+                        if !message.attachments.is_empty() || message.mode.is_some() {
+                            return Err("Paseo steering supports text only.".into());
+                        }
+                        let run = snapshot["runId"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .ok_or("Running host session has no run identity")?;
                         let mut send = command("send", Some(&id));
                         send["commandId"] = json!(message.id);
                         send["followUpId"] = json!(message.id);
-                        send["text"] = json!(message.prepared_prompt.as_deref().unwrap_or(&message.text));
+                        send["text"] =
+                            json!(message.prepared_prompt.as_deref().unwrap_or(&message.text));
                         send["activeTurnBehavior"] = json!("steer");
                         send["runId"] = json!(run);
                         binding.outbox.push(send);
                         journal(&store, &binding)?;
                         attempted = true;
                         let receipts = dispatch_outbox(&client, &machine.id, &store, &mut binding)?;
-                        Ok(receipts.iter().any(|r| r["commandId"].as_str() == Some(&message.id) && r["deferred"] != true))
+                        Ok(receipts.iter().any(|r| {
+                            r["commandId"].as_str() == Some(&message.id) && r["deferred"] != true
+                        }))
                     })();
                     match result {
                         Ok(true) => next.follow_up_delivered.push(message.id.clone()),
@@ -908,15 +944,19 @@ pub(crate) fn run_with_client(
                             if attempted && !binding.outbox.is_empty() {
                                 // Keep uncertain sends for inspection, never ahead of a later Stop/approval.
                                 let mut rejected = binding.clone();
-                                rejected.rejected = Some(json!({"error":error,"commands":binding.outbox,"uploads":binding.uploads}));
+                                rejected.rejected = Some(
+                                    json!({"error":error,"commands":binding.outbox,"uploads":binding.uploads}),
+                                );
                                 rejected.outbox.clear();
                                 rejected.uploads.clear();
                                 commit(&store, &mut binding, rejected)?;
                             }
                             next.follow_up_errors.push((message.id.clone(), error));
-                        },
+                        }
                     }
-                } else { other_controls.push(control); }
+                } else {
+                    other_controls.push(control);
+                }
             }
             tx.send_blocking(next).map_err(|_| "Window closed")?;
             last_revision = revision;
