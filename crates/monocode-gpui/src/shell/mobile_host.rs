@@ -2576,7 +2576,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let choice = new_chat_choice::resolve(&prefs, "/work/project");
+        let choice = new_chat_choice::resolve(&new_chat_choice::Inputs {
+            prefs: &prefs,
+            cwd: "/work/project",
+            fork: None,
+        });
         assert_eq!(choice.kind, Kind::Claude);
         let recent = choice
             .model
