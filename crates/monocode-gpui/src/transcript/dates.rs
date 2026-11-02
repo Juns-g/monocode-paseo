@@ -385,6 +385,7 @@ mod tests {
             .unwrap()
         });
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
         visual.run_until_parked();
         assert!(visual.debug_bounds("prompt-outline").is_some());
         assert!(visual.debug_bounds("mono-day-separator").is_none());
@@ -394,6 +395,7 @@ mod tests {
                 view.rebuild(0, cx);
             })
             .unwrap();
+        visual.refresh().unwrap();
         visual.run_until_parked();
         assert!(visual.debug_bounds("prompt-outline").is_none());
         assert!(visual.debug_bounds("mono-day-separator").is_some());
