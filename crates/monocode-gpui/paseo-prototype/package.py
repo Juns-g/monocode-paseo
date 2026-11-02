@@ -10,7 +10,8 @@ if app.exists():
 resources=app/'Contents/Resources';binary=app/'Contents/MacOS/monocode-gpui'
 resources.mkdir(parents=True);binary.parent.mkdir()
 subprocess.run(['node',str(Path(__file__).with_name('bundle.mjs')),str(resources)],check=True,cwd=root)
-shutil.copy2(root/'crates/monocode-gpui/target/release/monocode-gpui',binary)
+target=Path(os.environ.get('CARGO_TARGET_DIR') or root/'crates/monocode-gpui/target')
+shutil.copy2(target/'release/monocode-gpui',binary)
 shutil.copy2(root/'src-tauri/icons/icon.icns',resources/'monocode.icns')
 for source,name in [(root/'LICENSE','Monocode-LICENSE'),(root/'NOTICE','Monocode-NOTICE'),((Path(os.environ['PASEO_SOURCE'])/'LICENSE'),'Paseo-LICENSE'),((Path(os.environ['PASEO_SOURCE'])/'node_modules/ws/LICENSE'),'ws-LICENSE'),((Path(os.environ['PASEO_SOURCE'])/'node_modules/zod/LICENSE'),'zod-LICENSE')]:
     if source.exists():shutil.copy2(source,resources/name)
