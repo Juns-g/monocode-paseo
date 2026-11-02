@@ -385,9 +385,28 @@ mod tests {
             .unwrap()
         });
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.refresh().unwrap();
-        visual.run_until_parked();
-        assert!(visual.debug_bounds("prompt-outline").is_some());
+        // The first frame measures the viewport; the next paints viewport-dependent controls.
+        for _ in 0..2 {
+            window.update(visual, |_, _, cx| cx.notify()).unwrap();
+            visual.refresh().unwrap();
+            visual.run_until_parked();
+        }
+        assert!(
+            visual.debug_bounds("prompt-outline").is_some(),
+            "layout state: {:?}",
+            window
+                .update(visual, |view, _, _| (
+                    view.viewport,
+                    view.visible,
+                    view.mono,
+                    view.document,
+                    view.source
+                        .iter()
+                        .filter(|r| r.first && r.role == "user")
+                        .count()
+                ))
+                .unwrap()
+        );
         assert!(visual.debug_bounds("mono-day-separator").is_none());
         window
             .update(visual, |view, _, cx| {
@@ -395,8 +414,12 @@ mod tests {
                 view.rebuild(0, cx);
             })
             .unwrap();
-        visual.refresh().unwrap();
-        visual.run_until_parked();
+        // The first frame measures the viewport; the next paints viewport-dependent controls.
+        for _ in 0..2 {
+            window.update(visual, |_, _, cx| cx.notify()).unwrap();
+            visual.refresh().unwrap();
+            visual.run_until_parked();
+        }
         assert!(visual.debug_bounds("prompt-outline").is_none());
         assert!(visual.debug_bounds("mono-day-separator").is_some());
     }
