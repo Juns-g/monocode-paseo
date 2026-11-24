@@ -5,10 +5,23 @@ import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {DaemonClient} from 'paseo-source/packages/client/src/daemon-client.ts';
 import {createWebSocketTransportFactory} from 'paseo-source/packages/client/src/daemon-client-websocket-transport.ts';
+import {createHostChannelTransport} from 'paseo-source/packages/client/src/hosts/index.ts';
 import {CLIENT_CAPS} from 'paseo-source/packages/protocol/src/client-capabilities.ts';
 import {DEFAULT_CLIENT_CAPABILITIES} from 'paseo-source/packages/client/src/connection/index.ts';
 import WebSocket from 'paseo-source/node_modules/ws/wrapper.mjs';
 import {readLocalCredentialForTarget} from 'paseo-source/packages/server/src/server/local-credential.ts';
+
+export const PASEO_CLIENT_CAPABILITIES = {
+  ...Object.fromEntries(Object.keys(DEFAULT_CLIENT_CAPABILITIES).map(key=>[key,false])),
+  [CLIENT_CAPS.ownedSubscriptions]:true,
+  [CLIENT_CAPS.allProviders]:true,
+  [CLIENT_CAPS.explicitEventSubscriptions]:true,
+  [CLIENT_CAPS.selectiveAgentTimeline]:true,
+  [CLIENT_CAPS.reasoningMergeEnum]:true,
+  [CLIENT_CAPS.timelineNotifications]:true,
+  [CLIENT_CAPS.timelineReplacementInvalidation]:true,
+};
+export const SILENT_LOGGER = {debug(){},info(){},warn(){},error(){},trace(){},child(){return this;}};
 
 export function readConfig(){
  const path=process.env.PASEO_PROTOTYPE_CONFIG||join(homedir(),'Library/Application Support/Monocode Paseo Prototype/prototype.json');
@@ -28,7 +41,21 @@ return new DaemonClient({url:url.href,
     return readLocalCredentialForTarget(home,endpoint)||readLocalCredentialForTarget(home,'0.0.0.0:'+url.port)||undefined;
   },
   reconnect:{enabled:true,baseDelayMs:500,maxDelayMs:5000},connectTimeoutMs:10000,
-  capabilities:{...Object.fromEntries(Object.keys(DEFAULT_CLIENT_CAPABILITIES).map(key=>[key,false])),[CLIENT_CAPS.ownedSubscriptions]:true,[CLIENT_CAPS.allProviders]:true,[CLIENT_CAPS.explicitEventSubscriptions]:true,[CLIENT_CAPS.selectiveAgentTimeline]:true,[CLIENT_CAPS.reasoningMergeEnum]:true,[CLIENT_CAPS.timelineNotifications]:true,[CLIENT_CAPS.timelineReplacementInvalidation]:true},
-  logger:{debug(){},info(){},warn(){},error(){},trace(){},child(){return this;}},
+  capabilities:PASEO_CLIENT_CAPABILITIES,
+  logger:SILENT_LOGGER,
 });
+}
+
+export function createRoutedClient({origin,serverId,scopeId,routeId}) {
+  return new DaemonClient({
+    url:'ws://routed-host/ws',
+    clientId:scopeId,
+    clientType:'cli',
+    appVersion:'0.2.6',
+    transportFactory:createHostChannelTransport(origin,serverId,scopeId,routeId),
+    reconnect:{enabled:false,baseDelayMs:500,maxDelayMs:5000},
+    connectTimeoutMs:15000,
+    capabilities:PASEO_CLIENT_CAPABILITIES,
+    logger:SILENT_LOGGER,
+  });
 }

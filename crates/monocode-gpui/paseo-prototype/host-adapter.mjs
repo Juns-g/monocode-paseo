@@ -15,10 +15,11 @@ import {supportedRewindModes,extractUserMessageId,rewindPaseoAgent} from './rewi
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
 const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume and never answer (its own wait is 60 s).
-export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.worktrees','paseo.history-pages','sessions.no-delete','sessions.list-revision',
-  'attachments.upload','attachments.read','paseo.usage','paseo.rewind',
-  'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
+export const LOCAL_FS_CAPABILITIES=['files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
+export const BASE_CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.worktrees','paseo.history-pages','sessions.no-delete','sessions.list-revision',
+  'attachments.upload','attachments.read','paseo.usage','paseo.rewind'];
+export const CAPABILITIES=[...BASE_CAPABILITIES,'paseo.hosts',...LOCAL_FS_CAPABILITIES];
 const stamp=value=>{const n=typeof value==='number'?value:Date.parse(value);return Number.isFinite(n)?n:0;};
 // Only the filesystem boundary canonicalizes paths; recorded Paseo identity stays intact.
 function canonicalPath(path) {
@@ -128,8 +129,10 @@ export class Attempts {
 }
 
 export class PaseoHost {
-  constructor(client,directory,projectTimeline=rows=>rows) {
-    this.client=client;this.serverId=client.getLastServerInfoMessage()?.serverId??null;this.projectTimeline=projectTimeline;this.attempts=new Attempts(directory);
+  constructor(client,directory,projectTimeline=rows=>rows,options={}) {
+    this.client=client;this.isRemoteHost=options.isRemoteHost===true;this.hostRegistry=options.hostRegistry??null;
+    this.serverId=options.expectedServerId??client.getLastServerInfoMessage()?.serverId??null;
+    this.projectTimeline=projectTimeline;this.attempts=new Attempts(directory);
     this.statuses=new Map();this.entries=new Map();this.projects=new Map();this.histories=new Map();this.numbers=new Map();
     this.numberPath=join(directory,'paseo-permission-ids.json');
     try{this.numbers=new Map(JSON.parse(readFileSync(this.numberPath,'utf8')));}catch(e){if(e.code!=='ENOENT')throw e;}
@@ -140,15 +143,24 @@ export class PaseoHost {
     this.attachments=new AttachmentStore(directory);
     this.directoryAt=0;this.directoryRequests=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
   }
-  fileProjects(){return [...this.projects.keys()].flatMap(id=>{
-    try{return [this.fileProject(id)];}catch(error){if(['ENOENT','ENOTDIR'].includes(error.code))return [];throw error;}
-  });}
-  fileProject(id){const p=this.projects.get(id);if(!p)throw Error('Unknown Paseo project');return {...p,cwd:canonicalPath(p.cwd)};}
+  capabilities(){return this.isRemoteHost?BASE_CAPABILITIES:CAPABILITIES;}
+  comparePath(path){return this.isRemoteHost?normalizePosixPath(path):canonicalPath(path);}
+  resolveNavigationPath(path){return this.isRemoteHost?normalizePosixPath(path):navigationPath(path);}
+  fileProjects(){
+    if(this.isRemoteHost)return [];
+    return [...this.projects.keys()].flatMap(id=>{
+      try{return [this.fileProject(id)];}catch(error){if(['ENOENT','ENOTDIR'].includes(error.code))return [];throw error;}
+    });
+  }
+  fileProject(id){
+    if(this.isRemoteHost)throw Error('Remote Paseo host filesystem is not mounted on this Mac');
+    const p=this.projects.get(id);if(!p)throw Error('Unknown Paseo project');return {...p,cwd:canonicalPath(p.cwd)};
+  }
   prepareFiles(params){
+    if(this.isRemoteHost)throw Error('Remote Paseo host filesystem is not mounted on this Mac');
     if(params.projectId!=null)this.fileProject(params.projectId);
     for(const key of ['path','cwd'])if(typeof params[key]==='string' && isAbsolute(params[key]))params[key]=canonicalPath(params[key]);
   }
-  comparePath(path){return this.isRemoteHost?normalizePosixPath(path):canonicalPath(path);}
   identity(){const observed=this.client.getLastServerInfoMessage()?.serverId;if(!this.connected||!observed||(this.serverId&&observed!==this.serverId))throw Error('Paseo disconnected or daemon identity changed');this.serverId??=observed;}
   control(agent){const c=new Controller(this.client,()=>{});c.connected=this.connected;c.selected=agent;c.selectedServer=this.serverId;c.invalidate=()=>{};return c;}
   number(agent,id){const key=JSON.stringify([agent,id]);if(!this.numbers.has(key)){this.numbers.set(key,this.numbers.size+1);const temp=this.numberPath+'.tmp';writeFileSync(temp,JSON.stringify([...this.numbers]),{mode:0o600});renameSync(temp,this.numberPath);}return this.numbers.get(key);}
@@ -209,10 +221,10 @@ export class PaseoHost {
       }
       // Linked Git checkouts share navigation, never their execution cwd or agent identity.
       const canonicalProjects=new Map(),aliases=new Map(),repositoryRoots=new Map();
-      for(const p of projects.values())repositoryRoots.set(p.id,linkedRepositoryRoot(p.cwd));
+      for(const p of projects.values())repositoryRoots.set(p.id,this.isRemoteHost?null:linkedRepositoryRoot(p.cwd));
       const placements=[...projects.values()].sort((a,b)=>Number(!!repositoryRoots.get(a.id))-Number(!!repositoryRoots.get(b.id))||a.cwd.localeCompare(b.cwd));
       for(const p of placements){
-        const root=repositoryRoots.get(p.id),path=navigationPath(root??p.cwd),prior=canonicalProjects.get(path);
+        const root=repositoryRoots.get(p.id),path=this.resolveNavigationPath(root??p.cwd),prior=canonicalProjects.get(path);
         if(prior){aliases.set(p.id,prior.id);projects.delete(p.id);}
         else{
           const canonical=root?{id:`paseo:${root}`,cwd:root,name:p.name}:p;
@@ -224,11 +236,11 @@ export class PaseoHost {
       // Bots workspaces share one navigation project; execution remains agent-owned.
       const roots=[...projects.values()].sort((a,b)=>a.cwd.length-b.cwd.length);
       for(const root of roots){
-        const base=navigationPath(root.cwd).replace(/\/$/,'');
+        const base=this.resolveNavigationPath(root.cwd).replace(/\/$/,'');
         const key=[...entries.values()].find(e=>e.projectId===root.id)?.project.projectKey;
         if(!key)continue;
         for(const entry of entries.values()){
-          if(entry.project.projectKey===key && navigationPath(entry.project.checkout.cwd).startsWith(base+'/'))entry.projectId=root.id;
+          if(entry.project.projectKey===key && this.resolveNavigationPath(entry.project.checkout.cwd).startsWith(base+'/'))entry.projectId=root.id;
         }
       }
       const liveProjects=new Set([...entries.values()].map(e=>e.projectId));
@@ -324,7 +336,9 @@ export class PaseoHost {
   projectList(includeAll=false){
     return [...this.projects.values()].map(p=>{
       const rows=[...this.entries.values()].filter(e=>e.projectId===p.id);
-      let exists=false;try{exists=statSync(p.cwd).isDirectory();}catch(error){if(!['ENOENT','ENOTDIR'].includes(error.code))throw error;}
+      let exists=false;
+      if(this.isRemoteHost)exists=true;
+      else try{exists=statSync(p.cwd).isDirectory();}catch(error){if(!['ENOENT','ENOTDIR'].includes(error.code))throw error;}
       return {...p,exists,active:rows.some(e=>!e.agent.archivedAt),updatedAt:Math.max(0,...rows.map(e=>stamp(e.agent.updatedAt)))};
     }).filter(p=>includeAll||(p.exists&&p.active)).sort((a,b)=>b.updatedAt-a.updatedAt||a.id.localeCompare(b.id));
   }
@@ -510,8 +524,16 @@ export class PaseoHost {
     if(method==='paseo.worktrees')return {result:await listProjectWorktrees(this,p)};
     if(method==='paseo.usage')return {result:await fetchPaseoUsage(this.client,p)};
     if(method==='paseo.rewind')return {result:await rewindPaseoAgent(this,p)};
+    if(method==='paseo.hosts.list'){
+      if(this.isRemoteHost||!this.hostRegistry)return {result:{supported:false,self:{serverId:this.serverId??'',label:'Paseo'},hosts:[]}};
+      return {result:await this.hostRegistry.list()};
+    }
+    if(method==='paseo.hosts.connect'){
+      if(this.isRemoteHost||!this.hostRegistry)throw Error('远程宿主机不支持嵌套路由连接。');
+      return {result:await this.hostRegistry.connect(p)};
+    }
     if(method==='environment.describe')return {result:{protocolVersion:1,environmentId:this.serverId,name:`Paseo ${this.client.getLastServerInfoMessage()?.version??''}`,
-      platform:process.platform,providers:[...new Set((await this.providers()).map(harness))],capabilities:CAPABILITIES}};
+      platform:process.platform,providers:[...new Set((await this.providers()).map(harness))],capabilities:this.capabilities()}};
     if(['projects.list','sessions.list','projects.open'].includes(method)){
       await this.directory();
       if(method==='projects.list'){
@@ -618,6 +640,9 @@ export class PaseoHost {
       const result=await this.client.archiveAgent(entry.agent.id);this.invalidate();return {result};
     }
     if(method==='sessions.delete')throw Error('删除远程会话不受支持；请在 Paseo 处理。');
+    if(this.isRemoteHost&&(method==='workspace.run'||['files.read','files.list','files.index','files.search','files.searchContent','git.diff','git.branches','git.worktrees','git.index','git.fileDiff','projects.browse','git.switch','git.createBranch','git.worktreeCreate','files.create','files.write','git.action'].includes(method))){
+      throw Error('远程宿主机暂不支持本地文件浏览与本地 Git 读取，请在 Paseo 查看。');
+    }
     if(method==='workspace.run'){
       const reads=['list_dir','list_project_files','read_text_file','read_binary_file','read_file_preview','stat_files','git_diff_index','git_diff_files','git_diff_stats','git_file_diff','git_locate_files','git_head_message','git_pr_status','git_history','git_commit_files','git_commit_file_diff','git_staged_context','git_range_context','git_branches','git_worktrees','search_project'];
       if(!reads.includes(p.command))throw Error('此版本的项目文件和 Git 操作为只读。');

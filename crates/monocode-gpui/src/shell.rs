@@ -663,7 +663,10 @@ pub(crate) struct Shell {
     client_decorations: bool,
     tabs_frame: Entity<Chrome>,
     store: Database,
+    remote_dir: std::path::PathBuf,
     remote: Arc<monocode_core::remote::Connections>,
+    paseo_connecting_host: Option<String>,
+    paseo_hosts_refreshing: bool,
     remote_project_picker: Option<remote_projects::Open>,
     remote_refreshing: bool,
     remote_revisions: HashMap<String, String>,
@@ -890,7 +893,7 @@ impl Shell {
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("monocode-remote-{}", std::process::id()))
             });
-        let remote = Arc::new(monocode_core::remote::Connections::new(remote_dir));
+        let remote = Arc::new(monocode_core::remote::Connections::new(&remote_dir));
         // Tests that script a host pin the process-wide transport to their own.
         #[cfg(test)]
         let pinned = paseo_archive_tests::default_pinned();
@@ -1072,7 +1075,10 @@ impl Shell {
             client_decorations: false,
             tabs_frame,
             store,
+            remote_dir,
             remote,
+            paseo_connecting_host: None,
+            paseo_hosts_refreshing: false,
             remote_project_picker: None,
             remote_refreshing: false,
             remote_revisions: HashMap::new(),
@@ -4729,6 +4735,384 @@ impl Shell {
         );
         self.persist(cx);
     }
+    pub(crate) fn paseo_local_environment(&self) -> Option<&str> {
+        self.workspace
+            .preferences
+            .extra
+            .get("paseo_environment")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
+    pub(crate) fn paseo_hosts(&self) -> Vec<crate::paseo_host::RemoteHostInfo> {
+        self.workspace
+            .preferences
+            .extra
+            .get(crate::paseo_host::PASEO_HOSTS)
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default()
+    }
+    fn paseo_host_menu_items(&self) -> Vec<MenuItem> {
+        if !crate::paseo_host::project_ui(&self.workspace.preferences) {
+            return Vec::new();
+        }
+        let hosts = self.paseo_hosts();
+        if !hosts.iter().any(|h| h.is_remote) {
+            return Vec::new();
+        }
+        let active_env = monocode_core::remote::parse_remote_path(&self.workspace.project)
+            .map(|p| p.environment_id);
+        let mut items = Vec::with_capacity(hosts.len() + 2);
+        items.push(MenuItem::Header(crate::i18n::t("Hosts").into()));
+        for host in hosts {
+            let is_current = host
+                .server_id
+                .as_deref()
+                .is_some_and(|id| active_env.as_deref() == Some(id));
+            let is_connecting = host
+                .server_id
+                .as_deref()
+                .is_some_and(|id| self.paseo_connecting_host.as_deref() == Some(id));
+            let (status_label, dot_color, selectable): (String, gpui::Hsla, bool) =
+                if !host.is_remote {
+                    (
+                        crate::i18n::t("Local"),
+                        gpui::rgb(0x4ade80).into(),
+                        host.server_id.is_some(),
+                    )
+                } else if is_connecting {
+                    (
+                        crate::i18n::t("Connecting…"),
+                        gpui::rgb(0xfbbf24).into(),
+                        false,
+                    )
+                } else if !host.enabled || host.status == "disabled" {
+                    (crate::i18n::t("Disabled"), content(0.35), false)
+                } else if host.connected {
+                    (
+                        crate::i18n::t("Connected"),
+                        gpui::rgb(0x4ade80).into(),
+                        host.server_id.is_some(),
+                    )
+                } else if host.status == "online" {
+                    (
+                        crate::i18n::t("Online"),
+                        gpui::rgb(0x4ade80).into(),
+                        host.server_id.is_some(),
+                    )
+                } else if host.status == "connecting" {
+                    (
+                        crate::i18n::t("Connecting…"),
+                        gpui::rgb(0xfbbf24).into(),
+                        false,
+                    )
+                } else if host.status == "error" {
+                    (crate::i18n::t("Offline"), gpui::rgb(0xf87171).into(), false)
+                } else {
+                    (crate::i18n::t("Offline"), content(0.38), false)
+                };
+            let action_id = match &host.server_id {
+                Some(id) => format!("paseo-host:{id}"),
+                None => format!("paseo-host-unready:{}", host.registration_id),
+            };
+            let display = if !host.is_remote && host.label == "Local Mac" {
+                crate::i18n::t("Local Mac")
+            } else {
+                host.label
+            };
+            items.push(
+                MenuAction::new(action_id, display)
+                    .icon(if host.is_remote {
+                        "globe"
+                    } else {
+                        "circle-dot"
+                    })
+                    .icon_color(dot_color)
+                    .value(status_label)
+                    .checked(is_current)
+                    .disabled(!selectable || self.paseo_connecting_host.is_some())
+                    .into(),
+            );
+        }
+        items.push(MenuItem::Separator);
+        items
+    }
+    fn refresh_paseo_hosts(&mut self, cx: &mut Context<Self>) {
+        if !crate::paseo_host::project_ui(&self.workspace.preferences)
+            || self.paseo_hosts_refreshing
+        {
+            return;
+        }
+        let Some(local_env) = self.paseo_local_environment().map(str::to_owned) else {
+            return;
+        };
+        self.paseo_hosts_refreshing = true;
+        let client = self.remote.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::paseo_host::list_hosts(&client, &local_env) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.paseo_hosts_refreshing = false;
+                if let Ok(hosts) = result
+                    && this.paseo_hosts() != hosts
+                {
+                    this.workspace.preferences.extra.insert(
+                        crate::paseo_host::PASEO_HOSTS.into(),
+                        serde_json::to_value(&hosts).unwrap_or_default(),
+                    );
+                    if this
+                        .menu
+                        .as_ref()
+                        .is_some_and(|m| m.target == MenuTarget::Header)
+                    {
+                        let mut new_events = Vec::new();
+                        let (_, items, _, _) =
+                            this.menu_items(&MenuTarget::Header, &mut new_events, window, cx);
+                        if let Some(open) = &mut this.menu {
+                            open._events = new_events;
+                            open.menu
+                                .update(cx, |menu, cx| menu.replace_items(items, cx));
+                        }
+                    }
+                    this.invalidate_chrome(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+    fn prime_paseo_project_tab(&mut self, project_key: &str) {
+        let has_tab = self.workspace.tabs.iter().any(|tab| {
+            let sid = self
+                .workspace
+                .session_for_pane(self.workspace.scope_pane(*tab));
+            self.session_summaries
+                .get(&sid)
+                .is_some_and(|s| s.cwd == project_key)
+        });
+        if !has_tab
+            && let Some(newest) = self
+                .session_summaries
+                .values()
+                .filter(|s| s.cwd == project_key && !s.archived)
+                .max_by_key(|s| (s.updated_at, s.id))
+                .map(|s| s.id)
+        {
+            self.workspace.open(newest);
+        }
+    }
+    fn select_paseo_project_or_connect(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(parsed) = monocode_core::remote::parse_remote_path(&path)
+            && let Some(local_env) = self.paseo_local_environment()
+            && parsed.environment_id != local_env
+            && self
+                .remote
+                .machine_for_environment(&parsed.environment_id)
+                .is_err()
+        {
+            self.switch_paseo_host(parsed.environment_id, Some(path), window, cx);
+            return;
+        }
+        self.add_paseo_project(&path, cx);
+        if crate::paseo_host::project_ui(&self.workspace.preferences) {
+            self.prime_paseo_project_tab(&path);
+        }
+        self.select_project(path, window, cx);
+        self.refresh_remote_projects(cx);
+    }
+    pub(crate) fn switch_paseo_host(
+        &mut self,
+        target_server_id: String,
+        preferred_project: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local_env) = self.paseo_local_environment().map(str::to_owned) else {
+            return;
+        };
+        if target_server_id == local_env {
+            let prefix = format!("remote://{local_env}/");
+            let all_projects: Vec<String> = self
+                .workspace
+                .preferences
+                .extra
+                .get("paseo_all_projects")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let target = preferred_project
+                .filter(|p| p.starts_with(&prefix))
+                .or_else(|| {
+                    self.workspace
+                        .projects
+                        .iter()
+                        .find(|p| p.starts_with(&prefix))
+                        .cloned()
+                })
+                .or_else(|| all_projects.into_iter().find(|p| p.starts_with(&prefix)));
+            if let Some(project_key) = target {
+                self.add_paseo_project(&project_key, cx);
+                self.prime_paseo_project_tab(&project_key);
+                self.select_project(project_key, window, cx);
+                self.refresh_remote_projects(cx);
+            }
+            return;
+        }
+        if self.paseo_connecting_host.is_some() {
+            return;
+        }
+        self.paseo_connecting_host = Some(target_server_id.clone());
+        self.error = None;
+        self.invalidate_chrome(cx);
+        cx.notify();
+
+        let directory = self.remote_dir.clone();
+        let store = self.store.clone();
+        let connections = self.remote.clone();
+        let selection = crate::paseo_host::ProjectSelection::read(
+            self.workspace
+                .preferences
+                .extra
+                .get(crate::paseo_host::PROJECT_SELECTION),
+        );
+        let work = cx.background_executor().spawn(async move {
+            crate::paseo_host::connect_remote_host(
+                &directory,
+                &store,
+                &connections,
+                &local_env,
+                &target_server_id,
+                &selection,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.paseo_connecting_host = None;
+                match result {
+                    Ok(connected) => {
+                        let mut hosts = this.paseo_hosts();
+                        for h in &mut hosts {
+                            if h.server_id.as_deref() == Some(connected.server_id.as_str()) {
+                                h.connected = true;
+                                h.status = "online".into();
+                                if !connected.label.is_empty() {
+                                    h.label = connected.label.clone();
+                                }
+                            }
+                        }
+                        this.workspace.preferences.extra.insert(
+                            crate::paseo_host::PASEO_HOSTS.into(),
+                            serde_json::to_value(&hosts).unwrap_or_default(),
+                        );
+
+                        let mut all: Vec<String> = this
+                            .workspace
+                            .preferences
+                            .extra
+                            .get("paseo_all_projects")
+                            .cloned()
+                            .and_then(|v| serde_json::from_value(v).ok())
+                            .unwrap_or_default();
+                        for key in &connected.all_projects {
+                            if !all.iter().any(|existing| existing == key) {
+                                all.push(key.clone());
+                            }
+                        }
+                        this.workspace
+                            .preferences
+                            .extra
+                            .insert("paseo_all_projects".into(), serde_json::json!(all));
+
+                        for (key, label) in connected.labels {
+                            this.workspace
+                                .project_appearance
+                                .entry(key)
+                                .or_insert_with(|| {
+                                    monocode_core::project_appearance::ProjectAppearance {
+                                        name: label,
+                                        ..Default::default()
+                                    }
+                                });
+                        }
+                        for (key, path) in connected.icons {
+                            this.workspace
+                                .project_appearance
+                                .entry(key)
+                                .or_default()
+                                .logo = Some(path);
+                        }
+
+                        let previous: HashMap<i64, Option<String>> = connected
+                            .presentation
+                            .keys()
+                            .map(|id| {
+                                (
+                                    *id,
+                                    this.remote_details
+                                        .get(id)
+                                        .and_then(|d| d["bucket"].as_str())
+                                        .map(str::to_owned),
+                                )
+                            })
+                            .collect();
+                        this.remote_details.extend(connected.presentation);
+                        for (summary, running, waiting, draft) in connected.summaries {
+                            let id = summary.id;
+                            this.started_by.remove(&id);
+                            if let Some(parent) = connected.started_by.get(&id) {
+                                this.started_by.insert(id, *parent);
+                            }
+                            if draft {
+                                this.draft_sessions.insert(id);
+                            } else {
+                                this.draft_sessions.remove(&id);
+                            }
+                            if !this.session_summaries.contains_key(&id) {
+                                this.order.push(id);
+                            }
+                            this.session_summaries.insert(id, summary);
+                            let before = previous.get(&id).and_then(|b| b.as_deref());
+                            this.apply_remote_row(id, before, running, waiting, cx);
+                        }
+
+                        for p in &connected.projects {
+                            this.add_paseo_project(p, cx);
+                        }
+                        let prefix = format!("remote://{}/", connected.server_id);
+                        let target = preferred_project
+                            .filter(|p| p.starts_with(&prefix))
+                            .or_else(|| connected.projects.first().cloned())
+                            .or_else(|| connected.all_projects.first().cloned());
+                        if let Some(project_key) = target {
+                            this.add_paseo_project(&project_key, cx);
+                            this.prime_paseo_project_tab(&project_key);
+                            this.select_project(project_key, window, cx);
+                            this.refresh_remote_projects(cx);
+                        }
+                        this.persist(cx);
+                        this.invalidate_chrome(cx);
+                        this.refresh_sidebar_structure(cx);
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.error = Some(error);
+                        this.refresh_paseo_hosts(cx);
+                        this.invalidate_chrome(cx);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
     fn open_project(&mut self, cx: &mut Context<Self>) {
         if crate::paseo_host::active() {
             self.error = Some("请从侧栏选择现有 Paseo 项目".into());
@@ -5587,12 +5971,16 @@ impl Shell {
                 cx.notify();
             }),
         );
+        let is_header = target == MenuTarget::Header;
         self.menu = Some(ShellMenu {
             target,
             anchor,
             menu,
             _events: events,
         });
+        if is_header {
+            self.refresh_paseo_hosts(cx);
+        }
         self.invalidate_chrome(cx);
         cx.notify();
     }
@@ -5822,7 +6210,11 @@ impl Shell {
                         this.close_menu(cx);
                         match picked {
                             ProjectPicked::Project(path) => {
-                                this.select_project(path.clone(), window, cx)
+                                if crate::paseo_host::project_ui(&this.workspace.preferences) {
+                                    this.select_paseo_project_or_connect(path.clone(), window, cx);
+                                } else {
+                                    this.select_project(path.clone(), window, cx);
+                                }
                             }
                             ProjectPicked::Mono(id) => {
                                 if let Some(monos) = this.monos.clone() {
@@ -5872,8 +6264,7 @@ impl Shell {
                         this.close_menu(cx);
                         match picked {
                             ProjectPicked::Project(path) if *path != this.workspace.project => {
-                                this.add_paseo_project(path, cx);
-                                this.select_project(path.clone(), window, cx)
+                                this.select_paseo_project_or_connect(path.clone(), window, cx);
                             }
                             ProjectPicked::Project(_) | ProjectPicked::Mono(_) => {}
                             ProjectPicked::New => this.open_project(cx),
@@ -5901,42 +6292,44 @@ impl Shell {
                     MenuAction::new("switch-worktree", crate::i18n::t("Switch worktree"))
                         .icon("folder-tree")
                         .flyout(self.worktree_flyout(events, window, cx));
+                let mut items = self.paseo_host_menu_items();
+                items.extend([
+                    match branch {
+                        Some(branch) => worktree.value(branch),
+                        None => worktree,
+                    }
+                    .into(),
+                    MenuItem::Separator,
+                    MenuAction::new("switch-project", crate::i18n::t("Switch project"))
+                        .icon("folder")
+                        .flyout(Flyout {
+                            view: picker.into(),
+                            width: 286.,
+                            padding: 0.,
+                            height: None,
+                            max_height: Some(380.),
+                            focus: Some(focus),
+                            surface: None,
+                        })
+                        .into(),
+                    MenuAction::new("project-settings", crate::i18n::t("Project settings"))
+                        .icon("sliders")
+                        .flyout(self.project_settings_flyout(events, window, cx))
+                        .into(),
+                    MenuAction::new(
+                        "open-remote-project",
+                        crate::i18n::t("Open folder on a machine…"),
+                    )
+                    .icon("globe")
+                    .into(),
+                    MenuAction::new("settings", crate::i18n::t("Settings"))
+                        .icon("settings")
+                        .shortcut(format!("{MOD},"))
+                        .into(),
+                ]);
                 (
                     format!("{} menu", self.project_label(&self.workspace.project)).into(),
-                    vec![
-                        match branch {
-                            Some(branch) => worktree.value(branch),
-                            None => worktree,
-                        }
-                        .into(),
-                        MenuItem::Separator,
-                        MenuAction::new("switch-project", crate::i18n::t("Switch project"))
-                            .icon("folder")
-                            .flyout(Flyout {
-                                view: picker.into(),
-                                width: 286.,
-                                padding: 0.,
-                                height: None,
-                                max_height: Some(380.),
-                                focus: Some(focus),
-                                surface: None,
-                            })
-                            .into(),
-                        MenuAction::new("project-settings", crate::i18n::t("Project settings"))
-                            .icon("sliders")
-                            .flyout(self.project_settings_flyout(events, window, cx))
-                            .into(),
-                        MenuAction::new(
-                            "open-remote-project",
-                            crate::i18n::t("Open folder on a machine…"),
-                        )
-                        .icon("globe")
-                        .into(),
-                        MenuAction::new("settings", crate::i18n::t("Settings"))
-                            .icon("settings")
-                            .shortcut(format!("{MOD},"))
-                            .into(),
-                    ],
+                    items,
                     240.,
                     MenuStyle::Switcher,
                 )
@@ -6127,7 +6520,9 @@ impl Shell {
             }
             MenuTarget::Header => {
                 // "Project settings" opens the project's menu beside its row.
-                if action == "settings" {
+                if let Some(server_id) = action.strip_prefix("paseo-host:") {
+                    self.switch_paseo_host(server_id.to_owned(), None, window, cx);
+                } else if action == "settings" {
                     self.open_settings(crate::settings::Section::General, window, cx);
                 } else if action == "open-remote-project" {
                     self.open_remote_project(window, cx);
@@ -9878,6 +10273,92 @@ impl Shell {
                 menu.test_pick_action("switch-project", window, cx)
             });
         }
+    }
+    pub(crate) fn paseo_fixture_wire_multihost(
+        &mut self,
+        directory: std::path::PathBuf,
+        connections: Arc<monocode_core::remote::Connections>,
+        local_env: &str,
+        endpoint: &str,
+        hosts: Vec<crate::paseo_host::RemoteHostInfo>,
+    ) {
+        self.remote_dir = directory;
+        self.remote = connections;
+        self.workspace
+            .preferences
+            .extra
+            .insert("paseo_environment".into(), serde_json::json!(local_env));
+        self.workspace
+            .preferences
+            .extra
+            .insert("paseo_host_endpoint".into(), serde_json::json!(endpoint));
+        self.workspace.preferences.extra.insert(
+            crate::paseo_host::PASEO_HOSTS.into(),
+            serde_json::to_value(hosts).unwrap(),
+        );
+    }
+    pub(crate) fn paseo_fixture_pick_header_action(
+        &mut self,
+        action_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu(
+            MenuTarget::Header,
+            Anchor::Point(gpui::point(px(20.), px(50.))),
+            window,
+            cx,
+        );
+        if let Some(open) = &self.menu {
+            open.menu
+                .update(cx, |menu, cx| menu.test_pick_action(action_id, window, cx));
+        }
+    }
+    pub(crate) fn paseo_fixture_assert_remote_host_isolated(
+        &mut self,
+        expected_local_env: &str,
+        remote_link: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert_eq!(
+            self.paseo_local_environment(),
+            Some(expected_local_env),
+            "local Mac paseo_environment must never be overwritten by remote host"
+        );
+        assert!(
+            self.paseo_local_file(remote_link).is_none(),
+            "remote host file links must never resolve as local Mac files"
+        );
+        self.error = None;
+        self.new_terminal(window, cx);
+        assert!(
+            !self.terminals.contains_key(&self.workspace.project),
+            "remote host project must never spawn a local Mac terminal"
+        );
+        assert!(
+            self.error
+                .as_deref()
+                .is_some_and(|e| e.contains("remote projects") || e.contains("远程项目")),
+            "unexpected terminal error: {:?}",
+            self.error
+        );
+    }
+    pub(crate) fn paseo_fixture_current_project_label(&self) -> String {
+        self.project_label(&self.workspace.project)
+    }
+    pub(crate) fn paseo_fixture_session_titles_for_project(
+        &self,
+        project_key: &str,
+    ) -> Vec<String> {
+        let mut titles: Vec<String> = self
+            .session_summaries
+            .values()
+            .filter(|s| s.cwd == project_key)
+            .map(|s| s.title.clone())
+            .collect();
+        titles.sort();
+        titles
     }
 }
 

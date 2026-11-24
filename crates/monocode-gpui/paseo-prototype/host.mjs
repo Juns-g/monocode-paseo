@@ -1,6 +1,7 @@
 import {createHostServer} from '../../../host/server.ts';
-import {createClient,readConfig} from './sdk.mjs';
+import {createClient,createRoutedClient,readConfig} from './sdk.mjs';
 import {PaseoHost} from './host-adapter.mjs';
+import {HostRegistry} from './hosts.mjs';
 import {projectTimelineRows} from 'paseo-source/packages/server/src/server/agent/timeline-projection.ts';
 import {randomBytes,timingSafeEqual} from 'node:crypto';
 import {readFileSync,writeFileSync,mkdirSync} from 'node:fs';
@@ -14,7 +15,16 @@ let token;
 try{token=readFileSync(tokenPath,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;token=randomBytes(32).toString('base64url');writeFileSync(tokenPath,token,{flag:'wx',mode:0o600});}
 if(!/^[A-Za-z0-9_-]{43}$/.test(token))throw Error('Invalid isolated host token');
 const client=createClient();
-const host=new PaseoHost(client,directory,rows=>projectTimelineRows({rows,mode:'projected'}));
+const projectTimeline=rows=>projectTimelineRows({rows,mode:'projected'});
+const registry=new HostRegistry({
+  originClient:client,
+  baseDirectory:directory,
+  token,
+  createAdapter:(routedClient,hostDir,options)=>new PaseoHost(routedClient,hostDir,projectTimeline,options),
+  createRoutedClient,
+  createServer:(store,adapter)=>createHostServer({store},[],undefined,adapter),
+});
+const host=new PaseoHost(client,directory,projectTimeline,{hostRegistry:registry});
 host.allowLiveCheck=process.argv.includes('--live-create');
 const store={get environmentId(){return host.serverId;},
   authenticated(value){return value.length===token.length && timingSafeEqual(Buffer.from(value),Buffer.from(token));},
@@ -38,7 +48,7 @@ client.subscribeConnectionStatus(state=>{
   }
 });
 client.subscribeRawMessages(message=>{if(message.type==='agent_status')host.invalidate();});
-const stop=()=>{host.close();server.close();process.exit(0);};
+const stop=()=>{registry.close();host.close();server.close();process.exit(0);};
 process.on('SIGTERM',stop);process.on('SIGINT',stop);
 // Parent death releases client resources, never remote agents.
 process.stdin.resume();process.stdin.on('end',stop);

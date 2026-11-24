@@ -2214,5 +2214,10 @@
   "Paseo session is busy or state changed; rewind cancelled.": "Paseo 会话正在运行或状态已变化，已取消回退。",
   "Rewinding…": "正在回退…",
   "Wait for Paseo rewind to finish before sending a message.": "正在回退 Paseo 会话，请稍候再发送消息。",
-  "(Image message)": "（图片消息）"
+  "(Image message)": "（图片消息）",
+  "Hosts": "宿主机",
+  "Local Mac": "本机 Mac",
+  "Online": "在线",
+  "Offline": "离线",
+  "Remote Paseo host has no projects": "远程 Paseo 宿主机暂无可用项目"
 }
