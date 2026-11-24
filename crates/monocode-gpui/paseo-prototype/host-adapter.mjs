@@ -9,11 +9,12 @@ import {fullAccessMode,nativeModel,nativeSettings,configuration} from './configu
 import {SyncTransfers} from '../../../host/sync-transfer.ts';
 import {fetchPaseoUsage} from './usage.mjs';
 import {AttachmentStore} from './attachments.mjs';
+import {normalizePosixPath,validateWorktreeSpec,listProjectWorktrees,verifyExistingWorktreeCwd} from './worktrees.mjs';
 
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
 const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume and never answer (its own wait is 60 s).
-export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.history-pages','sessions.no-delete','sessions.list-revision',
+export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.worktrees','paseo.history-pages','sessions.no-delete','sessions.list-revision',
   'attachments.upload','attachments.read','paseo.usage',
   'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
@@ -143,6 +144,7 @@ export class PaseoHost {
     if(params.projectId!=null)this.fileProject(params.projectId);
     for(const key of ['path','cwd'])if(typeof params[key]==='string' && isAbsolute(params[key]))params[key]=canonicalPath(params[key]);
   }
+  comparePath(path){return this.isRemoteHost?normalizePosixPath(path):canonicalPath(path);}
   identity(){const observed=this.client.getLastServerInfoMessage()?.serverId;if(!this.connected||!observed||(this.serverId&&observed!==this.serverId))throw Error('Paseo disconnected or daemon identity changed');this.serverId??=observed;}
   control(agent){const c=new Controller(this.client,()=>{});c.connected=this.connected;c.selected=agent;c.selectedServer=this.serverId;c.invalidate=()=>{};return c;}
   number(agent,id){const key=JSON.stringify([agent,id]);if(!this.numbers.has(key)){this.numbers.set(key,this.numbers.size+1);const temp=this.numberPath+'.tmp';writeFileSync(temp,JSON.stringify([...this.numbers]),{mode:0o600});renameSync(temp,this.numberPath);}return this.numbers.get(key);}
@@ -357,13 +359,21 @@ export class PaseoHost {
   }
   async create(c){
     return this.attempts.run(c,async()=>{
+      if(c.worktree!=null&&(c.workspaceId!=null||c.worktreeCwd!=null))throw Error('工作区、已有 worktree 与新建 worktree 不能同时指定。');
+      const worktreeSpec=c.worktree!=null?validateWorktreeSpec(c.worktree):null;
       await this.directory();const project=this.projects.get(c.projectId);
       if(!project)throw Error('Unknown Paseo project');
-      this.fileProject(project.id);
+      if(!this.isRemoteHost)this.fileProject(project.id);
       const selected=c.workspaceId==null?null:this.workspaceChoices(project.id).find(w=>w.id===c.workspaceId);
       if(c.workspaceId!=null&&!selected)throw Error('所选工作区不存在或不属于当前项目；不会自动选择其他工作区。');
-      const cwd=selected?.cwd??project.cwd;
-      if(c.worktreeCwd&&canonicalPath(c.worktreeCwd)!==canonicalPath(cwd))throw Error('工作目录与所选 Paseo 工作区不一致；不会创建 worktree。');
+      let cwd=selected?.cwd??project.cwd;
+      if(selected){
+        if(c.worktreeCwd&&this.comparePath(c.worktreeCwd)!==this.comparePath(cwd))throw Error('工作目录与所选 Paseo 工作区不一致；不会创建 worktree。');
+      }else if(c.worktreeCwd){
+        if(this.comparePath(c.worktreeCwd)!==this.comparePath(project.cwd)){
+          cwd=await verifyExistingWorktreeCwd(this,project.cwd,c.worktreeCwd);
+        }
+      }
       const context=c.firstAgentContext;
       if(context!=null&&(typeof context.prompt!=='string'||context.prompt.length>65536||(context.attachments?.length??0)>0))throw Error('Invalid workspace naming context');
       const available=await this.providers();
@@ -384,18 +394,20 @@ export class PaseoHost {
         workspace=[...this.entries.values()].find(e=>e.projectId===project.id&&e.workspace?.id===selected.id)?.workspace;
       }else{
         const priorWorkspaces=new Set([...this.entries.values()].map(e=>e.agent.workspaceId));
+        const source=worktreeSpec?{kind:'worktree',cwd:project.cwd,...worktreeSpec}:{kind:'directory',path:cwd};
         // An inline agent makes the daemon replace firstAgentContext with its
         // initialPrompt. Keep naming separate from the exactly-once user send.
-        const created=await this.client.createWorkspace({source:{kind:'directory',path:cwd},
+        const created=await this.client.createWorkspace({source,
           ...(context?.prompt.trim()?{firstAgentContext:{prompt:context.prompt,attachments:[]}}:{}),idempotencyKey:c.commandId});
-        if(created.error||!created.workspace||created.agent)throw Error(created.error||'Workspace create acknowledgement is incomplete or unexpected; do not replay');
+        if(created.error||!created.workspace||created.agent||(worktreeSpec&&!created.workspace.workspaceDirectory))throw Error(created.error||'Workspace create acknowledgement is incomplete or unexpected; do not replay');
         workspace=created.workspace;
         if(priorWorkspaces.has(workspace.id))throw Error('New workspace acknowledgement reused an existing workspace; do not replay');
+        if(worktreeSpec){cwd=workspace.workspaceDirectory;config.cwd=cwd;}
         this.identity();
         agent=await this.client.createAgent({agentId,workspaceId:workspace.id,config,idempotencyKey:c.commandId+':agent'});
       }
       this.identity();
-      if(agent.id!==agentId||!workspace?.id||agent.workspaceId!==workspace.id||canonicalPath(agent.cwd)!==canonicalPath(cwd)||agent.labels?.['paseo.parent-agent-id'])throw Error('Create acknowledgement identity mismatch; do not replay');
+      if(agent.id!==agentId||!workspace?.id||agent.workspaceId!==workspace.id||this.comparePath(agent.cwd)!==this.comparePath(cwd)||agent.labels?.['paseo.parent-agent-id'])throw Error('Create acknowledgement identity mismatch; do not replay');
       const template=[...this.entries.values()].find(e=>e.projectId===project.id&&(!selected||e.agent.workspaceId===selected.id));
       this.entries.set(agent.id,{...template,project:{...template?.project,workspaceName:workspace.title||workspace.name,checkout:{...template?.project.checkout,cwd}},
         projectId:project.id,agent,workspace,paseoWorkspaceAnchorId:selected?template?.paseoWorkspaceAnchorId:agent.id,paseoParentAgentId:null});
@@ -490,6 +502,7 @@ export class PaseoHost {
       await this.directory();
       return {result:this.workspaceChoices(p.projectId).slice(0,WORKSPACE_CHOICE_LIMIT)};
     }
+    if(method==='paseo.worktrees')return {result:await listProjectWorktrees(this,p)};
     if(method==='paseo.usage')return {result:await fetchPaseoUsage(this.client,p)};
     if(method==='environment.describe')return {result:{protocolVersion:1,environmentId:this.serverId,name:`Paseo ${this.client.getLastServerInfoMessage()?.version??''}`,
       platform:process.platform,providers:[...new Set((await this.providers()).map(harness))],capabilities:CAPABILITIES}};

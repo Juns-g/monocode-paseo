@@ -1309,3 +1309,132 @@ fn live_window_layout_is_absent_without_the_history_pages_capability() {
     // The unpaged host keeps the whole-snapshot comparison: no slide accounting.
     assert!(updates.iter().any(|u| u.start == 0 && !u.rows.is_empty()));
 }
+
+#[test]
+fn paseo_draft_with_remote_worktree_emits_worktree_spec_omits_workspace_id_and_preserves_command_id()
+ {
+    let spec = monocode_core::agent::RemoteWorktreeSpec {
+        action: "branch-off".into(),
+        branch_name: Some("feat/wt-draft".into()),
+        base_branch: Some("main".into()),
+        ref_name: Some("main".into()),
+    };
+    let roundtrip: monocode_core::agent::RemoteWorktreeSpec =
+        serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+    assert_eq!(roundtrip, spec);
+
+    let dir = Directory::new();
+    let store = dir.store();
+    let mut binding = binding(&store);
+    binding.project.project_id = "paseo:/host/repo".into();
+    journal(&store, &binding).unwrap();
+
+    let drop_first_create = Arc::new(AtomicBool::new(true));
+    let drop_ref = drop_first_create.clone();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let recorded = commands.clone();
+    let host = Host::new(move |request| {
+        if request["method"] == "paseo.worktrees" {
+            return Some(json!({"projectId": request["params"]["projectId"], "isGitRepo": true}));
+        }
+        if request["method"] == "commands.dispatch" {
+            let command = request["params"].clone();
+            recorded.lock().unwrap().push(command.clone());
+            if command["type"] == "create" && drop_ref.swap(false, Ordering::Relaxed) {
+                return None;
+            }
+            Some(receipt(&command))
+        } else {
+            let mut value = snapshot("idle", 2);
+            value["projectId"] = json!("paseo:/host/repo");
+            Some(json!({"kind":"snapshot","value":value}))
+        }
+    });
+    assert_eq!(
+        host.client
+            .request(
+                &host.machine.id,
+                "paseo.worktrees",
+                json!({"projectId": "paseo:/host/repo"})
+            )
+            .unwrap()["isGitRepo"],
+        true
+    );
+
+    let settings = Settings {
+        model: Some("codex:fixture-model".into()),
+        remote_worktree: Some(spec),
+        // Even if remote_workspace_id or worktree_cwd were left behind, remote_worktree takes precedence and omits them.
+        remote_workspace_id: Some("stale-workspace".into()),
+        worktree_cwd: Some("remote://env/host/repo-wt".into()),
+        ..Default::default()
+    };
+    locked(&store)
+        .unwrap()
+        .save_agent_settings(binding.summary.id, &settings)
+        .unwrap();
+    let saved = locked(&store)
+        .unwrap()
+        .agent_settings(binding.summary.id)
+        .unwrap()
+        .unwrap();
+
+    // First send drops the create HTTP response; outbox preserves the exact create commandId.
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "Implement F6 worktrees".into(),
+        saved.clone(),
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let first = receive(&rx);
+    assert!(first.finished);
+    let durable = locked(&store)
+        .unwrap()
+        .remote_session(binding.summary.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.outbox.len(), 2);
+    let create_cmd_id = durable.outbox[0]["commandId"].as_str().unwrap().to_owned();
+    assert_eq!(
+        durable.outbox[0]["worktree"],
+        json!({
+            "action": "branch-off",
+            "branchName": "feat/wt-draft",
+            "baseBranch": "main",
+            "refName": "main"
+        })
+    );
+    assert!(durable.outbox[0].get("workspaceId").is_none());
+    assert!(durable.outbox[0].get("worktreeCwd").is_none());
+
+    // Retry reuses the exact same create commandId.
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    let mut retry_settings = saved;
+    retry_settings.remote_action = Some(json!({"type": "retry"}));
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        String::new(),
+        retry_settings,
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let second = receive(&rx);
+    assert!(second.finished, "{}", second.status);
+    let commands = commands.lock().unwrap();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[0]["type"], "create");
+    assert_eq!(commands[1]["type"], "create");
+    assert_eq!(commands[0]["commandId"], create_cmd_id);
+    assert_eq!(commands[1]["commandId"], create_cmd_id);
+    assert_eq!(commands[2]["type"], "send");
+}

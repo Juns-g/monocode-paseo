@@ -2079,34 +2079,7 @@ impl Conversation {
             return;
         }
         if self.paseo_controls() && id.starts_with("workspace:") {
-            if !self.paseo_workspace_draft() {
-                self.status = "已有 Paseo 对话不能在这里变更工作区归属".into();
-                cx.notify();
-                return;
-            }
-            let selected = if id == "workspace:paseo:new" {
-                None
-            } else if let Some(workspace) = id.strip_prefix("workspace:paseo:existing:") {
-                if !self
-                    .remote_state
-                    .workspace_choices
-                    .iter()
-                    .any(|w| w["id"] == workspace)
-                {
-                    self.status = "所选 Paseo 工作区已不可用，请重新打开新建页".into();
-                    cx.notify();
-                    return;
-                }
-                Some(workspace.to_owned())
-            } else {
-                return;
-            };
-            self.settings.remote_workspace_id = selected;
-            self.settings.new_worktree = false;
-            self.settings.worktree_cwd = None;
-            self.settings.worktree_removed = false;
-            self.save_settings(cx);
-            cx.notify();
+            self.paseo_workspace_choice(id, cx);
             return;
         }
         if id == "save-agent-preset" {
@@ -2555,7 +2528,10 @@ impl Conversation {
         }
         if self.paseo_controls()
             && kind == ComposerMenu::Add
-            && !self.remote_state.capabilities.contains("attachments.upload")
+            && !self
+                .remote_state
+                .capabilities
+                .contains("attachments.upload")
         {
             self.status = "当前 Paseo 桥接不支持发送图片附件".into();
             cx.notify();
@@ -2581,6 +2557,9 @@ impl Conversation {
             .update(cx, |completion, cx| completion.dismiss(cx));
         self.git_picker = None;
         self.git_events = None;
+        if kind == ComposerMenu::Workspace && self.paseo_workspace_draft() {
+            self.refresh_paseo_worktrees(cx);
+        }
         let mut events = Vec::new();
         let (label, items, width, style) = self.menu_items(kind, &mut events, window, cx);
         // The recent models open on the current one.
@@ -2659,33 +2638,7 @@ impl Conversation {
             }
             ComposerMenu::Workspace => {
                 if self.paseo_workspace_draft() {
-                    let mut items = vec![
-                        MenuItem::Header("Paseo 工作区归属".into()),
-                        MenuAction::new("workspace:paseo:new", "新建独立工作区")
-                            .description("创建新的独立对话，不作为当前对话的子任务")
-                            .icon("folder")
-                            .checked(self.settings.remote_workspace_id.is_none())
-                            .into(),
-                    ];
-                    if !self.remote_state.workspace_choices.is_empty() {
-                        items.push(MenuItem::Separator);
-                        items.push(MenuItem::Header("加入已有工作区（同项目）".into()));
-                        for workspace in &self.remote_state.workspace_choices {
-                            let Some(id) = workspace["id"].as_str() else {
-                                continue;
-                            };
-                            items.push(
-                                MenuAction::new(
-                                    format!("workspace:paseo:existing:{id}"),
-                                    workspace["title"].as_str().unwrap_or(id).to_owned(),
-                                )
-                                .description(workspace["cwd"].as_str().unwrap_or(id).to_owned())
-                                .icon("folder")
-                                .checked(self.settings.remote_workspace_id.as_deref() == Some(id))
-                                .into(),
-                            );
-                        }
-                    }
+                    let items = self.paseo_workspace_menu_items(events, window, cx);
                     return ("Paseo workspace", items, 340., MenuStyle::Settings);
                 }
                 let picker = cx.new(|cx| {
@@ -3302,22 +3255,10 @@ impl Conversation {
             self.git.as_ref().is_some_and(|s| s.linked) || self.settings.worktree_cwd.is_some();
         let new = draft && self.settings.new_worktree;
         let paseo_draft = self.paseo_workspace_draft();
+        let paseo_worktree = paseo_draft
+            && (self.settings.remote_worktree.is_some() || self.settings.worktree_cwd.is_some());
         let label: SharedString = if paseo_draft {
-            self.settings
-                .remote_workspace_id
-                .as_deref()
-                .map(|id| {
-                    let title = self
-                        .remote_state
-                        .workspace_choices
-                        .iter()
-                        .find(|w| w["id"] == id)
-                        .and_then(|w| w["title"].as_str())
-                        .unwrap_or(id);
-                    format!("加入：{title}")
-                })
-                .unwrap_or_else(|| "新建独立工作区".into())
-                .into()
+            self.paseo_workspace_pill_label()
         } else if self.paseo_controls() {
             "Paseo 工作区".into()
         } else if new {
@@ -3343,7 +3284,7 @@ impl Conversation {
         let workspace = if draft {
             bar_trigger(
                 "composer-workspace",
-                if new || linked {
+                if new || linked || paseo_worktree {
                     "folder-tree"
                 } else {
                     "folder"

@@ -18,10 +18,265 @@ pub(super) struct State {
     send_blocked_notice: bool,
     pub(super) unbound: bool,
     pub(super) workspace_choices: Vec<Value>,
+    pub(super) worktree_info: Option<Value>,
+    pub(super) worktree_info_at: Option<std::time::Instant>,
+    pub(super) worktree_info_loading: bool,
+    pub(super) worktree_form: std::cell::RefCell<Option<gpui::WeakEntity<PaseoWorktreeForm>>>,
     error: Option<String>,
     rejected: Option<Value>,
     snapshot: Option<Value>,
     pub(super) capabilities: std::collections::HashSet<String>,
+}
+
+pub(super) enum PaseoWorktreeEvent {
+    Confirmed(monocode_core::agent::RemoteWorktreeSpec),
+}
+
+pub(super) struct PaseoWorktreeForm {
+    pub(super) branch_input: Entity<input::Input>,
+    pub(super) branches: Vec<String>,
+    pub(super) base_branch: Option<String>,
+    pub(super) error: Option<String>,
+    _submitted: Subscription,
+    _changed: Subscription,
+}
+
+impl EventEmitter<PaseoWorktreeEvent> for PaseoWorktreeForm {}
+
+impl PaseoWorktreeForm {
+    pub(super) fn new(
+        worktree_info: Option<&Value>,
+        current: Option<&monocode_core::agent::RemoteWorktreeSpec>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let branch_input = cx.new(|cx| {
+            let mut field = input::Input::field(
+                "New Paseo worktree branch",
+                crate::i18n::t("留空由 Paseo 自动命名，如 feat/login"),
+                content(0.4),
+                cx,
+            );
+            if let Some(existing) = current.and_then(|s| s.branch_name.as_deref()) {
+                field.set_text(existing.to_owned(), cx);
+            }
+            field
+        });
+        let submitted = cx.subscribe(&branch_input, |this, _, _: &input::Submitted, cx| {
+            this.confirm(cx);
+        });
+        let changed = cx.subscribe(&branch_input, |this, _, _: &input::Changed, cx| {
+            if this.error.take().is_some() {
+                cx.notify();
+            }
+        });
+        let (branches, default_base) = Self::extract_branches(worktree_info);
+        let base_branch = current
+            .and_then(|s| s.base_branch.clone())
+            .filter(|b| !b.trim().is_empty())
+            .or(default_base);
+        Self {
+            branch_input,
+            branches,
+            base_branch,
+            error: None,
+            _submitted: submitted,
+            _changed: changed,
+        }
+    }
+
+    fn extract_branches(worktree_info: Option<&Value>) -> (Vec<String>, Option<String>) {
+        let current_branch = worktree_info
+            .and_then(|info| info["currentBranch"].as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned);
+        let mut branches: Vec<String> = worktree_info
+            .and_then(|info| info["branches"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| {
+                v.as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .collect();
+        if let Some(curr) = &current_branch
+            && !branches.contains(curr)
+        {
+            branches.insert(0, curr.clone());
+        }
+        let default_base = current_branch.or_else(|| branches.first().cloned());
+        (branches, default_base)
+    }
+
+    pub(super) fn set_worktree_info(&mut self, info: &Value, cx: &mut Context<Self>) {
+        let (branches, default_base) = Self::extract_branches(Some(info));
+        self.branches = branches;
+        if self.base_branch.is_none() {
+            self.base_branch = default_base;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn focus(&self, cx: &gpui::App) -> gpui::FocusHandle {
+        self.branch_input.focus_handle(cx)
+    }
+
+    pub(super) fn valid_branch_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 128
+            && !name.starts_with('/')
+            && !name.ends_with('/')
+            && !name.ends_with(".lock")
+            && !name.contains("..")
+            && !name
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    }
+
+    pub(super) fn confirm(&mut self, cx: &mut Context<Self>) -> bool {
+        let raw_branch = self.branch_input.read(cx).content.trim().to_owned();
+        if !raw_branch.is_empty() && !Self::valid_branch_name(&raw_branch) {
+            self.error = Some("分支名称格式无效，请检查后重试。".into());
+            cx.notify();
+            return false;
+        }
+        let branch_name = (!raw_branch.is_empty()).then_some(raw_branch);
+        let base_branch = self
+            .base_branch
+            .clone()
+            .filter(|b| !b.trim().is_empty() && Self::valid_branch_name(b));
+        cx.emit(PaseoWorktreeEvent::Confirmed(
+            monocode_core::agent::RemoteWorktreeSpec {
+                action: "branch-off".into(),
+                branch_name,
+                base_branch: base_branch.clone(),
+                ref_name: base_branch,
+            },
+        ));
+        true
+    }
+}
+
+impl Render for PaseoWorktreeForm {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected_base = self.base_branch.clone();
+        div()
+            .id("paseo-worktree-form")
+            .debug_selector(|| "paseo-worktree-form".into())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .text_size(px(12.))
+            .text_color(content(0.9))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(content(0.5))
+                    .child(crate::i18n::t("新建 Paseo Git Worktree")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(content(0.65))
+                            .child(crate::i18n::t("新分支名称（可选）")),
+                    )
+                    .child(
+                        div()
+                            .id("paseo-worktree-branch-input")
+                            .debug_selector(|| "paseo-worktree-branch-input".into())
+                            .px(px(8.))
+                            .py(px(5.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(content(0.15))
+                            .bg(content(0.04))
+                            .child(self.branch_input.clone()),
+                    ),
+            )
+            .when(!self.branches.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(content(0.65))
+                                .child(crate::i18n::t("基线分支")),
+                        )
+                        .child(
+                            div()
+                                .id("paseo-worktree-base-list")
+                                .max_h(px(140.))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .children(self.branches.iter().enumerate().map(|(ix, branch)| {
+                                    let branch_name = branch.clone();
+                                    let branch_for_click = branch.clone();
+                                    let branch_for_selector = branch.clone();
+                                    let is_selected =
+                                        selected_base.as_deref() == Some(branch.as_str());
+                                    div()
+                                        .id(("paseo-base-branch", ix))
+                                        .debug_selector(move || {
+                                            format!("paseo-base-branch-{branch_for_selector}")
+                                        })
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(6.))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .when(is_selected, |row| row.bg(content(0.08)))
+                                        .hover(|row| row.bg(content(0.06)))
+                                        .child(icon("git-branch", 12.).text_color(content(0.6)))
+                                        .child(div().flex_1().truncate().child(branch_name))
+                                        .when(is_selected, |row| {
+                                            row.child(icon("check", 12.).text_color(content(0.9)))
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.base_branch = Some(branch_for_click.clone());
+                                            cx.notify();
+                                        }))
+                                })),
+                        ),
+                )
+            })
+            .when_some(self.error.clone(), |d, err| {
+                d.child(
+                    div()
+                        .debug_selector(|| "paseo-worktree-error".into())
+                        .text_size(px(11.))
+                        .text_color(tint(AMBER_400, 0.95))
+                        .child(err),
+                )
+            })
+            .child(
+                div().flex().justify_end().pt(px(2.)).child(
+                    crate::settings::widgets::secondary_button(
+                        "paseo-worktree-confirm",
+                        crate::i18n::t("确定"),
+                        true,
+                        false,
+                    )
+                    .debug_selector(|| "paseo-worktree-confirm".into())
+                    .child(crate::i18n::t("确定"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm(cx);
+                    })),
+                ),
+            )
+    }
 }
 impl State {
     fn legacy_recovery_error(&self) -> Option<&str> {
@@ -609,7 +864,10 @@ impl Conversation {
             cx.notify();
             return true;
         }
-        if self.settings.new_worktree && self.settings.worktree_cwd.is_none() {
+        if !self.paseo_controls()
+            && self.settings.new_worktree
+            && self.settings.worktree_cwd.is_none()
+        {
             if !self.preparing_worktree {
                 self.prepare_worktree(cx);
             }
@@ -794,6 +1052,366 @@ impl Conversation {
                     .collect();
             }
         }
+        cx.notify();
+    }
+    pub(super) fn refresh_paseo_worktrees(&mut self, cx: &mut Context<Self>) {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(10);
+        if !self.paseo_workspace_draft()
+            || !self.remote_state.capabilities.contains("paseo.worktrees")
+            || self.remote_state.worktree_info_loading
+            || self
+                .remote_state
+                .worktree_info_at
+                .is_some_and(|at| at.elapsed() < TTL)
+        {
+            return;
+        }
+        if self.remote_state.client.is_none() {
+            self.remote_state.client = monocode_core::remote::default_connections().ok();
+        }
+        let Some(client) = self.remote_state.client.clone() else {
+            return;
+        };
+        self.remote_state.worktree_info_loading = true;
+        let store = self.store.clone();
+        let id = self.summary.id;
+        let work = cx.background_executor().spawn(async move {
+            let remote = locked(&store)?
+                .remote_session(id)?
+                .ok_or("Remote session no longer exists")?;
+            let machine = remote.machine(&client)?;
+            client.request(
+                &machine.id,
+                "paseo.worktrees",
+                json!({"projectId": remote.project.project_id}),
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.remote_state.worktree_info_loading = false;
+                if let Ok(info) = result {
+                    if let Some(form) = this
+                        .remote_state
+                        .worktree_form
+                        .borrow()
+                        .as_ref()
+                        .and_then(|w| w.upgrade())
+                    {
+                        form.update(cx, |form, cx| form.set_worktree_info(&info, cx));
+                    }
+                    this.remote_state.worktree_info = Some(info);
+                    this.remote_state.worktree_info_at = Some(std::time::Instant::now());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+    pub(super) fn apply_paseo_worktree_spec(
+        &mut self,
+        spec: monocode_core::agent::RemoteWorktreeSpec,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.paseo_workspace_draft() {
+            self.status = "已有 Paseo 对话不能在这里变更工作区归属".into();
+            cx.notify();
+            return;
+        }
+        self.settings.remote_worktree = Some(spec);
+        self.settings.remote_workspace_id = None;
+        self.settings.new_worktree = false;
+        self.settings.worktree_cwd = None;
+        self.settings.worktree_removed = false;
+        self.save_settings(cx);
+        cx.notify();
+    }
+    pub(super) fn paseo_workspace_pill_label(&self) -> SharedString {
+        if let Some(spec) = &self.settings.remote_worktree {
+            let branch = spec
+                .branch_name
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("自动命名");
+            format!("新 Worktree：{branch}").into()
+        } else if let Some(id) = self.settings.remote_workspace_id.as_deref() {
+            let title = self
+                .remote_state
+                .workspace_choices
+                .iter()
+                .find(|w| w["id"] == id)
+                .and_then(|w| w["title"].as_str())
+                .unwrap_or(id);
+            format!("加入：{title}").into()
+        } else if let Some(wt_cwd) = self.settings.worktree_cwd.as_deref() {
+            let host_path = monocode_core::remote::parse_remote_path(wt_cwd)
+                .map(|r| r.host_path)
+                .unwrap_or_else(|| wt_cwd.to_owned());
+            let trimmed = host_path.trim_end_matches('/');
+            let branch = self
+                .remote_state
+                .worktree_info
+                .as_ref()
+                .and_then(|info| info["worktrees"].as_array())
+                .and_then(|list| {
+                    list.iter().find(|w| {
+                        w["path"]
+                            .as_str()
+                            .is_some_and(|p| p.trim_end_matches('/') == trimmed)
+                    })
+                })
+                .and_then(|w| w["branchName"].as_str())
+                .filter(|s| !s.trim().is_empty());
+            let label = branch.unwrap_or_else(|| {
+                Path::new(trimmed)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(trimmed)
+            });
+            format!("Worktree：{label}").into()
+        } else {
+            "新建独立工作区".into()
+        }
+    }
+    pub(super) fn paseo_workspace_menu_items(
+        &self,
+        events: &mut Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<MenuItem> {
+        let is_new_default = self.settings.remote_workspace_id.is_none()
+            && self.settings.remote_worktree.is_none()
+            && self.settings.worktree_cwd.is_none();
+        let mut items = vec![
+            MenuItem::Header("Paseo 工作区归属".into()),
+            MenuAction::new("workspace:paseo:new", "新建独立工作区")
+                .description("创建新的独立对话，不作为当前对话的子任务")
+                .icon("folder")
+                .checked(is_new_default)
+                .into(),
+        ];
+        if self.remote_state.capabilities.contains("paseo.worktrees") {
+            let is_git_repo = self
+                .remote_state
+                .worktree_info
+                .as_ref()
+                .and_then(|info| info["isGitRepo"].as_bool())
+                .unwrap_or(true);
+            let form = cx.new(|cx| {
+                PaseoWorktreeForm::new(
+                    self.remote_state.worktree_info.as_ref(),
+                    self.settings.remote_worktree.as_ref(),
+                    cx,
+                )
+            });
+            *self.remote_state.worktree_form.borrow_mut() = Some(form.downgrade());
+            events.push(cx.subscribe_in(
+                &form,
+                window,
+                |this, _, event: &PaseoWorktreeEvent, window, cx| match event {
+                    PaseoWorktreeEvent::Confirmed(spec) => {
+                        this.apply_paseo_worktree_spec(spec.clone(), cx);
+                        this.close_menu(window, cx);
+                    }
+                },
+            ));
+            let focus = form.read(cx).focus(cx);
+            items.push(
+                MenuAction::new(
+                    "workspace:paseo:new-worktree",
+                    crate::i18n::t("新建 Paseo Git Worktree…"),
+                )
+                .description(if is_git_repo {
+                    "由 Paseo 创建并管理独立 Git Worktree 分支"
+                } else {
+                    "当前项目不是 Git 仓库"
+                })
+                .icon("folder-tree")
+                .disabled(!is_git_repo)
+                .checked(self.settings.remote_worktree.is_some())
+                .flyout(Flyout {
+                    view: form.into(),
+                    width: 280.,
+                    padding: 10.,
+                    height: None,
+                    max_height: Some(320.),
+                    focus: Some(focus),
+                    surface: None,
+                })
+                .into(),
+            );
+        }
+        let non_primary_worktrees: Vec<&Value> = self
+            .remote_state
+            .worktree_info
+            .as_ref()
+            .and_then(|info| info["worktrees"].as_array())
+            .into_iter()
+            .flatten()
+            .filter(|w| w["containsCwd"].as_bool() != Some(true) && w["path"].as_str().is_some())
+            .collect();
+        if !non_primary_worktrees.is_empty() {
+            items.push(MenuItem::Separator);
+            items.push(MenuItem::Header(crate::i18n::t("已有 Git Worktree").into()));
+            let selected_host_path = self
+                .settings
+                .worktree_cwd
+                .as_deref()
+                .and_then(monocode_core::remote::parse_remote_path)
+                .map(|r| r.host_path);
+            for wt in non_primary_worktrees {
+                let Some(path) = wt["path"].as_str() else {
+                    continue;
+                };
+                let branch = wt["branchName"].as_str().filter(|s| !s.trim().is_empty());
+                let label = branch.unwrap_or(path).to_owned();
+                let checked = self.settings.remote_worktree.is_none()
+                    && self.settings.remote_workspace_id.is_none()
+                    && selected_host_path
+                        .as_deref()
+                        .is_some_and(|p| p.trim_end_matches('/') == path.trim_end_matches('/'));
+                let mut action =
+                    MenuAction::new(format!("workspace:paseo:worktree-path:{path}"), label)
+                        .description(path.to_owned())
+                        .icon("folder-tree")
+                        .checked(checked);
+                if wt["workspaceId"].as_str().is_some() {
+                    action = action.badge(crate::i18n::t("已有工作区"));
+                }
+                items.push(action.into());
+            }
+        }
+        if !self.remote_state.workspace_choices.is_empty() {
+            items.push(MenuItem::Separator);
+            items.push(MenuItem::Header("加入已有工作区（同项目）".into()));
+            for workspace in &self.remote_state.workspace_choices {
+                let Some(id) = workspace["id"].as_str() else {
+                    continue;
+                };
+                let cwd = workspace["cwd"].as_str().unwrap_or(id);
+                let enriched = self
+                    .remote_state
+                    .worktree_info
+                    .as_ref()
+                    .and_then(|info| info["workspaces"].as_array())
+                    .and_then(|list| list.iter().find(|w| w["id"].as_str() == Some(id)));
+                let branch = workspace["branch"]
+                    .as_str()
+                    .or_else(|| enriched.and_then(|w| w["branch"].as_str()))
+                    .filter(|s| !s.trim().is_empty());
+                let is_wt = workspace["isWorktree"].as_bool().unwrap_or(false)
+                    || enriched
+                        .and_then(|w| w["isWorktree"].as_bool())
+                        .unwrap_or(false);
+                let description = match branch {
+                    Some(b) => format!("{b} · {cwd}"),
+                    None => cwd.to_owned(),
+                };
+                items.push(
+                    MenuAction::new(
+                        format!("workspace:paseo:existing:{id}"),
+                        workspace["title"].as_str().unwrap_or(id).to_owned(),
+                    )
+                    .description(description)
+                    .icon(if is_wt { "folder-tree" } else { "folder" })
+                    .checked(self.settings.remote_workspace_id.as_deref() == Some(id))
+                    .into(),
+                );
+            }
+        }
+        items
+    }
+    pub(super) fn paseo_workspace_choice(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.paseo_workspace_draft() {
+            self.status = "已有 Paseo 对话不能在这里变更工作区归属".into();
+            cx.notify();
+            return;
+        }
+        if id == "workspace:paseo:new" {
+            self.settings.remote_workspace_id = None;
+            self.settings.remote_worktree = None;
+            self.settings.new_worktree = false;
+            self.settings.worktree_cwd = None;
+            self.settings.worktree_removed = false;
+        } else if id == "workspace:paseo:new-worktree" {
+            if self
+                .remote_state
+                .worktree_info
+                .as_ref()
+                .is_some_and(|info| info["isGitRepo"] == false)
+            {
+                self.status = "当前 Paseo 项目不是 Git 仓库，无法创建 Git Worktree".into();
+                cx.notify();
+                return;
+            }
+            let base_branch = self
+                .remote_state
+                .worktree_info
+                .as_ref()
+                .and_then(|info| info["currentBranch"].as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned);
+            self.settings.remote_worktree = Some(monocode_core::agent::RemoteWorktreeSpec {
+                action: "branch-off".into(),
+                branch_name: None,
+                base_branch: base_branch.clone(),
+                ref_name: base_branch,
+            });
+            self.settings.remote_workspace_id = None;
+            self.settings.new_worktree = false;
+            self.settings.worktree_cwd = None;
+            self.settings.worktree_removed = false;
+        } else if let Some(path) = id.strip_prefix("workspace:paseo:worktree-path:") {
+            let valid = self
+                .remote_state
+                .worktree_info
+                .as_ref()
+                .and_then(|info| info["worktrees"].as_array())
+                .is_some_and(|list| {
+                    list.iter().any(|w| {
+                        w["path"]
+                            .as_str()
+                            .is_some_and(|p| p.trim_end_matches('/') == path.trim_end_matches('/'))
+                    })
+                });
+            if !valid {
+                self.status = "所选 Git Worktree 不存在或不属于当前项目".into();
+                cx.notify();
+                return;
+            }
+            let Some(project_remote) = monocode_core::remote::parse_remote_path(&self.summary.cwd)
+            else {
+                return;
+            };
+            self.settings.worktree_cwd = Some(monocode_core::remote::remote_path(
+                &project_remote.environment_id,
+                path,
+            ));
+            self.settings.remote_workspace_id = None;
+            self.settings.remote_worktree = None;
+            self.settings.new_worktree = false;
+            self.settings.worktree_removed = false;
+        } else if let Some(workspace) = id.strip_prefix("workspace:paseo:existing:") {
+            if !self
+                .remote_state
+                .workspace_choices
+                .iter()
+                .any(|w| w["id"] == workspace)
+            {
+                self.status = "所选 Paseo 工作区已不可用，请重新打开新建页".into();
+                cx.notify();
+                return;
+            }
+            self.settings.remote_workspace_id = Some(workspace.to_owned());
+            self.settings.remote_worktree = None;
+            self.settings.new_worktree = false;
+            self.settings.worktree_cwd = None;
+            self.settings.worktree_removed = false;
+        } else {
+            return;
+        }
+        self.save_settings(cx);
         cx.notify();
     }
 }

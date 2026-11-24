@@ -698,11 +698,20 @@ pub(crate) fn run_with_client(
                 create["runtimeMode"] = json!(settings.access.id());
                 if binding.project.project_id.starts_with("paseo:") {
                     create["firstAgentContext"] = json!({"prompt":prompt,"attachments":[]});
-                    if let Some(workspace) = &settings.remote_workspace_id {
+                    if let Some(wt) = &settings.remote_worktree {
+                        create["worktree"] = serde_json::to_value(wt)
+                            .map_err(|e| format!("Invalid Paseo worktree spec: {e}"))?;
+                    } else if let Some(workspace) = &settings.remote_workspace_id {
                         create["workspaceId"] = json!(workspace);
+                    } else if let Some(path) = &settings.worktree_cwd {
+                        let remote = monocode_core::remote::parse_remote_path(path)
+                            .ok_or("Invalid remote worktree")?;
+                        if remote.environment_id != binding.project.environment_id {
+                            return Err("Worktree belongs to another machine".into());
+                        }
+                        create["worktreeCwd"] = json!(remote.host_path);
                     }
-                }
-                if let Some(path) = &settings.worktree_cwd {
+                } else if let Some(path) = &settings.worktree_cwd {
                     let remote = monocode_core::remote::parse_remote_path(path)
                         .ok_or("Invalid remote worktree")?;
                     if remote.environment_id != binding.project.environment_id {

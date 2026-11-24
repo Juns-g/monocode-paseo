@@ -2194,5 +2194,14 @@
   "Clear notes": "清空批注",
   "Remove note": "移除批注",
   "Expand review notes": "展开评审批注",
-  "Collapse review notes": "收起评审批注"
+  "Collapse review notes": "收起评审批注",
+  "新建 Paseo Git Worktree…": "新建 Paseo Git Worktree…",
+  "新建 Paseo Git Worktree": "新建 Paseo Git Worktree",
+  "新分支名称（可选）": "新分支名称（可选）",
+  "留空由 Paseo 自动命名，如 feat/login": "留空由 Paseo 自动命名，如 feat/login",
+  "基线分支": "基线分支",
+  "已有 Git Worktree": "已有 Git Worktree",
+  "已有工作区": "已有工作区",
+  "自动命名": "自动命名",
+  "确定": "确定"
 }

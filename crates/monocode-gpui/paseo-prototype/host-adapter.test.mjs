@@ -1002,3 +1002,100 @@ test('non-image, incomplete, unsupported and steer attachments never reach the d
   assert.equal(f.events.sends,0);f.close();
 });
 }
+
+// F6: Paseo worktrees discovery, creation and reuse
+test('paseo.worktrees is advertised, merges checkout worktrees/branches/workspaces and handles non-git directories gracefully',async()=>{
+  const f=fixture();try{
+    f.a.cwd=f.directory;f.e.project.checkout.cwd=f.directory;
+    f.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+    const caps=(await f.host.request('environment.describe',{})).result.capabilities;
+    assert.ok(caps.includes('paseo.worktrees'));
+    const wtDir=join(f.directory,'wt-feature');mkdirSync(wtDir);
+    f.client.listCheckoutWorktrees=async()=>[
+      {path:f.directory,branchName:'main',head:'aaa',createdAt:'2026-10-25T00:00:00Z',containsCwd:true},
+      {path:wtDir,branchName:'feat/wt',head:'bbb',createdAt:'2026-10-26T00:00:00Z',containsCwd:false},
+    ];
+    f.client.getPaseoWorktreeList=async()=>({worktrees:[{worktreePath:wtDir}]});
+    f.client.getBranchSuggestions=async()=>({branches:['main','feat/wt','release']});
+    const info=(await f.host.request('paseo.worktrees',{projectId:'paseo:'+f.directory})).result;
+    assert.equal(info.isGitRepo,true);assert.equal(info.currentBranch,'main');
+    assert.deepEqual(info.branches,['main','feat/wt','release']);
+    assert.equal(info.worktrees.length,2);
+    assert.equal(info.worktrees[0].workspaceId,'w');assert.equal(info.worktrees[0].containsCwd,true);
+    assert.equal(info.worktrees[1].isPaseoOwned,true);assert.equal(info.worktrees[1].workspaceId,null);
+    f.client.listCheckoutWorktrees=async()=>{throw Error('not a git repo');};
+    f.client.getPaseoWorktreeList=async()=>({worktrees:[],error:'not a git repo'});
+    f.client.getBranchSuggestions=async()=>({branches:[],error:'not a git repo'});
+    const plain=(await f.host.request('paseo.worktrees',{projectId:'paseo:'+f.directory})).result;
+    assert.equal(plain.isGitRepo,false);assert.deepEqual(plain.worktrees,[]);assert.deepEqual(plain.branches,[]);
+  }finally{f.close();}
+});
+
+test('create with worktree delegates to Paseo createWorkspace(kind: worktree), binds workspaceDirectory to agent cwd, and preserves Attempts no-replay',async()=>{
+  const f=fixture();try{
+    f.a.cwd=f.directory;f.e.project.checkout.cwd=f.directory;
+    const wtDir=join(f.directory,'paseo-wt-feat');mkdirSync(wtDir);
+    f.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+    f.client.listProviderModels=async()=>({models:[{provider:'hermes',id:'m',label:'M'}]});
+    f.client.listProviderModes=async()=>({modes:[{id:'dont_ask'}]});f.client.listProviderFeatures=async()=>({features:[]});
+    let workspaceCalls=0,agentCalls=0,wsOpts,agOpts;
+    f.client.createWorkspace=async o=>{
+      workspaceCalls++;wsOpts=o;
+      return {workspace:{id:'ws-wt-1',name:'feat/wt',workspaceKind:'worktree',worktreeSlug:'feat-wt',workspaceDirectory:wtDir},error:null};
+    };
+    f.client.createAgent=async o=>{
+      agentCalls++;agOpts=o;
+      return {...f.a,id:o.agentId,workspaceId:o.workspaceId,cwd:o.config.cwd};
+    };
+    const create={type:'create',commandId:'wt-create-1',projectId:'paseo:'+f.directory,harness:'hermes',model:'hermes:m',
+      worktree:{action:'branch-off',branchName:'feat/wt',baseBranch:'main'},
+      firstAgentContext:{prompt:'Build worktree flow',attachments:[]}};
+    const receipt=await f.host.command(create);
+    assert.equal(workspaceCalls,1);assert.equal(agentCalls,1);
+    assert.deepEqual(wsOpts.source,{kind:'worktree',cwd:f.directory,action:'branch-off',branchName:'feat/wt',baseBranch:'main',refName:'main'});
+    assert.deepEqual(wsOpts.firstAgentContext,{prompt:'Build worktree flow',attachments:[]});
+    assert.equal(wsOpts.idempotencyKey,'wt-create-1');
+    assert.equal(agOpts.workspaceId,'ws-wt-1');assert.equal(agOpts.config.cwd,wtDir);
+    assert.equal(agOpts.idempotencyKey,'wt-create-1:agent');
+    assert.equal(f.host.entries.get(receipt.sessionId).agent.cwd,wtDir);
+    assert.deepEqual(await f.host.command(create),receipt);
+    assert.equal(workspaceCalls,1);assert.equal(agentCalls,1);
+    f.client.createWorkspace=async()=>{workspaceCalls++;throw Error('lost worktree create ack');};
+    const lost={...create,commandId:'wt-create-lost'};
+    await assert.rejects(f.host.command(lost),/lost worktree create ack/);
+    const restored=new PaseoHost(f.client,f.directory);restored.connected=true;
+    await assert.rejects(restored.command(lost),/No replay/);
+    assert.equal(workspaceCalls,2);
+  }finally{f.close();}
+});
+
+test('create rejects invalid branch names, conflicting workspaceId+worktree, or unverified worktreeCwd with zero mutations and accepts verified worktreeCwd',async()=>{
+  const f=fixture();try{
+    f.a.cwd=f.directory;f.e.project.checkout.cwd=f.directory;
+    const verifiedWt=join(f.directory,'existing-wt');mkdirSync(verifiedWt);
+    const unverifiedDir=join(f.directory,'not-a-wt');mkdirSync(unverifiedDir);
+    f.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+    f.client.listProviderModels=async()=>({models:[{provider:'hermes',id:'m',label:'M'}]});
+    f.client.listProviderModes=async()=>({modes:[{id:'dont_ask'}]});f.client.listProviderFeatures=async()=>({features:[]});
+    f.client.listCheckoutWorktrees=async()=>[
+      {path:f.directory,branchName:'main',containsCwd:true},
+      {path:verifiedWt,branchName:'feat/existing',containsCwd:false},
+    ];
+    let mutations=0,wsOpts,agOpts;
+    f.client.createWorkspace=async o=>{mutations++;wsOpts=o;return {workspace:{id:'ws-existing-wt',name:'Existing wt',workspaceKind:'directory',workspaceDirectory:o.source.path},error:null};};
+    f.client.createAgent=async o=>{mutations++;agOpts=o;return {...f.a,id:o.agentId,workspaceId:o.workspaceId,cwd:o.config.cwd};};
+    const base={type:'create',projectId:'paseo:'+f.directory,harness:'hermes',model:'hermes:m'};
+    await assert.rejects(f.host.command({...base,commandId:'bad-1',worktree:{action:'branch-off',branchName:'../bad'}}),/分支名称格式无效/);
+    await assert.rejects(f.host.command({...base,commandId:'bad-2',worktree:{action:'branch-off',branchName:'foo bar'}}),/分支名称格式无效/);
+    await assert.rejects(f.host.command({...base,commandId:'bad-3',workspaceId:'w',worktree:{action:'branch-off'}}),/不能同时指定/);
+    await assert.rejects(f.host.command({...base,commandId:'bad-4',worktreeCwd:verifiedWt,worktree:{action:'branch-off'}}),/不能同时指定/);
+    await assert.rejects(f.host.command({...base,commandId:'bad-5',worktreeCwd:unverifiedDir}),/不属于该项目的 Git worktree/);
+    assert.equal(mutations,0);
+    const receipt=await f.host.command({...base,commandId:'good-existing-wt',worktreeCwd:verifiedWt});
+    assert.equal(mutations,2);
+    assert.deepEqual(wsOpts.source,{kind:'directory',path:verifiedWt});
+    assert.equal(agOpts.config.cwd,verifiedWt);
+    assert.equal(f.host.entries.get(receipt.sessionId).agent.cwd,verifiedWt);
+  }finally{f.close();}
+});
+

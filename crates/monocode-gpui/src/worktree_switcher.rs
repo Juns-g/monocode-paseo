@@ -229,7 +229,9 @@ impl WorktreeSwitcher {
         self.search.read(cx).content.trim().to_owned()
     }
     fn can_create(&self, cx: &gpui::App) -> bool {
-        self.state.is_some()
+        !crate::paseo_host::active()
+            && !self.cwd.starts_with("remote://")
+            && self.state.is_some()
             && self.load_error.is_none()
             && !self.query(cx).is_empty()
             && rows(&self.cwd, self.state.as_ref(), &self.query(cx)).is_empty()
@@ -794,5 +796,41 @@ mod tests {
         visual.simulate_input("new-copy");
         visual.run_until_parked();
         assert!(visual.debug_bounds("create-sidebar-worktree").is_some());
+    }
+    #[gpui::test]
+    fn remote_and_paseo_worktree_switcher_never_allows_local_git_worktree_creation(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(input::bind);
+        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    WorktreeSwitcher::new(
+                        "remote://paseo-env/repo/project".into(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        store,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.state = Some(snapshot());
+                view.load_error = None;
+                view.error = None;
+                view.search
+                    .update(cx, |input, cx| input.set_text("new-branch".into(), cx));
+                assert!(!view.can_create(cx));
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("create-sidebar-worktree").is_none());
     }
 }

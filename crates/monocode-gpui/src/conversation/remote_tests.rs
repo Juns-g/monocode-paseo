@@ -1480,7 +1480,8 @@ fn paseo_composer_add_menu_allows_image_upload_and_keeps_access_plan_draft_block
 
 #[gpui::test]
 fn paseo_rejects_non_image_attachments_on_add_and_send(cx: &mut TestAppContext) {
-    let dir = std::env::temp_dir().join(format!("paseo-attach-ui-{}", monocode_core::mono::new_id()));
+    let dir =
+        std::env::temp_dir().join(format!("paseo-attach-ui-{}", monocode_core::mono::new_id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (png, pdf, txt) = (dir.join("a.png"), dir.join("b.pdf"), dir.join("c.txt"));
     for path in [&png, &pdf, &txt] {
@@ -1710,4 +1711,187 @@ fn paseo_sends_image_attachment_over_real_transport_including_image_only(cx: &mu
     }
     cx.update(|cx| assert!(!view.read(cx).remote_state.pending));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+fn paseo_draft_worktree_menu_flyout_pill_and_send_guard_never_invoke_local_prepare_worktree(
+    cx: &mut TestAppContext,
+) {
+    let worktree_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wt_counter = worktree_requests.clone();
+    let host = crate::runtime::remote::TestHost::with_capabilities(
+        vec!["paseo.configure", "paseo.workspaces", "paseo.worktrees"],
+        move |request| match request["method"].as_str().unwrap() {
+            "paseo.workspaces" => {
+                Some(json!([{"id":"ws-1","title":"Existing task","cwd":"/repo"}]))
+            }
+            "paseo.worktrees" => {
+                wt_counter.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(request["params"]["projectId"], "paseo:/repo");
+                Some(json!({
+                    "projectId": "paseo:/repo",
+                    "isGitRepo": true,
+                    "currentBranch": "main",
+                    "branches": ["main", "develop"],
+                    "worktrees": [
+                        {
+                            "path": "/repo",
+                            "branchName": "main",
+                            "containsCwd": true,
+                            "isPaseoOwned": false,
+                            "workspaceId": "ws-1"
+                        },
+                        {
+                            "path": "/repo-wt/feat-existing",
+                            "branchName": "feat/existing",
+                            "containsCwd": false,
+                            "isPaseoOwned": true,
+                            "workspaceId": null
+                        }
+                    ],
+                    "workspaces": [
+                        {"id":"ws-1","title":"Existing task","cwd":"/repo","branch":"main","isWorktree":false}
+                    ]
+                }))
+            }
+            other => panic!("unexpected method: {other}"),
+        },
+    );
+
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let project = store
+        .remember_remote_project("env", &json!({"id":"paseo:/repo","cwd":"/repo"}))
+        .unwrap();
+    let summary = store.create("codex", &project.key).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let window = cx.open_window(Default::default(), |_, cx| {
+        let mut view = Conversation::new(summary, store.clone(), cx);
+        view.remote_state.client = Some(host.client.clone());
+        view.input
+            .update(cx, |input, cx| input.set_text("Build F6".into(), cx));
+        view
+    });
+    window.update(cx, |view, _, cx| view.load(cx)).unwrap();
+    cx.run_until_parked();
+
+    // 1. Verify remote_send_guard never invokes local prepare_worktree in Paseo mode even if new_worktree is true.
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.loaded);
+            assert!(view.paseo_workspace_draft());
+            view.settings.new_worktree = true;
+            view.settings.worktree_cwd = None;
+            assert!(!view.remote_send_guard(cx));
+            assert!(!view.preparing_worktree);
+            view.settings.new_worktree = false;
+            assert_eq!(view.paseo_workspace_pill_label().as_ref(), "新建独立工作区");
+        })
+        .unwrap();
+
+    // 2. Opening ComposerMenu::Workspace lazily fetches paseo.worktrees once (and caches within 10s).
+    window
+        .update(cx, |view, window, cx| {
+            view.toggle_menu(ComposerMenu::Workspace, window, cx);
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if cx.update(|cx| {
+            window
+                .read(cx)
+                .unwrap()
+                .remote_state
+                .worktree_info
+                .is_some()
+        }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(worktree_requests.load(Ordering::Relaxed), 1);
+
+    // Re-open menu so items include the loaded worktrees & branches; cached info avoids a second RPC.
+    window
+        .update(cx, |view, window, cx| {
+            view.close_menu(window, cx);
+            view.toggle_menu(ComposerMenu::Workspace, window, cx);
+            let actions = menu_action_ids(view, ComposerMenu::Workspace, window, cx);
+            assert!(actions.contains(&"workspace:paseo:new".to_owned()));
+            assert!(actions.contains(&"workspace:paseo:new-worktree".to_owned()));
+            assert!(
+                actions
+                    .contains(&"workspace:paseo:worktree-path:/repo-wt/feat-existing".to_owned())
+            );
+            assert!(actions.contains(&"workspace:paseo:existing:ws-1".to_owned()));
+
+            // 3. Interact with the PaseoWorktreeForm flyout.
+            let menu = view.menu.as_ref().unwrap().menu.clone();
+            let flyout = menu.read(cx).test_flyout("workspace:paseo:new-worktree");
+            let form: Entity<super::PaseoWorktreeForm> = flyout.downcast().unwrap();
+            form.update(cx, |form, cx| {
+                assert_eq!(form.base_branch.as_deref(), Some("main"));
+                assert_eq!(form.branches, vec!["main", "develop"]);
+                // Invalid branch name is rejected in the form without closing.
+                form.branch_input
+                    .update(cx, |input, cx| input.set_text("../bad".into(), cx));
+                assert!(!form.confirm(cx));
+                assert!(form.error.is_some());
+
+                // Valid branch name + base branch confirms and updates settings + pill label.
+                form.branch_input
+                    .update(cx, |input, cx| input.set_text("feat/f6-branch".into(), cx));
+                form.base_branch = Some("develop".into());
+                assert!(form.confirm(cx));
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(
+                view.settings.remote_worktree,
+                Some(monocode_core::agent::RemoteWorktreeSpec {
+                    action: "branch-off".into(),
+                    branch_name: Some("feat/f6-branch".into()),
+                    base_branch: Some("develop".into()),
+                    ref_name: Some("develop".into()),
+                })
+            );
+            assert!(view.settings.remote_workspace_id.is_none());
+            assert!(view.settings.worktree_cwd.is_none());
+            assert_eq!(
+                view.paseo_workspace_pill_label().as_ref(),
+                "新 Worktree：feat/f6-branch"
+            );
+
+            // 4. Direct quick-action with empty branch name uses auto-naming pill label.
+            view.menu_choice("workspace:paseo:new-worktree", cx);
+            assert_eq!(
+                view.paseo_workspace_pill_label().as_ref(),
+                "新 Worktree：自动命名"
+            );
+
+            // 5. Selecting an existing Git worktree path sets worktree_cwd and clears remote_worktree.
+            view.menu_choice("workspace:paseo:worktree-path:/repo-wt/feat-existing", cx);
+            assert!(view.settings.remote_worktree.is_none());
+            assert!(view.settings.remote_workspace_id.is_none());
+            assert_eq!(
+                view.settings.worktree_cwd.as_deref(),
+                Some("remote://env/repo-wt/feat-existing")
+            );
+            assert_eq!(
+                view.paseo_workspace_pill_label().as_ref(),
+                "Worktree：feat/existing"
+            );
+
+            // 6. Switching back to "新建独立工作区" resets all worktree/workspace fields cleanly.
+            view.menu_choice("workspace:paseo:new", cx);
+            assert!(view.settings.remote_worktree.is_none());
+            assert!(view.settings.remote_workspace_id.is_none());
+            assert!(view.settings.worktree_cwd.is_none());
+            assert_eq!(view.paseo_workspace_pill_label().as_ref(), "新建独立工作区");
+        })
+        .unwrap();
+    assert_eq!(worktree_requests.load(Ordering::Relaxed), 1);
 }
