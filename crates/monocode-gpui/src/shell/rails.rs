@@ -171,7 +171,8 @@ impl Shell {
                     cx.stop_propagation();
                     this.rails.paseo_disclosures.insert(id, !open);
                     if open && let Some(children) = this.rails.started.get(&id) {
-                        this.selected_sessions.retain(|child| !children.contains(child));
+                        this.selected_sessions
+                            .retain(|child| !children.contains(child));
                     }
                     this.notify_sidebar(cx);
                 }))

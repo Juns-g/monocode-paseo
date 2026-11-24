@@ -9,6 +9,7 @@ publish = false
 serde.workspace = true
 serde_json.workspace = true
 monocode-core = { path = "../monocode-core" }
+log = "0.4"
 pulldown-cmark = "0.13.5"
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
@@ -54,6 +55,7 @@ qrcode = { version = "0.14", default-features = false }
 embed-resource = "3"
 
 [dev-dependencies]
+rusqlite.workspace = true
 gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false, features = ["test-support"] }
 
 # The vendored renderer's backdrop-blur marker for frosted popovers.

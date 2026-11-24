@@ -25,8 +25,11 @@ import {
   isImage,
   MAX_ATTACHMENTS,
   merge,
+  pasteImage,
   pickFiles,
   pickPhotos,
+  restore,
+  watchClipboardImage,
   type Attachment,
 } from "./attachments";
 import { DictationBar } from "./DictationBar";
@@ -38,6 +41,7 @@ import { COMPOSER_INPUT_ID } from "./SessionScreen";
 export const COMPOSER_PLACEHOLDER = "Plan, ask, build…";
 /** Mid-turn the desktop steers with the message or queues it, as its setting says. */
 const BUSY_PLACEHOLDER = "Send a follow-up…";
+const OFFLINE_PLACEHOLDER = "Reconnecting to desktop…";
 
 const BUTTON = 36;
 /** Gap between the round buttons and the composer's edge. */
@@ -124,13 +128,27 @@ export function Composer({
   const colors = useColors();
   const styles = useStyles();
   const offline = useOffline();
-  const blocked = offline ? "offline" : notice ? "error" : null;
+  // Losing the desktop holds back only what needs it, Send and Stop; the
+  // person can keep writing. An error waits until it's back.
+  const blocked = !offline && !!notice;
   const input = useRef<TextInput>(null);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  // What's held as of now, not as of the last render: picks can overlap (a
+  // paste waiting on iOS's prompt, then another), and each must add to the
+  // other's result rather than to the list its menu was opened with.
+  const held = useRef<Attachment[]>([]);
+  const hold = (next: (current: Attachment[]) => Attachment[]) => {
+    held.current = next(held.current);
+    setAttachments(held.current);
+  };
   const [inputHeight, setInputHeight] = useState(INPUT_MIN);
   const [dictating, setDictating] = useState(false);
+  // A copied screenshot or photo: the add menu offers to paste it, as
+  // React Native's field pastes only text.
+  const [clipboardImage, setClipboardImage] = useState(false);
+  useEffect(() => watchClipboardImage(setClipboardImage), []);
   // Where dictated words go: the cursor, or the selection they replace.
   const selection = useRef({ start: 0, end: 0 });
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !sending;
@@ -257,16 +275,19 @@ export function Composer({
   };
 
   const attach = async (pick: (room: number) => Promise<Attachment[]>) => {
-    const room = MAX_ATTACHMENTS - attachments.length;
-    if (room <= 0) {
+    const limit = () =>
       Alert.alert("Attachment limit", `A message can carry up to ${MAX_ATTACHMENTS} files.`);
-      return;
-    }
+    const room = MAX_ATTACHMENTS - held.current.length;
+    if (room <= 0) return limit();
     try {
       const picked = await pick(room);
       if (!picked.length) return;
-      // Merged here, not in an updater, so its size error lands in the catch.
-      setAttachments(merge(attachments, picked));
+      // Into what's held now, which another pick may have added to meanwhile;
+      // merged outside the update so its size error lands in the catch.
+      const current = held.current;
+      const next = merge(current, picked);
+      hold(() => next);
+      if (next.length < current.length + picked.length) limit();
       // Ready to say what they're for.
       input.current?.focus();
     } catch (reason) {
@@ -279,12 +300,12 @@ export function Composer({
   // message, as a messaging app; a session's card lets go of it.
   const send = async () => {
     // The draft stays put until the desktop can take it.
-    if (!canSend || blocked) return;
+    if (!canSend || blocked || offline) return;
     const message = text.trim();
-    const files = attachments;
+    const files = held.current;
     setSending(true);
     setText("");
-    setAttachments([]);
+    hold(() => []);
     morph(false);
     if (!compact) {
       focused.set(false);
@@ -294,8 +315,22 @@ export function Composer({
       await onSend(message, files);
     } catch (reason) {
       setText((current) => current || message);
-      setAttachments((current) => (current.length ? current : files));
-      Alert.alert("Message not sent", reason instanceof Error ? reason.message : String(reason));
+      // Back with anything pasted or picked while it was sending, not instead of it.
+      let dropped: Attachment[] = [];
+      hold((current) => {
+        const restored = restore(files, current);
+        dropped = restored.dropped;
+        return restored.kept;
+      });
+      const why = reason instanceof Error ? reason.message : String(reason);
+      Alert.alert(
+        "Message not sent",
+        dropped.length
+          ? `${why}\n\nA message can carry up to ${MAX_ATTACHMENTS} files within its size limit, so ` +
+              `${dropped.map((attachment) => attachment.name).join(", ")}, added while it was sending, ` +
+              `${dropped.length === 1 ? "was" : "were"} removed.`
+          : why,
+      );
     } finally {
       setSending(false);
     }
@@ -352,7 +387,7 @@ export function Composer({
                 key={attachment.id}
                 attachment={attachment}
                 onRemove={() =>
-                  setAttachments((current) => current.filter((item) => item.id !== attachment.id))
+                  hold((current) => current.filter((item) => item.id !== attachment.id))
                 }
               />
             ))}
@@ -386,7 +421,7 @@ export function Composer({
               ),
             )
           }
-          placeholder={busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER}
+          placeholder={offline ? OFFLINE_PLACEHOLDER : busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER}
           placeholderTextColor={colors.muted}
           multiline
           keyboardAppearance={scheme}
@@ -394,21 +429,7 @@ export function Composer({
           selectionColor={colors.accent}
           style={[styles.input, blocked && styles.hidden]}
         />
-        {blocked === "offline" ? (
-          <Animated.View
-            key="offline"
-            entering={FadeIn.duration(DICTATION_FADE.duration)}
-            exiting={FadeOut.duration(DICTATION_FADE.duration)}
-            accessibilityRole="text"
-            accessibilityLabel="Reconnecting to your desktop. Messages can't be sent until it's back."
-            style={styles.status}
-          >
-            <PulsingDot />
-            <Text style={styles.statusLabel} numberOfLines={1}>
-              Reconnecting to desktop
-            </Text>
-          </Animated.View>
-        ) : blocked === "error" && notice ? (
+        {blocked && notice ? (
           <Animated.View
             key="error"
             entering={FadeIn.duration(DICTATION_FADE.duration)}
@@ -437,6 +458,7 @@ export function Composer({
         style={[styles.button, styles.leading, undictated, blocked && styles.disabled]}
       >
         <AddMenu
+          onPaste={clipboardImage ? () => void attach(pasteImage) : undefined}
           onPhotos={() => void attach(pickPhotos)}
           onFiles={() => void attach(pickFiles)}
         />
@@ -481,14 +503,26 @@ export function Composer({
       >
         {/* A draft mid-turn sends; without one the button stops the turn. */}
         {canSend ? (
-          <RoundButton icon="send" label="Send" onPress={() => void send()} primary />
+          <RoundButton
+            icon="send"
+            label="Send"
+            hint={offline ? "Available once your desktop reconnects" : undefined}
+            onPress={() => void send()}
+            primary
+            disabled={offline}
+          />
         ) : busy && onStop ? (
-          <RoundButton label="Stop" onPress={() => { void onStop().catch(reason => Alert.alert("Could not stop", String(reason))); }} primary>
+          <RoundButton label="Stop" onPress={() => { void onStop().catch(reason => Alert.alert("Could not stop", String(reason))); }} primary disabled={offline}>
             <View style={styles.stop} />
           </RoundButton>
         ) : (
           <RoundButton icon="mic" label="Dictate" onPress={dictate} />
         )}
+        {offline && canSend ? (
+          <View pointerEvents="none" style={styles.sendStatus}>
+            <PulsingDot />
+          </View>
+        ) : null}
       </Animated.View>
 
       {dictating ? (
@@ -505,15 +539,25 @@ export function Composer({
 }
 
 /**
- * The add button: a native menu to attach photos or files. The menu lies
+ * The add button: a native menu to attach photos or files, or the
+ * clipboard's image when it holds one. The menu lies
  * over the button, its label an invisible box of the button's size, as in
  * SessionFilterMenu.
  */
-function AddMenu({ onPhotos, onFiles }: { onPhotos: () => void; onFiles: () => void }) {
+function AddMenu({
+  onPaste,
+  onPhotos,
+  onFiles,
+}: {
+  onPaste?: () => void;
+  onPhotos: () => void;
+  onFiles: () => void;
+}) {
   const styles = useStyles();
   const colors = useColors();
   if (Platform.OS === "android") return (
     <ChoiceMenu label="Add photos or files" actions={[
+      ...(onPaste ? [{ label: "Paste Image", icon: "copy" as const, onPress: onPaste }] : []),
       { label: "Photo Library", icon: "image", onPress: onPhotos },
       { label: "Files", icon: "folder", onPress: onFiles },
     ]}>
@@ -539,6 +583,9 @@ function AddMenu({ onPhotos, onFiles }: { onPhotos: () => void; onFiles: () => v
             </HStack>
           }
         >
+          {onPaste ? (
+            <Button label="Paste Image" systemImage="doc.on.clipboard" onPress={onPaste} />
+          ) : null}
           <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
           <Button label="Files" systemImage="folder" onPress={onFiles} />
         </Menu>
@@ -586,14 +633,18 @@ function AttachmentChip({
 function RoundButton({
   icon,
   label,
+  hint,
   onPress,
   primary = false,
+  disabled = false,
   children,
 }: {
   icon?: IconName;
   label: string;
+  hint?: string;
   onPress?: () => void;
   primary?: boolean;
+  disabled?: boolean;
   children?: ReactNode;
 }) {
   const colors = useColors();
@@ -602,12 +653,16 @@ function RoundButton({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={label}
+      accessibilityHint={hint}
+      accessibilityState={{ disabled }}
+      disabled={disabled}
       hitSlop={4}
       onPress={onPress}
       style={({ pressed }) => [
         styles.round,
         primary && styles.roundPrimary,
         pressed && styles.pressed,
+        disabled && styles.disabled,
       ]}
     >
       {children ??
@@ -817,6 +872,11 @@ const useStyles = themedStyles((colors) => ({
   },
   hidden: {
     opacity: 0,
+  },
+  sendStatus: {
+    position: "absolute",
+    top: 0,
+    right: 0,
   },
   disabled: {
     opacity: 0.4,

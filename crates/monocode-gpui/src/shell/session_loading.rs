@@ -134,6 +134,104 @@ pub(super) fn new_session_settings(
     settings
 }
 
+/// The user's defaults for a new session: provider, model, access, effort and
+/// account. Read on the UI thread, applied with the store in the background,
+/// so every way of starting a session (new tab, split) begins the same way.
+pub(super) struct NewSessionDefaults {
+    kind: Kind,
+    model: Option<String>,
+    verify_catalog: bool,
+    account: monocode_core::accounts::Profile,
+    access: monocode_core::agent::AccessMode,
+    effort: Option<String>,
+    preferences: crate::settings::Preferences,
+}
+
+impl NewSessionDefaults {
+    pub(super) fn read(
+        choice: super::new_chat_choice::NewChatChoice,
+        cwd: &str,
+        preferences: &crate::settings::Preferences,
+        cx: &App,
+    ) -> Self {
+        let super::new_chat_choice::NewChatChoice {
+            kind,
+            model,
+            verify_catalog,
+        } = choice;
+        let access = if crate::paseo_host::project_ui(preferences) {
+            monocode_core::agent::AccessMode::FullAccess
+        } else {
+            crate::conversation::default_access(cx)
+        };
+        Self {
+            kind,
+            model,
+            verify_catalog,
+            account: crate::accounts::get(cx)
+                .map(|center| center.read(cx).selected(kind, cwd))
+                .unwrap_or_default(),
+            access,
+            effort: crate::conversation::preferred_effort(kind.id(), cx),
+            preferences: preferences.clone(),
+        }
+    }
+
+    /// Create the session and save its starting settings.
+    pub(super) fn create(
+        self,
+        store: &monocode_core::store::Store,
+        cwd: &str,
+        worktree_cwd: Option<String>,
+    ) -> Result<(Session, monocode_core::agent::Settings), String> {
+        let Self {
+            kind,
+            mut model,
+            verify_catalog,
+            account,
+            access,
+            effort,
+            preferences,
+        } = self;
+        if verify_catalog {
+            model = super::new_chat_choice::fork::verified_model(cwd);
+        }
+        let preset = preferences.new_chat_preset(kind.id(), model.as_deref());
+        let summary = store.create(kind.id(), cwd)?;
+        let mut settings = new_session_settings(
+            store
+                .desktop_preferences()
+                .and_then(|preferences| preferences.session_defaults(kind.id(), cwd)),
+            model,
+        );
+        settings.access = access;
+        if let Some(effort) = effort {
+            settings.model_settings.retain(|key, _| {
+                !matches!(
+                    key.as_str(),
+                    "effort" | "reasoning" | "reasoningEffort" | "reasoning_effort"
+                )
+            });
+            settings.effort = Some(effort);
+        }
+        settings.account = account;
+        settings.worktree_cwd = worktree_cwd;
+        if let Some(preset) = preset {
+            preset.apply(&mut settings)?;
+        }
+        if settings.model.is_some()
+            || settings.effort.is_some()
+            || !settings.model_settings.is_empty()
+            || settings.worktree_cwd.is_some()
+            || settings.account.id != monocode_core::accounts::DEFAULT
+            || access != Default::default()
+        {
+            store.save_agent_settings(summary.id, &settings)?;
+        }
+        Ok((summary, settings))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

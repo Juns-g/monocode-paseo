@@ -683,7 +683,8 @@ test('Paseo bucket changes are volatile and entered time stays stable within a b
  f.a.status='running';f.a.activeTurn={turnId:'synthetic'};await f.host.directory(true);
  const running=(await query()).result;assert.equal(f.host.entries.get('a').paseoBucket,'running');
  assert.equal(before.structuralRevision,running.structuralRevision);
- f.a.status='error';await f.host.directory(true);assert.equal(f.host.entries.get('a').paseoBucket,'failed');
+ f.a.status='error';f.a.requiresAttention=true;f.a.attentionReason='error';await f.host.directory(true);assert.equal(f.host.entries.get('a').paseoBucket,'failed');
+ f.a.requiresAttention=false;await f.host.directory(true);assert.equal(f.host.entries.get('a').paseoBucket,'done');
  f.a.pendingPermissions=[{id:'permission'}];await f.host.directory(true);assert.equal(f.host.entries.get('a').paseoBucket,'needs_input');
  f.close();
 });

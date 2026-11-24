@@ -134,24 +134,30 @@ impl Store {
                     .or_insert(remote.summary.id);
             }
         }
-        let links: HashMap<_, _> = sessions.values().filter_map(|remote| {
-            let parent = remote.parent_session_id.as_ref()?;
-            let parent = ids.get(&(remote.project.environment_id.clone(), parent.clone()))?;
-            (*parent != remote.summary.id).then_some((remote.summary.id, *parent))
-        }).collect();
-        Ok(links.iter().filter_map(|(child, parent)| {
-            let mut seen = std::collections::HashSet::from([*child]);
-            let mut current = *parent;
-            loop {
-                if !seen.insert(current) {
-                    return None;
+        let links: HashMap<_, _> = sessions
+            .values()
+            .filter_map(|remote| {
+                let parent = remote.parent_session_id.as_ref()?;
+                let parent = ids.get(&(remote.project.environment_id.clone(), parent.clone()))?;
+                (*parent != remote.summary.id).then_some((remote.summary.id, *parent))
+            })
+            .collect();
+        Ok(links
+            .iter()
+            .filter_map(|(child, parent)| {
+                let mut seen = std::collections::HashSet::from([*child]);
+                let mut current = *parent;
+                loop {
+                    if !seen.insert(current) {
+                        return None;
+                    }
+                    match links.get(&current) {
+                        Some(parent) => current = *parent,
+                        None => return Some((*child, *parent)),
+                    }
                 }
-                match links.get(&current) {
-                    Some(parent) => current = *parent,
-                    None => return Some((*child, *parent)),
-                }
-            }
-        }).collect())
+            })
+            .collect())
     }
 
     /// Opt in only for daemon-authoritative, isolated clients.
@@ -674,8 +680,14 @@ impl Store {
             summary: summary.clone(),
             project: project.clone(),
             session_id: Some(host_id.into()),
-            parent_session_id: value.get("paseoParentAgentId")
-                .map(|parent| parent.as_str().filter(|id| !id.is_empty()).map(str::to_owned))
+            parent_session_id: value
+                .get("paseoParentAgentId")
+                .map(|parent| {
+                    parent
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                })
                 .unwrap_or_else(|| prior.as_ref().and_then(|r| r.parent_session_id.clone())),
             outbox: prior.as_ref().map(|r| r.outbox.clone()).unwrap_or_default(),
             uploads: prior
@@ -733,8 +745,13 @@ impl Store {
                 if block["role"] == "plan" {
                     block["nativeRemotePlan"] = Value::Bool(true);
                 }
-                let id = block["id"].as_str().map_or_else(|| format!("#{index}"), str::to_owned);
-                Ok((id, shared::blocks::project(std::slice::from_ref(&block))?.len()))
+                let id = block["id"]
+                    .as_str()
+                    .map_or_else(|| format!("#{index}"), str::to_owned);
+                Ok((
+                    id,
+                    shared::blocks::project(std::slice::from_ref(&block))?.len(),
+                ))
             })
             .collect()
     }
@@ -824,7 +841,10 @@ mod tests {
         assert_eq!(ids, ["u1", "a1", "draft", "p1", "u2"]);
         assert_eq!(layout[2].1, 0);
         let (history, _) = Store::project_remote_history(&value).unwrap();
-        assert_eq!(layout.iter().map(|(_, rows)| rows).sum::<usize>(), history.rows.len());
+        assert_eq!(
+            layout.iter().map(|(_, rows)| rows).sum::<usize>(),
+            history.rows.len()
+        );
         assert!(Store::remote_window_layout(&json!({})).is_err());
     }
     #[test]
@@ -836,16 +856,29 @@ mod tests {
         let mut child = snapshot("child");
         child["paseoParentAgentId"] = json!("parent");
         let parent = snapshot("parent");
-        let registered = store.sync_remote_summaries(&project, &[child.clone(), parent]).unwrap();
+        let registered = store
+            .sync_remote_summaries(&project, &[child.clone(), parent])
+            .unwrap();
         let (child_id, parent_id) = (registered[0].summary.id, registered[1].summary.id);
-        let links = store.session_sidebar_metadata(&[project.key.clone()]).started_by;
+        let links = store
+            .session_sidebar_metadata(&[project.key.clone()])
+            .started_by;
         assert_eq!(links.get(&child_id), Some(&parent_id));
         drop(store);
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.session_sidebar_metadata(&[project.key.clone()]).started_by.get(&child_id), Some(&parent_id));
+        assert_eq!(
+            store
+                .session_sidebar_metadata(&[project.key.clone()])
+                .started_by
+                .get(&child_id),
+            Some(&parent_id)
+        );
         child["paseoParentAgentId"] = Value::Null;
         store.register_remote_summary(&project, &child).unwrap();
-        assert!(!store.session_sidebar_metadata(&[project.key]).started_by.contains_key(&child_id));
+        assert!(!store
+            .session_sidebar_metadata(&[project.key])
+            .started_by
+            .contains_key(&child_id));
     }
 
     #[test]
@@ -856,10 +889,24 @@ mod tests {
         let mut child = snapshot("child");
         child["paseoParentAgentId"] = json!("parent");
         let child_id = store.register_remote_summary(&one, &child).unwrap().id;
-        store.register_remote_summary(&two, &snapshot("parent")).unwrap();
-        assert!(!store.session_sidebar_metadata(&[one.key.clone()]).started_by.contains_key(&child_id));
-        let parent_id = store.register_remote_summary(&one, &snapshot("parent")).unwrap().id;
-        assert_eq!(store.session_sidebar_metadata(&[one.key.clone()]).started_by.get(&child_id), Some(&parent_id));
+        store
+            .register_remote_summary(&two, &snapshot("parent"))
+            .unwrap();
+        assert!(!store
+            .session_sidebar_metadata(&[one.key.clone()])
+            .started_by
+            .contains_key(&child_id));
+        let parent_id = store
+            .register_remote_summary(&one, &snapshot("parent"))
+            .unwrap()
+            .id;
+        assert_eq!(
+            store
+                .session_sidebar_metadata(&[one.key.clone()])
+                .started_by
+                .get(&child_id),
+            Some(&parent_id)
+        );
         let mut parent = snapshot("parent");
         parent["paseoParentAgentId"] = json!("child");
         store.register_remote_summary(&one, &parent).unwrap();
