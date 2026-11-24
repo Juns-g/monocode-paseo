@@ -177,17 +177,20 @@ pub(super) fn project_turns(
                 .get("turnMetrics")
                 .filter(|value| value.is_object())
                 .and_then(|value| serde_json::from_value(value.clone()).ok());
+            let paseo_message_id = block["paseoMessageId"].as_str().map(str::to_owned);
             if model.is_object()
                 || duration.is_some()
                 || started_at.is_some()
                 || metrics.is_some()
                 || block["providerTurnId"].is_string()
                 || joined_turn.is_some()
+                || paseo_message_id.is_some()
             {
                 turns.insert(
                     offset + prompt + 1,
                     crate::agent::TurnInfo {
                         joined_turn,
+                        paseo_message_id,
                         provider_turn_id: block["providerTurnId"].as_str().map(str::to_owned),
                         provider: model["harness"].as_str().unwrap_or("").into(),
                         model: model["name"].as_str().unwrap_or("").into(),

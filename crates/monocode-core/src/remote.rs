@@ -455,6 +455,11 @@ fn supported_remote_method(method: &str) -> bool {
             | "projects.open"
             | "models.list"
             | "paseo.workspaces"
+            | "paseo.usage"
+            | "paseo.rewind"
+            | "paseo.worktrees"
+            | "paseo.hosts.list"
+            | "paseo.hosts.connect"
             | "sessions.list"
             | "sessions.update"
             | "sessions.delete"
@@ -954,6 +959,11 @@ mod tests {
             "git.worktreeCreate",
             "attachments.upload",
             "attachments.read",
+            "paseo.usage",
+            "paseo.rewind",
+            "paseo.worktrees",
+            "paseo.hosts.list",
+            "paseo.hosts.connect",
         ] {
             assert!(supported_remote_method(method), "{method}");
         }

@@ -137,6 +137,9 @@ pub struct Settings {
     /// Explicit Paseo workspace for an unbound draft; None creates an independent workspace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_workspace_id: Option<String>,
+    /// Explicit Paseo-managed git worktree draft spec; None uses directory/existing workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_worktree: Option<RemoteWorktreeSpec>,
     pub worktree_removed: bool,
     pub handoff: Option<Handoff>,
     pub pending_provider_switch: Option<ProviderSwitch>,
@@ -165,12 +168,26 @@ pub struct MonoContext {
     pub root: std::path::PathBuf,
     pub executable: std::path::PathBuf,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorktreeSpec {
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TurnInfo {
     /// An accepted steer belongs to the provider run that opened this receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub joined_turn: Option<usize>,
+    /// Paseo canonical user message ID for native rewind (`agent.rewind.request`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paseo_message_id: Option<String>,
     pub provider_turn_id: Option<String>,
     pub provider: String,
     pub model: String,
