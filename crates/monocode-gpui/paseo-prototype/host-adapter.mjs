@@ -10,12 +10,13 @@ import {SyncTransfers} from '../../../host/sync-transfer.ts';
 import {fetchPaseoUsage} from './usage.mjs';
 import {AttachmentStore} from './attachments.mjs';
 import {normalizePosixPath,validateWorktreeSpec,listProjectWorktrees,verifyExistingWorktreeCwd} from './worktrees.mjs';
+import {supportedRewindModes,extractUserMessageId,rewindPaseoAgent} from './rewind.mjs';
 
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
 const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume and never answer (its own wait is 60 s).
 export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.worktrees','paseo.history-pages','sessions.no-delete','sessions.list-revision',
-  'attachments.upload','attachments.read','paseo.usage',
+  'attachments.upload','attachments.read','paseo.usage','paseo.rewind',
   'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
 const stamp=value=>{const n=typeof value==='number'?value:Date.parse(value);return Number.isFinite(n)?n:0;};
@@ -66,7 +67,10 @@ export function projectBlocks(page,entries=page.displayEntries??page.entries,req
     }
     const block={id:`${page.epoch}:${entry.seqStart}`,role,text:item.text??item.message??'',sentAt:at};
     if(role==='user'){
-      block.startedAt=at;block.providerTurnId=entry.turnId??undefined;prompt=block;
+      block.startedAt=at;block.providerTurnId=entry.turnId??undefined;
+      const messageId=extractUserMessageId(entry);
+      if(messageId)block.paseoMessageId=messageId;
+      prompt=block;
       const files=item.clientMessageId?attachmentsFor(item.clientMessageId):null;
       if(files?.length)block.attachments=files;
     }
@@ -286,6 +290,7 @@ export class PaseoHost {
       const s=summary(entry,entry.projectId),blocks=projectBlocks({...h.page,agent:entry.agent},this.projectTimeline(h.entries),request=>this.number(id,request),messageId=>this.attachments.forMessage(id,messageId));
       const session={id,harness:s.harness,providerSessionId:s.providerSessionId,model:s.model,modelSettings:nativeSettings(entry.agent),runtimeMode:s.runtimeMode,title:s.title,cwd:s.cwd,
         busy:s.status==='running',blocks,paseoModeId:entry.agent.currentModeId,
+        paseoRewindModes:supportedRewindModes(entry.agent,this.client.getLastServerInfoMessage()),
         historyWindow:{epoch:h.page.epoch,before:h.page.hasOlder&&h.entries.length?h.entries[0].seqStart:null}};
       const question=entry.agent.pendingPermissions?.find(p=>p.kind==='question');
       // Arbitrary provider question forms need exact schemas. Keep them explicit.
@@ -504,6 +509,7 @@ export class PaseoHost {
     }
     if(method==='paseo.worktrees')return {result:await listProjectWorktrees(this,p)};
     if(method==='paseo.usage')return {result:await fetchPaseoUsage(this.client,p)};
+    if(method==='paseo.rewind')return {result:await rewindPaseoAgent(this,p)};
     if(method==='environment.describe')return {result:{protocolVersion:1,environmentId:this.serverId,name:`Paseo ${this.client.getLastServerInfoMessage()?.version??''}`,
       platform:process.platform,providers:[...new Set((await this.providers()).map(harness))],capabilities:CAPABILITIES}};
     if(['projects.list','sessions.list','projects.open'].includes(method)){

@@ -1099,3 +1099,113 @@ test('create rejects invalid branch names, conflicting workspaceId+worktree, or 
   }finally{f.close();}
 });
 
+// F5: Paseo native rewind
+{
+test('projectBlocks emits paseoMessageId preferring providerMessageId and preserves >32KB user message IDs',()=>{
+  const huge='u'.repeat(35000);
+  const blocks=projectBlocks({epoch:'e',agent:{status:'idle'},entries:[
+    {seqStart:1,seqEnd:1,timestamp:1000,providerMessageId:'prov-1',item:{type:'user_message',text:'first',messageId:'client-1',clientMessageId:'client-1'}},
+    {seqStart:2,seqEnd:2,timestamp:2000,item:{type:'assistant_message',text:'reply-1',messageId:'asst-1'}},
+    {seqStart:3,seqEnd:3,timestamp:3000,item:{type:'user_message',text:huge,messageId:'msg-huge',clientMessageId:'msg-huge'}},
+    {seqStart:4,seqEnd:4,timestamp:4000,item:{type:'user_message',text:'legacy-no-id'}}]});
+  assert.equal(blocks[0].paseoMessageId,'prov-1');
+  assert.equal(blocks[1].paseoMessageId,undefined);
+  assert.equal(blocks[2].paseoMessageId,'msg-huge');
+  assert.equal(blocks[3].paseoMessageId,undefined);
+});
+
+test('environment.describe advertises paseo.rewind and sessions.sync exposes paseoRewindModes with feature gating',async()=>{
+  const f=fixture();try{
+    f.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+    const caps=(await f.host.request('environment.describe',{})).result.capabilities;
+    assert.ok(caps.includes('paseo.rewind'));
+    f.a.capabilities={supportsRewindConversation:true,supportsRewindFiles:false,supportsRewindBoth:true};
+    const first=(await f.host.request('sessions.sync',{sessionId:'a'})).result.value;
+    assert.deepEqual(first.session.paseoRewindModes,['conversation','both']);
+    f.client.getLastServerInfoMessage=()=>({serverId:SERVER,version:'synthetic',features:{rewind:false}});
+    f.host.invalidate();
+    const disabled=(await f.host.request('sessions.sync',{sessionId:'a'})).result.value;
+    assert.deepEqual(disabled.session.paseoRewindModes,[]);
+  }finally{f.close();}
+});
+
+test('paseo.rewind refuses busy, awaiting-permission, archived, unsupported-mode and invalid calls with zero daemon mutations',async()=>{
+  const f=fixture(),rewinds=[];try{
+    f.client.rewindAgent=async(...args)=>{rewinds.push(args);return {ok:true};};
+    f.a.capabilities={supportsRewindConversation:true,supportsRewindFiles:false,supportsRewindBoth:false};
+    await f.host.directory();
+    // Busy: activeTurn
+    f.a.activeTurn={turnId:'t1'};
+    await assert.rejects(f.host.request('paseo.rewind',{commandId:'rw-busy-turn',sessionId:'a',messageId:'m1',mode:'conversation'}),/正在运行|空闲/);
+    // Busy: running status
+    f.a.activeTurn=null;f.a.status='running';
+    await assert.rejects(f.host.request('paseo.rewind',{commandId:'rw-busy-status',sessionId:'a',messageId:'m1',mode:'conversation'}),/正在运行|空闲/);
+    // Busy: pending permission
+    f.a.status='idle';f.a.pendingPermissions=[{id:'p1',kind:'tool'}];
+    await assert.rejects(f.host.request('paseo.rewind',{commandId:'rw-busy-perm',sessionId:'a',messageId:'m1',mode:'conversation'}),/正在运行|等待审批/);
+    f.a.pendingPermissions=[];
+    // Archived
+    f.a.archivedAt='2026-10-25T00:00:00Z';
+    await assert.rejects(f.host.request('paseo.rewind',{commandId:'rw-archived',sessionId:'a',messageId:'m1',mode:'conversation'}),/已归档/);
+    f.a.archivedAt=null;
+    // Unsupported mode
+    await assert.rejects(f.host.request('paseo.rewind',{commandId:'rw-bad-mode',sessionId:'a',messageId:'m1',mode:'both'}),/不支持此回退模式/);
+    // Missing params
+    await assert.rejects(f.host.request('paseo.rewind',{commandId:'',sessionId:'a',messageId:'m1',mode:'conversation'}),/Missing command/);
+    await assert.rejects(f.host.request('paseo.rewind',{commandId:'rw-no-msg',sessionId:'a',messageId:'',mode:'conversation'}),/messageId/);
+    assert.equal(rewinds.length,0);
+  }finally{f.close();}
+});
+
+test('paseo.rewind succeeds when idle, forces fresh snapshot on next sessions.sync, and enforces Attempts idempotency',async()=>{
+  const f=fixture(),rewinds=[];try{
+    let epoch='e1';
+    let entries=[
+      {seqStart:1,seqEnd:1,timestamp:1000,providerMessageId:'pm-1',item:{type:'user_message',text:'Keep me'}},
+      {seqStart:2,seqEnd:2,timestamp:2000,item:{type:'assistant_message',text:'Reply 1'}},
+      {seqStart:3,seqEnd:3,timestamp:3000,providerMessageId:'pm-2',item:{type:'user_message',text:'Rewind me'}},
+      {seqStart:4,seqEnd:4,timestamp:4000,item:{type:'assistant_message',text:'Reply 2'}}];
+    f.a.capabilities={supportsRewindConversation:true,supportsRewindFiles:true,supportsRewindBoth:true};
+    f.client.fetchAgentTimeline=async()=>({agent:f.a,epoch,hasOlder:false,entries});
+    f.client.rewindAgent=async(agentId,messageId,mode)=>{
+      rewinds.push([agentId,messageId,mode]);
+      if(mode!=='files'){
+        epoch='e2';
+        entries=entries.slice(0,2);
+      }
+      return {ok:true};
+    };
+    await f.host.directory();
+    const initial=(await f.host.request('sessions.sync',{sessionId:'a'})).result;
+    assert.equal(initial.kind,'snapshot');
+    assert.equal(initial.value.session.blocks.length,4);
+    assert.equal(initial.value.session.blocks[2].paseoMessageId,'pm-2');
+
+    const cmd={commandId:'rw-ok-1',sessionId:'a',messageId:'pm-2',mode:'both'};
+    const receipt=(await f.host.request('paseo.rewind',cmd)).result;
+    assert.equal(receipt.ok,true);
+    assert.equal(receipt.commandId,'rw-ok-1');
+    assert.deepEqual(rewinds,[['a','pm-2','both']]);
+
+    // Duplicate commandId returns cached receipt without calling rewindAgent twice.
+    const dup=(await f.host.request('paseo.rewind',cmd)).result;
+    assert.deepEqual(dup,receipt);
+    assert.equal(rewinds.length,1);
+
+    // Next sessions.sync returns full 'snapshot' (never 'delta' against pre-rewind revision!).
+    const after=(await f.host.request('sessions.sync',{sessionId:'a',revision:initial.value.revision})).result;
+    assert.equal(after.kind,'snapshot');
+    assert.equal(after.value.session.blocks.length,2);
+    assert.equal(after.value.session.historyWindow.epoch,'e2');
+
+    // Unknown/failed rewind attempt is never replayed across restart.
+    f.client.rewindAgent=async()=>{rewinds.push(['lost']);throw Error('network lost');};
+    const lostCmd={commandId:'rw-lost',sessionId:'a',messageId:'pm-1',mode:'conversation'};
+    await assert.rejects(f.host.request('paseo.rewind',lostCmd),/network lost/);
+    const restarted=new PaseoHost(f.client,f.directory);restarted.connected=true;
+    await assert.rejects(restarted.request('paseo.rewind',lostCmd),/No replay/);
+    assert.equal(rewinds.length,2);
+    restarted.close();
+  }finally{f.close();}
+});
+}

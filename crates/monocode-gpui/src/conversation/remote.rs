@@ -3,6 +3,13 @@ use super::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+#[derive(Clone, Debug)]
+pub(super) struct PendingRewind {
+    pub(super) message_id: String,
+    pub(super) text: String,
+    pub(super) focus: gpui::FocusHandle,
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub(super) client: Option<Arc<monocode_core::remote::Connections>>,
@@ -26,6 +33,10 @@ pub(super) struct State {
     rejected: Option<Value>,
     snapshot: Option<Value>,
     pub(super) capabilities: std::collections::HashSet<String>,
+    pub(super) rewind_modes: Vec<String>,
+    pub(super) rewinding: bool,
+    pub(super) rewind_confirm: Option<PendingRewind>,
+    resync_after_refresh: bool,
 }
 
 pub(super) enum PaseoWorktreeEvent {
@@ -555,6 +566,9 @@ impl Conversation {
             self.remote_state.online = false;
             self.remote_state.error = Some(error.into());
             self.status = error.into();
+            let can_rewind = self.can_paseo_rewind();
+            self.transcript
+                .update(cx, |v, cx| v.set_paseo_rewind_enabled(can_rewind, cx));
             cx.notify();
         }
     }
@@ -568,7 +582,11 @@ impl Conversation {
                     if this
                         .update(cx, |this, cx| {
                             // Live turns have their own 750 ms sync and control loop.
-                            if !this.busy && !this.stopping && !this.history_unloaded {
+                            if !this.busy
+                                && !this.stopping
+                                && !this.remote_state.rewinding
+                                && !this.history_unloaded
+                            {
                                 this.refresh_remote_snapshot(cx);
                             }
                         })
@@ -790,10 +808,22 @@ impl Conversation {
                             this.summary.has_messages = snapshot["session"]["blocks"]
                                 .as_array()
                                 .is_some_and(|b| !b.is_empty());
+                            if let Some(modes) = snapshot["session"]["paseoRewindModes"].as_array() {
+                                this.remote_state.rewind_modes = modes
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(str::to_owned))
+                                    .collect();
+                            } else if snapshot["session"].is_object() {
+                                this.remote_state.rewind_modes.clear();
+                            }
                             this.install_remote_draft(snapshot, cx);
                             this.install_remote_plans(snapshot, cx);
                         }
                         this.remote_state.snapshot = snapshot;
+                        let can_rewind = this.can_paseo_rewind();
+                        this.transcript.update(cx, |view, cx| {
+                            view.set_paseo_rewind_enabled(can_rewind, cx);
+                        });
                         if initial {
                             this.refresh_catalog(cx);
                             this.refresh_git(cx);
@@ -811,6 +841,11 @@ impl Conversation {
                             this.launch_prompt(String::new(), cx);
                         } else {
                             this.run_history_actions(cx);
+                        }
+                        if this.remote_state.resync_after_refresh {
+                            this.remote_state.resync_after_refresh = false;
+                            this.remote_state.snapshot = None;
+                            this.refresh_remote_snapshot(cx);
                         }
                     }
                     Err(error) => this.remote_connection_error(&error, cx),
@@ -842,21 +877,30 @@ impl Conversation {
     }
     pub(super) fn remote_send_guard(&mut self, cx: &mut Context<Self>) -> bool {
         self.remote_state.send_blocked_notice = false;
-        let error = if !self.loaded {
-            Some("Wait for this remote conversation to load.")
+        let error: Option<String> = if !self.loaded {
+            Some("Wait for this remote conversation to load.".into())
         } else if !self.remote_state.online {
-            Some("The machine is offline. Reconnect in Settings → Connections, then Retry.")
+            Some("The machine is offline. Reconnect in Settings → Connections, then Retry.".into())
         } else if self.remote_state.pending {
-            Some(self.remote_state.legacy_recovery_error().unwrap_or(
-                "A remote command needs confirmation. Choose Retry before sending another message.",
+            Some(
+                self.remote_state
+                    .legacy_recovery_error()
+                    .unwrap_or(
+                        "A remote command needs confirmation. Choose Retry before sending another message.",
+                    )
+                    .to_owned(),
+            )
+        } else if self.remote_state.rewinding {
+            Some(crate::i18n::t(
+                "Wait for Paseo rewind to finish before sending a message.",
             ))
         } else if (self.busy || self.stopping) && !self.paseo_follow_ups() {
-            Some("Wait for this remote turn to finish before sending another message.")
+            Some("Wait for this remote turn to finish before sending another message.".into())
         } else {
             None
         };
         if let Some(error) = error {
-            self.status = error.into();
+            self.status = error;
             self.remote_state.send_blocked_notice = self.loaded
                 && self.remote_state.online
                 && !self.remote_state.pending
@@ -1015,6 +1059,160 @@ impl Conversation {
     }
     pub(super) fn release_remote_snapshot(&mut self) {
         self.remote_state.snapshot = None;
+    }
+    pub(super) fn can_paseo_rewind(&self) -> bool {
+        self.paseo_controls()
+            && self.remote_state.capabilities.contains("paseo.rewind")
+            && !self.remote_state.rewind_modes.is_empty()
+            && !self.remote_state.unbound
+            && !self.remote_state.rewinding
+            && !self.busy
+            && !self.stopping
+            && self.remote_state.online
+            && !self.remote_state.pending
+            && !self.needs_approval()
+            && self.questions.is_empty()
+    }
+    pub(super) fn open_paseo_rewind_confirm(
+        &mut self,
+        message_id: String,
+        text: String,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if message_id.trim().is_empty() {
+            return;
+        }
+        if !self.can_paseo_rewind() {
+            if self.busy || self.stopping || self.needs_approval() || !self.questions.is_empty() {
+                self.status =
+                    crate::i18n::t("Paseo session is busy or state changed; rewind cancelled.");
+                cx.notify();
+            }
+            return;
+        }
+        self.menu = None;
+        self.git_picker = None;
+        self.close_response_menu(cx);
+        let focus = cx.focus_handle();
+        if let Some(window) = window {
+            window.focus(&focus, cx);
+        }
+        self.remote_state.rewind_confirm = Some(PendingRewind {
+            message_id,
+            text,
+            focus,
+        });
+        cx.notify();
+    }
+    pub(super) fn close_paseo_rewind_confirm(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.remote_state.rewind_confirm.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+    pub(super) fn close_paseo_rewind_confirm_with_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.close_paseo_rewind_confirm(cx) {
+            let input_focus = self.input.focus_handle(cx);
+            window.focus(&input_focus, cx);
+            true
+        } else {
+            false
+        }
+    }
+    pub(super) fn execute_paseo_rewind(&mut self, mode: &'static str, cx: &mut Context<Self>) {
+        if !self.can_paseo_rewind() || !self.remote_state.rewind_modes.iter().any(|m| m == mode) {
+            self.remote_state.rewind_confirm = None;
+            self.status =
+                crate::i18n::t("Paseo session is busy or state changed; rewind cancelled.");
+            let can_rewind = self.can_paseo_rewind();
+            self.transcript
+                .update(cx, |v, cx| v.set_paseo_rewind_enabled(can_rewind, cx));
+            cx.notify();
+            return;
+        }
+        let Some(PendingRewind {
+            message_id, text, ..
+        }) = self.remote_state.rewind_confirm.take()
+        else {
+            return;
+        };
+        if self.remote_state.client.is_none() {
+            self.remote_state.client = monocode_core::remote::default_connections().ok();
+        }
+        let Some(client) = self.remote_state.client.clone() else {
+            self.status = "Remote connections are unavailable".into();
+            cx.notify();
+            return;
+        };
+        self.remote_state.rewinding = true;
+        self.status = crate::i18n::t("Rewinding…");
+        self.transcript
+            .update(cx, |v, cx| v.set_paseo_rewind_enabled(false, cx));
+        cx.notify();
+
+        let command_id = monocode_core::mono::new_id();
+        let store = self.store.clone();
+        let id = self.summary.id;
+        let work = cx.background_executor().spawn(async move {
+            let remote = locked(&store)?
+                .remote_session(id)?
+                .ok_or("Remote session no longer exists")?;
+            let session_id = remote.session_id.clone().ok_or("Unbound remote draft")?;
+            let machine = remote.machine(&client)?;
+            client.request(
+                &machine.id,
+                "paseo.rewind",
+                json!({
+                    "commandId": command_id,
+                    "sessionId": session_id,
+                    "messageId": message_id,
+                    "mode": mode,
+                }),
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.remote_state.rewinding = false;
+                match result {
+                    Ok(_) => {
+                        this.remote_state.error = None;
+                        // Force a clean authoritative snapshot (no delta against pre-rewind revision).
+                        this.remote_state.snapshot = None;
+                        if matches!(mode, "conversation" | "both")
+                            && !text.trim().is_empty()
+                            && this.input.read(cx).content.trim().is_empty()
+                            && this.attachments.is_empty()
+                        {
+                            this.input.update(cx, |input, cx| input.set_text(text, cx));
+                        }
+                        if this.remote_state.refreshing {
+                            this.remote_state.resync_after_refresh = true;
+                        } else {
+                            this.refresh_remote_snapshot(cx);
+                        }
+                        if matches!(mode, "files" | "both") {
+                            this.refresh_git(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.status = error;
+                        let can_rewind = this.can_paseo_rewind();
+                        this.transcript
+                            .update(cx, |v, cx| v.set_paseo_rewind_enabled(can_rewind, cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn restore_remote_message(&mut self, cx: &mut Context<Self>) {
         if let Some(error) = self.remote_state.legacy_recovery_error() {
@@ -1419,3 +1617,565 @@ impl Conversation {
 #[cfg(test)]
 #[path = "remote_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::*;
+    use gpui::{Bounds, TestAppContext, WindowBounds, WindowOptions, point, size};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    #[test]
+    fn paseo_rewind_projects_message_ids_for_text_and_attachment_turns() {
+        let snapshot = json!({
+            "session": {
+                "blocks": [
+                    {
+                        "id": "e:1",
+                        "role": "user",
+                        "text": "First prompt",
+                        "sentAt": 1000,
+                        "startedAt": 1000,
+                        "paseoMessageId": "pm-first"
+                    },
+                    {
+                        "id": "e:2",
+                        "role": "assistant",
+                        "text": "First reply",
+                        "sentAt": 2000
+                    },
+                    {
+                        "id": "e:3",
+                        "role": "user",
+                        "text": "Prompt with image",
+                        "sentAt": 3000,
+                        "startedAt": 3000,
+                        "paseoMessageId": "pm-image",
+                        "attachments": [{
+                            "id": "att-1",
+                            "name": "shot.png",
+                            "mimeType": "image/png",
+                            "kind": "image",
+                            "size": 12
+                        }]
+                    },
+                    {
+                        "id": "e:4",
+                        "role": "user",
+                        "text": "Legacy prompt without paseoMessageId",
+                        "sentAt": 4000,
+                        "startedAt": 4000
+                    }
+                ]
+            }
+        });
+        let (history, turns) =
+            monocode_core::store::Store::project_remote_history(&snapshot).unwrap();
+        assert_eq!(history.rows[0].role, "user");
+        assert_eq!(
+            turns.get(&1).and_then(|t| t.paseo_message_id.as_deref()),
+            Some("pm-first")
+        );
+        // Block 3 has a user row at index 2 and a metadata attachment row at index 3;
+        // TurnInfo is keyed at `end` of the user text rows (index 3).
+        assert_eq!(history.rows[2].role, "user");
+        assert_eq!(
+            turns.get(&3).and_then(|t| t.paseo_message_id.as_deref()),
+            Some("pm-image")
+        );
+        // Block 4 has startedAt without paseoMessageId -> TurnInfo exists with None.
+        let last_end = history.rows.len();
+        assert_eq!(
+            turns
+                .get(&last_end)
+                .and_then(|t| t.paseo_message_id.as_deref()),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn paseo_rewind_hover_button_modal_modes_and_busy_guard(cx: &mut TestAppContext) {
+        let preferences = crate::settings::Preferences::default();
+        crate::theme::configure(&preferences, false);
+        cx.update(|cx| {
+            cx.set_global(preferences);
+            cx.set_reduce_motion(true);
+        });
+
+        let rewinds: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let rewinds_ref = rewinds.clone();
+        let host = crate::runtime::remote::TestHost::with_capabilities(
+            vec![
+                "paseo.configure",
+                "paseo.preserve-prose",
+                "paseo.rewind",
+                "sessions.sync",
+            ],
+            move |request| match request["method"].as_str().unwrap() {
+                "sessions.sync" => Some(json!({
+                    "kind": "snapshot",
+                    "value": {
+                        "projectId": "paseo:/repo",
+                        "revision": 1,
+                        "status": "idle",
+                        "runId": null,
+                        "updatedAt": 100,
+                        "session": {
+                            "id": "paseo-session",
+                            "title": "Rewind test",
+                            "harness": "claude",
+                            "model": "claude:sonnet",
+                            "runtimeMode": "full-access",
+                            "modelSettings": {},
+                            "paseoRewindModes": ["conversation", "both"],
+                            "blocks": [
+                                {
+                                    "id": "e:1",
+                                    "role": "user",
+                                    "text": "Legacy user prompt",
+                                    "sentAt": 1000,
+                                    "startedAt": 1000
+                                },
+                                {
+                                    "id": "e:2",
+                                    "role": "assistant",
+                                    "text": "First reply",
+                                    "sentAt": 2000
+                                },
+                                {
+                                    "id": "e:3",
+                                    "role": "user",
+                                    "text": "Second prompt with messageId",
+                                    "sentAt": 3000,
+                                    "startedAt": 3000,
+                                    "paseoMessageId": "pm-second"
+                                },
+                                {
+                                    "id": "e:4",
+                                    "role": "assistant",
+                                    "text": "Second reply",
+                                    "sentAt": 4000
+                                }
+                            ]
+                        }
+                    }
+                })),
+                "paseo.rewind" => {
+                    rewinds_ref.lock().unwrap().push(request["params"].clone());
+                    Some(json!({"ok": true, "revision": 2}))
+                }
+                "commands.dispatch" if request["params"]["type"] == "view" => Some(
+                    json!({"commandId": request["params"]["commandId"], "sessionId": "paseo-session", "revision": 1}),
+                ),
+                "models.list" => Some(json!({"models": {}, "errors": {}})),
+                "git.branches" | "git.worktrees" | "git.index" | "git.diff" => None,
+                other => panic!("unexpected method: {other}"),
+            },
+        );
+
+        let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .remember_remote_project("env", &json!({"id": "paseo:/repo", "cwd": "/repo"}))
+            .unwrap();
+        let summary = store
+            .register_remote_summary(
+                &project,
+                &json!({
+                    "projectId": "paseo:/repo",
+                    "revision": 1,
+                    "status": "idle",
+                    "updatedAt": 100,
+                    "session": {
+                        "id": "paseo-session",
+                        "title": "Rewind test",
+                        "harness": "claude",
+                        "model": "claude:sonnet",
+                        "runtimeMode": "full-access",
+                        "modelSettings": {},
+                        "blocks": []
+                    }
+                }),
+            )
+            .unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(1000.), px(720.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    cx.new(|cx| {
+                        let mut view = Conversation::new(summary, store.clone(), cx);
+                        view.remote_state.client = Some(host.client.clone());
+                        view.load_remote(cx);
+                        view
+                    })
+                },
+            )
+            .unwrap()
+        });
+
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        for _ in 0..500 {
+            visual.run_until_parked();
+            let ready = window
+                .update(visual, |view, _, _| {
+                    view.loaded && !view.remote_state.refreshing && view.summary.has_messages
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        visual.refresh().unwrap();
+
+        // Hover prompt 0 (missing paseoMessageId): rewind button must NOT appear.
+        window
+            .update(visual, |view, _, cx| {
+                assert!(view.can_paseo_rewind());
+                view.transcript
+                    .update(cx, |t, cx| t.set_hovered_prompt_for_test(Some(0), cx));
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("paseo-rewind-0").is_none());
+        assert!(visual.debug_bounds("edit-last-message-0").is_none());
+
+        // Hover second user prompt (row 3 after prompt 0 + its attachment metadata + reply 1):
+        // rewind button appears, while local edit-last-message stays hidden in Paseo mode.
+        let second_prompt = window
+            .update(visual, |view, _, cx| {
+                let idx = view
+                    .transcript
+                    .read(cx)
+                    .source_rows()
+                    .iter()
+                    .rposition(|r| r.first && r.role == "user")
+                    .unwrap();
+                assert_eq!(idx, 3);
+                view.transcript
+                    .update(cx, |t, cx| t.set_hovered_prompt_for_test(Some(idx), cx));
+                idx
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert_eq!(second_prompt, 3);
+        assert!(visual.debug_bounds("edit-last-message-3").is_none());
+        let rewind_btn = visual
+            .debug_bounds("paseo-rewind-3")
+            .expect("Paseo rewind hover action should appear for user message with paseoMessageId");
+
+        // Click rewind button -> opens modal with ONLY advertised modes ("conversation", "both").
+        visual.simulate_click(rewind_btn.center(), Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("paseo-rewind-dialog").is_some());
+        assert!(
+            visual
+                .debug_bounds("paseo-rewind-confirm-conversation")
+                .is_some()
+        );
+        assert!(visual.debug_bounds("paseo-rewind-confirm-both").is_some());
+        assert!(visual.debug_bounds("paseo-rewind-confirm-files").is_none());
+        assert!(visual.debug_bounds("paseo-rewind-busy-warning").is_none());
+
+        // Escape dismisses modal cleanly with zero RPCs.
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("paseo-rewind-dialog").is_none());
+        assert!(rewinds.lock().unwrap().is_empty());
+
+        // Re-open modal, then transition session to `busy = true` while modal is open:
+        // confirm buttons disable, busy warning renders, and execution is strictly blocked!
+        let rewind_btn = visual.debug_bounds("paseo-rewind-3").unwrap();
+        visual.simulate_click(rewind_btn.center(), Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("paseo-rewind-dialog").is_some());
+
+        window
+            .update(visual, |view, _, cx| {
+                view.busy = true;
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("paseo-rewind-busy-warning").is_some());
+        let both_btn = visual.debug_bounds("paseo-rewind-confirm-both").unwrap();
+        visual.simulate_click(both_btn.center(), Default::default());
+        visual.run_until_parked();
+        assert!(
+            rewinds.lock().unwrap().is_empty(),
+            "clicking disabled confirm while busy must send zero paseo.rewind RPCs"
+        );
+
+        // Even a direct programmatic call while busy is blocked and closes the modal.
+        window
+            .update(visual, |view, _, cx| {
+                view.execute_paseo_rewind("both", cx);
+                assert!(view.remote_state.rewind_confirm.is_none());
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(rewinds.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn paseo_rewind_executes_rpc_restores_empty_composer_preserves_draft_and_resyncs(
+        cx: &mut TestAppContext,
+    ) {
+        let rewinds: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sync_revisions: Arc<Mutex<Vec<Option<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let phase = Arc::new(AtomicU64::new(0));
+
+        let rewinds_ref = rewinds.clone();
+        let sync_ref = sync_revisions.clone();
+        let phase_ref = phase.clone();
+
+        let host = crate::runtime::remote::TestHost::with_capabilities(
+            vec![
+                "paseo.configure",
+                "paseo.preserve-prose",
+                "paseo.rewind",
+                "sessions.sync",
+            ],
+            move |request| match request["method"].as_str().unwrap() {
+                "sessions.sync" => {
+                    sync_ref
+                        .lock()
+                        .unwrap()
+                        .push(request["params"]["revision"].as_u64());
+                    let step = phase_ref.load(Ordering::Relaxed);
+                    let blocks = match step {
+                        0 => json!([
+                            {
+                                "id": "e1:1",
+                                "role": "user",
+                                "text": "Prompt 1",
+                                "sentAt": 1000,
+                                "startedAt": 1000,
+                                "paseoMessageId": "pm-1"
+                            },
+                            {
+                                "id": "e1:2",
+                                "role": "assistant",
+                                "text": "Reply 1",
+                                "sentAt": 2000
+                            },
+                            {
+                                "id": "e1:3",
+                                "role": "user",
+                                "text": "Prompt 2 to rewind",
+                                "sentAt": 3000,
+                                "startedAt": 3000,
+                                "paseoMessageId": "pm-2"
+                            },
+                            {
+                                "id": "e1:4",
+                                "role": "assistant",
+                                "text": "Reply 2 removed after rewind",
+                                "sentAt": 4000
+                            }
+                        ]),
+                        1 => json!([
+                            {
+                                "id": "e2:1",
+                                "role": "user",
+                                "text": "Prompt 1",
+                                "sentAt": 1000,
+                                "startedAt": 1000,
+                                "paseoMessageId": "pm-1"
+                            },
+                            {
+                                "id": "e2:2",
+                                "role": "assistant",
+                                "text": "Reply 1",
+                                "sentAt": 2000
+                            }
+                        ]),
+                        _ => json!([]),
+                    };
+                    Some(json!({
+                        "kind": "snapshot",
+                        "value": {
+                            "projectId": "paseo:/repo",
+                            "revision": 10 + step,
+                            "status": "idle",
+                            "runId": null,
+                            "updatedAt": 100 + step,
+                            "session": {
+                                "id": "paseo-session",
+                                "title": "Rewind flow",
+                                "harness": "claude",
+                                "model": "claude:sonnet",
+                                "runtimeMode": "full-access",
+                                "modelSettings": {},
+                                "paseoRewindModes": ["conversation", "files", "both"],
+                                "blocks": blocks
+                            }
+                        }
+                    }))
+                }
+                "paseo.rewind" => {
+                    let params = request["params"].clone();
+                    if params["mode"] != "files" {
+                        phase_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    rewinds_ref.lock().unwrap().push(params.clone());
+                    Some(json!({
+                        "ok": true,
+                        "commandId": params["commandId"],
+                        "sessionId": "paseo-session",
+                        "messageId": params["messageId"],
+                        "mode": params["mode"],
+                        "revision": 99
+                    }))
+                }
+                "commands.dispatch" if request["params"]["type"] == "view" => Some(json!({
+                    "commandId": request["params"]["commandId"],
+                    "sessionId": "paseo-session",
+                    "revision": 10
+                })),
+                "models.list" => Some(json!({"models": {}, "errors": {}})),
+                "git.branches" | "git.worktrees" | "git.index" | "git.diff" => None,
+                other => panic!("unexpected method: {other}"),
+            },
+        );
+
+        let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .remember_remote_project("env", &json!({"id": "paseo:/repo", "cwd": "/repo"}))
+            .unwrap();
+        let summary = store
+            .register_remote_summary(
+                &project,
+                &json!({
+                    "projectId": "paseo:/repo",
+                    "revision": 1,
+                    "status": "idle",
+                    "updatedAt": 100,
+                    "session": {
+                        "id": "paseo-session",
+                        "title": "Rewind flow",
+                        "harness": "claude",
+                        "model": "claude:sonnet",
+                        "runtimeMode": "full-access",
+                        "modelSettings": {},
+                        "blocks": []
+                    }
+                }),
+            )
+            .unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let view = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, store.clone(), cx);
+                view.remote_state.client = Some(host.client.clone());
+                view.load_remote(cx);
+                view
+            })
+        });
+
+        let wait_settled = |cx: &mut TestAppContext| {
+            for _ in 0..1000 {
+                cx.run_until_parked();
+                if cx.update(|cx| {
+                    let v = view.read(cx);
+                    v.loaded && !v.remote_state.refreshing && !v.remote_state.rewinding
+                }) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            cx.update(|cx| panic!("conversation did not settle: {}", view.read(cx).status));
+        };
+        wait_settled(cx);
+
+        cx.update(|cx| {
+            // 2 user blocks (each with qualified attachment metadata row) + 2 assistant blocks = 6 rows.
+            assert_eq!(view.read(cx).transcript.read(cx).source_rows().len(), 6);
+        });
+
+        // 1. Rewind "both" with empty composer -> restores "Prompt 2 to rewind", clears snapshot
+        //    so sessions.sync sends revision=None, and drops removed tail rows!
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text(String::new(), cx));
+                view.open_paseo_rewind_confirm(
+                    "pm-2".into(),
+                    "Prompt 2 to rewind".into(),
+                    None,
+                    cx,
+                );
+                assert!(view.remote_state.rewind_confirm.is_some());
+                view.execute_paseo_rewind("both", cx);
+            });
+        });
+        wait_settled(cx);
+
+        cx.update(|cx| {
+            let v = view.read(cx);
+            assert_eq!(v.input.read(cx).content, "Prompt 2 to rewind");
+            let rows = v.transcript.read(cx).source_rows();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].text, "Prompt 1");
+            assert_eq!(rows[2].text, "Reply 1");
+        });
+        {
+            let calls = rewinds.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["sessionId"], "paseo-session");
+            assert_eq!(calls[0]["messageId"], "pm-2");
+            assert_eq!(calls[0]["mode"], "both");
+            assert!(!calls[0]["commandId"].as_str().unwrap().is_empty());
+            // Post-rewind sessions.sync must have requested a clean snapshot (None revision).
+            let syncs = sync_revisions.lock().unwrap();
+            assert_eq!(*syncs.last().unwrap(), None);
+        }
+
+        // 2. Rewind "files" with empty composer -> does NOT populate composer text!
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text(String::new(), cx));
+                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), None, cx);
+                view.execute_paseo_rewind("files", cx);
+            });
+        });
+        wait_settled(cx);
+        cx.update(|cx| {
+            assert_eq!(view.read(cx).input.read(cx).content, "");
+        });
+
+        // 3. Rewind "conversation" with non-empty composer -> preserves existing draft!
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.input.update(cx, |input, cx| {
+                    input.set_text("Keep my typed draft".into(), cx)
+                });
+                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), None, cx);
+                view.execute_paseo_rewind("conversation", cx);
+            });
+        });
+        wait_settled(cx);
+        cx.update(|cx| {
+            let v = view.read(cx);
+            assert_eq!(v.input.read(cx).content, "Keep my typed draft");
+            assert_eq!(v.transcript.read(cx).source_rows().len(), 0);
+        });
+        assert_eq!(rewinds.lock().unwrap().len(), 3);
+    }
+}

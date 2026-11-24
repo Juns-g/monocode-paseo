@@ -18,6 +18,11 @@ pub(crate) enum Request {
     EditLastTurn {
         turn: usize,
     },
+    PaseoRewind {
+        turn: usize,
+        message_id: String,
+        text: String,
+    },
     Draft {
         send: bool,
     },
