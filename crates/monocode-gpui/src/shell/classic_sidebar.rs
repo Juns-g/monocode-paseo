@@ -269,6 +269,7 @@ impl gpui::RenderOnce for ChangeStats {
 impl Shell {
     pub(super) fn classic_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.refresh_sidebar_structure(cx);
+        let (slide_x, slide_opacity) = self.sidebar_slide_transform(cx);
         if self
             .classic_worktree_picker
             .as_ref()
@@ -365,6 +366,8 @@ impl Shell {
                     div()
                         .relative()
                         .size_full()
+                        .left(px(slide_x))
+                        .opacity(slide_opacity)
                         .min_h_0()
                         .flex()
                         .flex_col()

@@ -172,7 +172,10 @@ impl Render for Chrome {
             .update(cx, |shell, cx| match kind {
                 ChromeKind::Sidebar => {
                     let sidebar = shell.sidebar(cx);
-                    if shell.spaces_nudge.is_some() || shell.classic_tabs.animating() {
+                    if shell.spaces_nudge.is_some()
+                        || shell.classic_tabs.animating()
+                        || shell.sidebar_slide_animating()
+                    {
                         window.request_animation_frame();
                     }
                     sidebar
@@ -362,6 +365,14 @@ fn adjacent<T: PartialEq + Clone>(items: &[T], current: Option<&T>, step: isize)
     }
 }
 
+#[derive(Clone, Copy)]
+struct SidebarSlide {
+    from_x: f32,
+    from_opacity: f32,
+    duration_secs: f32,
+    start: std::time::Instant,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SwipeAxis {
     Pending,
@@ -375,6 +386,8 @@ struct SidebarProjectSwipe {
     y: f32,
     axis: SwipeAxis,
     consumed: bool,
+    drag_offset: f32,
+    in_swipe_switch: bool,
 }
 
 impl Default for SidebarProjectSwipe {
@@ -385,6 +398,8 @@ impl Default for SidebarProjectSwipe {
             y: 0.,
             axis: SwipeAxis::Pending,
             consumed: false,
+            drag_offset: 0.,
+            in_swipe_switch: false,
         }
     }
 }
@@ -766,6 +781,7 @@ pub(crate) struct Shell {
     focus: FocusHandle,
     sidebar_focus: FocusHandle,
     sidebar_swipe: SidebarProjectSwipe,
+    project_slide: Option<SidebarSlide>,
     query: String,
     sidebar_hover: Option<&'static str>,
     tab_hover: Option<i64>,
@@ -1172,6 +1188,7 @@ impl Shell {
             focus: cx.focus_handle(),
             sidebar_focus: cx.focus_handle(),
             sidebar_swipe: Default::default(),
+            project_slide: None,
             query: String::new(),
             sidebar_hover: None,
             tab_hover: None,
@@ -4657,6 +4674,29 @@ impl Shell {
         if let Some(monos) = self.monos.clone() {
             monos.update(cx, |m, cx| m.close(cx));
         }
+        let previous_project = self.workspace.project.clone();
+        if previous_project != path && !cx.reduce_motion() {
+            let order = self.workspace.visible_project_order();
+            if let (Some(old_ix), Some(new_ix)) = (
+                order.iter().position(|p| p == &previous_project),
+                order.iter().position(|p| p == &path),
+            ) {
+                let direction = if new_ix > old_ix { 1. } else { -1. };
+                let from_swipe = self.sidebar_swipe.in_swipe_switch;
+                let width = self.workspace.sidebar_width;
+                let (distance, from_opacity, duration_secs) = if from_swipe {
+                    ((width * 0.42).clamp(80., 130.), 0.15, 0.22)
+                } else {
+                    ((width * 0.28).clamp(56., 92.), 0.25, 0.24)
+                };
+                self.project_slide = Some(SidebarSlide {
+                    from_x: direction * distance,
+                    from_opacity,
+                    duration_secs,
+                    start: std::time::Instant::now(),
+                });
+            }
+        }
         self.workspace.project = path.clone();
         self.workspace.active = None;
         if let Some(ix) = self.workspace.projects.iter().position(|p| p == &path) {
@@ -7460,9 +7500,55 @@ impl Shell {
             self.select_project(next, window, cx);
         }
     }
+    pub(super) fn sidebar_slide_animating(&self) -> bool {
+        self.project_slide.is_some() || self.sidebar_swipe.drag_offset.abs() > 0.1
+    }
+    /// Evaluates the current sidebar horizontal slide/drag transform `(offset_x, opacity)`
+    /// and clears or springs back once settled.
+    pub(super) fn sidebar_slide_transform(&mut self, cx: &App) -> (f32, f32) {
+        if cx.reduce_motion() {
+            self.project_slide = None;
+            self.sidebar_swipe.drag_offset = 0.;
+            return (0., 1.);
+        }
+        // If a partial drag stalled without receiving TouchPhase::Ended, spring back cleanly.
+        if self.sidebar_swipe.drag_offset.abs() > 0.1
+            && self
+                .sidebar_swipe
+                .last_event
+                .is_some_and(|at| at.elapsed() > std::time::Duration::from_millis(120))
+        {
+            let from_x = std::mem::replace(&mut self.sidebar_swipe.drag_offset, 0.);
+            self.project_slide = Some(SidebarSlide {
+                from_x,
+                from_opacity: 1.,
+                duration_secs: 0.16,
+                start: std::time::Instant::now(),
+            });
+        }
+        if self.sidebar_swipe.drag_offset.abs() > 0.1 {
+            return (self.sidebar_swipe.drag_offset, 1.);
+        }
+        match self.project_slide {
+            Some(slide) => {
+                let t = slide.start.elapsed().as_secs_f32() / slide.duration_secs.max(0.01);
+                if t >= 1. {
+                    self.project_slide = None;
+                    (0., 1.)
+                } else {
+                    // Expo-out cubic-bezier(0.16, 1, 0.3, 1), matching Sidebar.tsx's space slide.
+                    let eased = crate::reveal::bezier(t, 0.16, 1., 0.3, 1.);
+                    let x = slide.from_x * (1. - eased);
+                    let opacity = slide.from_opacity + (1. - slide.from_opacity) * eased;
+                    (x, opacity)
+                }
+            }
+            None => (0., 1.),
+        }
+    }
     /// Port of React's `useProjectSwipe`: a horizontal trackpad swipe over the
-    /// left sidebar switches between adjacent projects in the bottom spaces bar
-    /// (once per gesture, ignoring momentum tails and vertical scrolling).
+    /// left sidebar tracks fingers live (with edge rubber-banding) and glides
+    /// smoothly into the adjacent project in the bottom spaces bar once per gesture.
     pub(super) fn handle_sidebar_project_swipe(
         &mut self,
         event: &gpui::ScrollWheelEvent,
@@ -7498,6 +7584,7 @@ impl Shell {
             || self.renaming.is_some()
         {
             self.sidebar_swipe.axis = SwipeAxis::Reserved;
+            self.sidebar_swipe.drag_offset = 0.;
             return false;
         }
 
@@ -7528,25 +7615,59 @@ impl Shell {
             }
         }
 
-        if !self.sidebar_swipe.consumed && self.sidebar_swipe.x.abs() >= SWIPE_DISTANCE {
-            self.sidebar_swipe.consumed = true;
-            if let Some(index) = projects
-                .iter()
-                .position(|path| path == &self.workspace.project)
-            {
-                let target = if self.sidebar_swipe.x > 0. {
-                    index.checked_add(1).and_then(|i| projects.get(i))
-                } else {
-                    index.checked_sub(1).and_then(|i| projects.get(i))
-                };
+        let index = projects
+            .iter()
+            .position(|path| path == &self.workspace.project);
+        let target = index.and_then(|ix| {
+            if self.sidebar_swipe.x > 0. {
+                ix.checked_add(1).and_then(|i| projects.get(i))
+            } else {
+                ix.checked_sub(1).and_then(|i| projects.get(i))
+            }
+        });
+
+        if !self.sidebar_swipe.consumed {
+            if matches!(event.touch_phase, gpui::TouchPhase::Ended) {
+                let from_x = std::mem::replace(&mut self.sidebar_swipe.drag_offset, 0.);
+                if from_x.abs() > 0.5 && !cx.reduce_motion() {
+                    self.project_slide = Some(SidebarSlide {
+                        from_x,
+                        from_opacity: 1.,
+                        duration_secs: 0.16,
+                        start: std::time::Instant::now(),
+                    });
+                    self.sidebar_frame.update(cx, |_, cx| cx.notify());
+                }
+            } else if self.sidebar_swipe.x.abs() >= SWIPE_DISTANCE {
                 if let Some(next) = target.cloned()
                     && next != self.workspace.project
                 {
+                    self.sidebar_swipe.consumed = true;
+                    self.sidebar_swipe.drag_offset = 0.;
+                    self.sidebar_swipe.in_swipe_switch = true;
                     self.select_project(next, window, cx);
+                    self.sidebar_swipe.in_swipe_switch = false;
                     // Refresh timestamp after project switch completes so its work
                     // never expires the momentum guard for trailing inertia events.
                     self.sidebar_swipe.last_event = Some(std::time::Instant::now());
+                } else if !cx.reduce_motion() {
+                    // At the first/last project boundary: soft rubber-band resistance.
+                    let mag = self.sidebar_swipe.x.abs();
+                    self.sidebar_swipe.drag_offset =
+                        -self.sidebar_swipe.x.signum() * (1. - (-mag / 36.).exp()) * 16.;
+                    self.project_slide = None;
+                    self.sidebar_frame.update(cx, |_, cx| cx.notify());
                 }
+            } else if !cx.reduce_motion() {
+                // Live follow-finger lead-in before crossing the switch threshold.
+                self.sidebar_swipe.drag_offset = if target.is_some() {
+                    (-self.sidebar_swipe.x * 0.55).clamp(-24., 24.)
+                } else {
+                    let mag = self.sidebar_swipe.x.abs();
+                    -self.sidebar_swipe.x.signum() * (1. - (-mag / 36.).exp()) * 16.
+                };
+                self.project_slide = None;
+                self.sidebar_frame.update(cx, |_, cx| cx.notify());
             }
         }
         true
@@ -7620,6 +7741,7 @@ impl Shell {
             return self.classic_sidebar(cx);
         }
         self.refresh_sidebar_structure(cx);
+        let (slide_x, slide_opacity) = self.sidebar_slide_transform(cx);
         let live_agents = self.live_agents_preview(cx);
         div()
             .id("monocode-sidebar")
@@ -7644,10 +7766,12 @@ impl Shell {
             .flex_col()
             .child(self.sidebar_project_swipe_capture(cx))
             .child(
-                div().flex_1().min_h_0().child(
+                div().flex_1().min_h_0().overflow_hidden().child(
                     div()
                         .relative()
                         .size_full()
+                        .left(px(slide_x))
+                        .opacity(slide_opacity)
                         .flex()
                         .flex_col()
                         .child(

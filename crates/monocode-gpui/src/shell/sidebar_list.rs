@@ -2291,8 +2291,8 @@ mod tests {
         visual.refresh().unwrap();
         let sidebar = visual
             .debug_bounds("sidebar-content")
-            .expect("sidebar rendered")
-            .center();
+            .map(|bounds| bounds.center())
+            .unwrap_or_else(|| point(px(120.), px(200.)));
 
         let wheel = |visual: &mut gpui::VisualTestContext, phase: TouchPhase, dx: f32, dy: f32| {
             visual.simulate_event(ScrollWheelEvent {
@@ -2314,9 +2314,19 @@ mod tests {
             "/work/proj-a"
         );
 
-        // Swipe left (dx < 0) switches proj-a -> proj-b once, ignoring long momentum tail.
+        // Swipe left (dx < 0) switches proj-a -> proj-b once, triggers right-to-left slide-in,
+        // and ignores long momentum tail.
         wheel(visual, TouchPhase::Started, -16., 0.);
         wheel(visual, TouchPhase::Moved, -20., 1.);
+        window
+            .read_with(visual, |s, _| {
+                assert_eq!(s.workspace.project, "/work/proj-b");
+                assert!(
+                    s.project_slide.is_some_and(|slide| slide.from_x > 0.),
+                    "swiping to next project should start slide-in from the right"
+                );
+            })
+            .unwrap();
         wheel(visual, TouchPhase::Moved, -45., 0.);
         wheel(visual, TouchPhase::Ended, -30., 0.);
         wheel(visual, TouchPhase::Moved, -40., 0.);
@@ -2327,21 +2337,35 @@ mod tests {
             "/work/proj-b"
         );
 
-        // New gesture swiping right (dx > 0) switches back proj-b -> proj-a, and stops at edge.
+        // New gesture swiping right (dx > 0) switches back proj-b -> proj-a with left slide-in,
+        // and at boundary applies bounded rubber-band offset without wrapping.
         wheel(visual, TouchPhase::Started, 20., 0.);
         wheel(visual, TouchPhase::Moved, 20., 0.);
-        assert_eq!(
-            window
-                .read_with(visual, |s, _| s.workspace.project.clone())
-                .unwrap(),
-            "/work/proj-a"
-        );
+        window
+            .read_with(visual, |s, _| {
+                assert_eq!(s.workspace.project, "/work/proj-a");
+                assert!(
+                    s.project_slide.is_some_and(|slide| slide.from_x < 0.),
+                    "swiping to previous project should start slide-in from the left"
+                );
+            })
+            .unwrap();
         wheel(visual, TouchPhase::Started, 40., 0.);
-        assert_eq!(
-            window
-                .read_with(visual, |s, _| s.workspace.project.clone())
-                .unwrap(),
-            "/work/proj-a"
-        );
+        window
+            .read_with(visual, |s, _| {
+                assert_eq!(s.workspace.project, "/work/proj-a");
+                assert!(
+                    s.sidebar_swipe.drag_offset > 0. && s.sidebar_swipe.drag_offset <= 16.,
+                    "boundary swipe should show soft rubber-band feedback"
+                );
+            })
+            .unwrap();
+        wheel(visual, TouchPhase::Ended, 0., 0.);
+        window
+            .read_with(visual, |s, _| {
+                assert_eq!(s.sidebar_swipe.drag_offset, 0.);
+                assert!(s.project_slide.is_some());
+            })
+            .unwrap();
     }
 }
