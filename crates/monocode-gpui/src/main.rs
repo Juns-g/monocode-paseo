@@ -466,6 +466,10 @@ fn main() {
             "paseo_host_endpoint".into(),
             serde_json::json!(host.endpoint),
         );
+        workspace.preferences.extra.insert(
+            paseo_host::PASEO_HOSTS.into(),
+            serde_json::to_value(&host.hosts).expect("paseo hosts"),
+        );
         workspace.projects = host.projects.clone();
         for (key, path) in &host.icons {
             workspace

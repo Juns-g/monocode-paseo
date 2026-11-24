@@ -1002,3 +1002,152 @@ test('non-image, incomplete, unsupported and steer attachments never reach the d
   assert.equal(f.events.sends,0);f.close();
 });
 }
+
+// F7: multi-host isolation & routed loopback servers
+import {LOCAL_FS_CAPABILITIES,BASE_CAPABILITIES} from './host-adapter.mjs';
+import {HostRegistry} from './hosts.mjs';
+import {PASEO_CLIENT_CAPABILITIES,createRoutedClient} from './sdk.mjs';
+import {createHostServer} from '../../../host/server.ts';
+{
+const REMOTE_CWD='/home/bianrenping.juns/work/code/ai_scope'; // Non-existent Linux path on macOS.
+const TOKEN='B'.repeat(43);
+
+function remoteFixture(serverId='srv-devbox-boe') {
+  const directory=mkdtempSync(join(tmpdir(),'paseo-remote-host-test-'));
+  const a={id:'remote-agent-1',provider:'codex',cwd:REMOTE_CWD,workspaceId:'w-remote',status:'idle',model:'gpt-5.4',updatedAt:'2026-11-24T00:00:00Z',pendingPermissions:[],activeTurn:null};
+  const e={agent:a,project:{projectKey:'pk-ai-scope',projectName:'ai_scope',workspaceName:'Remote WS',checkout:{cwd:REMOTE_CWD,currentBranch:'main'}}};
+  const client={
+    getLastServerInfoMessage:()=>({serverId,version:'0.17.4'}),
+    fetchAgentHistory:async()=>({entries:[e],pageInfo:{nextCursor:null}}),
+    fetchWorkspaces:async()=>({entries:[{id:'w-remote',name:'Remote WS',title:'Remote WS',workspaceKind:'directory'}],pageInfo:{}}),
+    fetchAgent:async id=>({agent:{...a,id}}),
+    fetchAgentTimeline:async()=>({agent:a,epoch:'e1',hasOlder:false,entries:[
+      {seqStart:1,seqEnd:1,timestamp:'2026-11-24T00:00:00Z',item:{type:'user_message',text:'Hello devbox'}},
+      {seqStart:2,seqEnd:2,timestamp:'2026-11-24T00:00:02Z',item:{type:'assistant_message',text:'Hello from devbox'}}]}),
+    subscribeAgentTimeline:()=>Object.assign(()=>{},{ready:Promise.resolve()}),
+    listAvailableProviders:async()=>({providers:[{provider:'codex',available:true}]}),
+    listProviderModels:async()=>({models:[{provider:'codex',id:'gpt-5.4',label:'GPT-5.4'}]}),
+    listProviderModes:async()=>({modes:[{id:'full-access'}]}),
+    listProviderFeatures:async()=>({features:[]}),
+    getProjectIcon:async id=>({projectId:id,icon:null}),
+    close(){},
+  };
+  const host=new PaseoHost(client,directory,rows=>rows,{isRemoteHost:true,expectedServerId:serverId});
+  host.connected=true;
+  return {host,client,a,e,directory,close(){host.close();rmSync(directory,{recursive:true,force:true});}};
+}
+
+test('remote PaseoHost omits local FS capabilities, skips Mac stat/realpath, creates remotely, and never returns null to host/server.ts',async()=>{
+  assert.equal(typeof PASEO_CLIENT_CAPABILITIES,'object');
+  assert.equal(typeof createRoutedClient,'function');
+  const rf=remoteFixture('srv-devbox-boe');
+  const store={
+    get environmentId(){return rf.host.serverId;},
+    authenticated:v=>v===TOKEN,
+    projects:()=>rf.host.fileProjects(),
+    project:id=>rf.host.fileProject(id),
+  };
+  const server=createHostServer({store},[],undefined,rf.host);
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const endpoint=`http://127.0.0.1:${server.address().port}`;
+  const rpc=async(method,params={})=>{
+    const res=await fetch(`${endpoint}/rpc`,{
+      method:'POST',
+      headers:{Authorization:`Bearer ${TOKEN}`,'Content-Type':'application/json'},
+      body:JSON.stringify({version:1,environmentId:'srv-devbox-boe',method,params}),
+    });
+    return {status:res.status,body:await res.json()};
+  };
+  try{
+    const desc=(await rpc('environment.describe')).body.result;
+    assert.equal(desc.environmentId,'srv-devbox-boe');
+    assert.deepEqual(desc.capabilities,BASE_CAPABILITIES);
+    for(const cap of [...LOCAL_FS_CAPABILITIES,'paseo.hosts']){
+      assert.equal(desc.capabilities.includes(cap),false,`remote host must not advertise ${cap}`);
+    }
+
+    // Remote Linux paths work without touching Mac fs.
+    const visible=(await rpc('projects.list',{})).body.result;
+    assert.equal(visible.length,1);
+    assert.equal(visible[0].cwd,REMOTE_CWD);
+    assert.equal(visible[0].exists,true);
+    assert.deepEqual(rf.host.fileProjects(),[]);
+    assert.throws(()=>rf.host.fileProject(`paseo:${REMOTE_CWD}`),/not mounted/);
+
+    // Every local FS / Git / workspace method explicitly errors and NEVER falls back to host/server.ts.
+    for(const method of ['workspace.run','files.read','files.list','files.index','files.search','files.searchContent','git.diff','git.branches','git.worktrees','git.index','git.fileDiff','projects.browse']){
+      const out=await rpc(method,{projectId:`paseo:${REMOTE_CWD}`,command:'list_dir',path:REMOTE_CWD});
+      assert.equal(out.status,400,`expected 400 rejection for ${method}`);
+      assert.match(out.body.error,/远程宿主机暂不支持/);
+    }
+
+    // Nested host routing from a remote host is refused.
+    assert.equal((await rpc('paseo.hosts.list')).body.result.supported,false);
+    assert.equal((await rpc('paseo.hosts.connect',{serverId:'srv-devbox-ai'})).status,400);
+
+    // Remote create uses POSIX path comparison (never canonicalPath on Mac).
+    let createdWorkspace=null,createdAgent=null;
+    rf.client.createWorkspace=async o=>{createdWorkspace=o;return {workspace:{id:'w-new-remote',name:'New Remote',workspaceDirectory:REMOTE_CWD},error:null};};
+    rf.client.createAgent=async o=>{createdAgent=o;return {...rf.a,id:o.agentId,workspaceId:'w-new-remote',cwd:`${REMOTE_CWD}/`};};
+    const created=(await rpc('commands.dispatch',{
+      type:'create',
+      commandId:'remote-create-1',
+      projectId:`paseo:${REMOTE_CWD}`,
+      harness:'codex',
+      model:'codex:gpt-5.4',
+      worktreeCwd:`${REMOTE_CWD}/`,
+    })).body.result;
+    assert.equal(created.paseoCreated,true);
+    assert.equal(createdWorkspace.source.path,REMOTE_CWD);
+    assert.equal(createdAgent.config.cwd,REMOTE_CWD);
+  }finally{
+    server.close();
+    server.closeAllConnections?.();
+    rf.close();
+  }
+});
+
+test('primary PaseoHost dispatches paseo.hosts.list and paseo.hosts.connect via HostRegistry',async()=>{
+  const lf=fixture();
+  const rf=remoteFixture('srv-devbox-ai');
+  lf.client.getLastServerInfoMessage=()=>({serverId:SERVER,version:'0.17.4',features:{connectedHosts:true}});
+  lf.client.listHosts=async()=>({
+    self:{serverId:SERVER,label:'Local Mac'},
+    hosts:[{registrationId:'r-ai',serverId:'srv-devbox-ai',label:'devbox-ai',enabled:true,status:'online',targetDescription:'ssh://devbox-ai',lastOnlineAt:null,error:null}],
+  });
+  lf.client.openHostRoute=async()=>'route-ai-1';
+  lf.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+  const registry=new HostRegistry({
+    originClient:lf.client,
+    baseDirectory:lf.directory,
+    token:TOKEN,
+    createRoutedClient:()=>({...rf.client,connect:async()=>{},setReconnectEnabled(){},subscribeConnectionStatus:()=>()=>{},subscribeRawMessages:()=>()=>{}}),
+    createAdapter:(c,dir,opts)=>new PaseoHost(c,dir,rows=>rows,opts),
+    createServer:(store,adapter)=>createHostServer({store},[],undefined,adapter),
+  });
+  lf.host.hostRegistry=registry;
+  try{
+    const localCaps=(await lf.host.request('environment.describe',{})).result.capabilities;
+    assert.ok(localCaps.includes('paseo.hosts'));
+    const listed=(await lf.host.request('paseo.hosts.list',{})).result;
+    assert.equal(listed.supported,true);
+    assert.equal(listed.hosts[0].label,'devbox-ai');
+    const connected=(await lf.host.request('paseo.hosts.connect',{serverId:'srv-devbox-ai'})).result;
+    assert.equal(connected.serverId,'srv-devbox-ai');
+    assert.equal(connected.status,'online');
+    assert.match(connected.endpoint,/^http:\/\/127\.0\.0\.1:\d+$/);
+    const remoteProjectsRes=await fetch(`${connected.endpoint}/rpc`,{
+      method:'POST',
+      headers:{Authorization:`Bearer ${TOKEN}`,'Content-Type':'application/json'},
+      body:JSON.stringify({version:1,environmentId:'srv-devbox-ai',method:'projects.list',params:{}}),
+    });
+    const remoteProjects=(await remoteProjectsRes.json()).result;
+    assert.equal(remoteProjects.length,1);
+    assert.equal(remoteProjects[0].cwd,REMOTE_CWD);
+  }finally{
+    registry.close();
+    rf.close();
+    lf.close();
+  }
+});
+}

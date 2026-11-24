@@ -2194,5 +2194,10 @@
   "Clear notes": "清空批注",
   "Remove note": "移除批注",
   "Expand review notes": "展开评审批注",
-  "Collapse review notes": "收起评审批注"
+  "Collapse review notes": "收起评审批注",
+  "Hosts": "宿主机",
+  "Local Mac": "本机 Mac",
+  "Online": "在线",
+  "Offline": "离线",
+  "Remote Paseo host has no projects": "远程 Paseo 宿主机暂无可用项目"
 }

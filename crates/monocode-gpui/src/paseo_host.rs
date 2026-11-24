@@ -145,6 +145,299 @@ pub(crate) fn project_ui(preferences: &crate::settings::Preferences) -> bool {
     active() || preferences.extra.contains_key(PROJECT_SELECTION)
 }
 
+pub(crate) const PASEO_HOSTS: &str = "paseo_hosts";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct RemoteHostInfo {
+    pub(crate) registration_id: String,
+    pub(crate) server_id: Option<String>,
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
+    pub(crate) status: String,
+    pub(crate) target_description: String,
+    pub(crate) is_remote: bool,
+    pub(crate) connected: bool,
+}
+
+pub(crate) fn parse_hosts_response(local_server_id: &str, value: &Value) -> Vec<RemoteHostInfo> {
+    let self_label = value["self"]["label"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Local Mac")
+        .to_owned();
+    let mut out = vec![RemoteHostInfo {
+        registration_id: "self".into(),
+        server_id: Some(local_server_id.to_owned()),
+        label: self_label,
+        enabled: true,
+        status: "online".into(),
+        target_description: "127.0.0.1".into(),
+        is_remote: false,
+        connected: true,
+    }];
+    if let Some(rows) = value["hosts"].as_array() {
+        for row in rows {
+            let server_id = row["serverId"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            if server_id.as_deref() == Some(local_server_id) {
+                continue;
+            }
+            let registration_id = row["registrationId"].as_str().unwrap_or("").to_owned();
+            let target_description = row["targetDescription"].as_str().unwrap_or("").to_owned();
+            let label = row["label"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!target_description.is_empty()).then_some(target_description.as_str()))
+                .or(server_id.as_deref())
+                .unwrap_or(if registration_id.is_empty() {
+                    "Remote host"
+                } else {
+                    &registration_id
+                })
+                .to_owned();
+            let enabled = row["enabled"].as_bool().unwrap_or(true);
+            let status = row["status"]
+                .as_str()
+                .unwrap_or(if enabled { "offline" } else { "disabled" })
+                .to_owned();
+            let connected = row["connected"].as_bool().unwrap_or(false)
+                || row["connectedEndpoint"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty());
+            out.push(RemoteHostInfo {
+                registration_id,
+                server_id,
+                label,
+                enabled,
+                status,
+                target_description,
+                is_remote: true,
+                connected,
+            });
+        }
+    }
+    out
+}
+
+pub(crate) fn list_hosts(
+    connections: &Connections,
+    local_server_id: &str,
+) -> Result<Vec<RemoteHostInfo>, String> {
+    let primary = connections.machine_for_environment(local_server_id)?;
+    let value = connections.request(&primary.id, "paseo.hosts.list", json!({}))?;
+    Ok(parse_hosts_response(local_server_id, &value))
+}
+
+fn cache_project_icon(
+    directory: &Path,
+    remote_key: &str,
+    project: &Value,
+) -> Result<Option<String>, String> {
+    let Some(icon) = project.get("icon") else {
+        return Ok(None);
+    };
+    let (Some(data), Some(mime)) = (icon["data"].as_str(), icon["mimeType"].as_str()) else {
+        return Ok(None);
+    };
+    if data.len() > 2_000_000 {
+        return Ok(None);
+    }
+    let Some(extension) = (match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/svg+xml" => Some("svg"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    use base64::Engine;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+        return Ok(None);
+    };
+    let cache = directory.join("paseo-project-icons");
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    // Agent/project strings never become filesystem path segments.
+    let path = cache.join(format!(
+        "{}.{}",
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            remote_key.hash(&mut h);
+            h.finish()
+        },
+        extension
+    ));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+pub(crate) struct ConnectedRemoteHost {
+    pub(crate) server_id: String,
+    pub(crate) label: String,
+    pub(crate) projects: Vec<String>,
+    pub(crate) all_projects: Vec<String>,
+    pub(crate) labels: std::collections::HashMap<String, String>,
+    pub(crate) icons: std::collections::HashMap<String, String>,
+    pub(crate) summaries: Vec<(monocode_core::store::Session, bool, bool, bool)>,
+    pub(crate) presentation: std::collections::HashMap<i64, Value>,
+    pub(crate) started_by: std::collections::HashMap<i64, i64>,
+}
+
+pub(crate) fn connect_remote_host(
+    directory: &Path,
+    store: &Arc<Mutex<Store>>,
+    connections: &Connections,
+    local_server_id: &str,
+    server_id: &str,
+    selection: &ProjectSelection,
+) -> Result<ConnectedRemoteHost, String> {
+    if server_id.is_empty() || server_id == local_server_id {
+        return Err("Invalid remote Paseo host".into());
+    }
+    let primary = connections.machine_for_environment(local_server_id)?;
+    let info = connections.request(
+        &primary.id,
+        "paseo.hosts.connect",
+        json!({ "serverId": server_id }),
+    )?;
+    if info["serverId"].as_str() != Some(server_id) {
+        return Err("Remote Paseo daemon identity mismatch".into());
+    }
+    let endpoint = info["endpoint"]
+        .as_str()
+        .ok_or("Missing remote host endpoint")?;
+    if !loopback(endpoint) {
+        return Err("Remote Paseo host proxy must bind loopback".into());
+    }
+    let token = std::fs::read_to_string(directory.join("paseo-host-token"))
+        .map_err(|e| format!("Missing Paseo host token: {e}"))?;
+    let label = info["label"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(server_id)
+        .to_owned();
+    let machine = connections.connect(
+        format!("Paseo ({label})"),
+        endpoint.to_owned(),
+        token.trim().to_owned(),
+    )?;
+    if machine.environment_id != server_id {
+        let _ = connections.disconnect(&machine.id);
+        return Err("Remote Paseo daemon identity mismatch".into());
+    }
+    let visible = connections.request(&machine.id, "projects.list", json!({}))?;
+    let projects = connections.request(
+        &machine.id,
+        "projects.list",
+        json!({"includeAll":true,"includeIcons":true}),
+    )?;
+    let rows = projects.as_array().ok_or("Invalid Paseo projects")?;
+    if rows.is_empty() {
+        return Err(crate::i18n::t("Remote Paseo host has no projects"));
+    }
+
+    let mut labels = std::collections::HashMap::new();
+    let mut icons = std::collections::HashMap::new();
+    let mut all_projects = Vec::new();
+    let mut chosen_projects = Vec::new();
+
+    let remembered = {
+        let guard = store.lock().map_err(|_| "Store unavailable")?;
+        guard.ephemeral_remote_status(&machine.environment_id);
+        let mut items = Vec::with_capacity(rows.len());
+        for project in rows {
+            let remote = guard.remember_remote_project(&machine.environment_id, project)?;
+            let is_visible = visible
+                .as_array()
+                .is_some_and(|v| v.iter().any(|p| p["id"] == project["id"]));
+            let name = project["name"].as_str().unwrap_or("Paseo");
+            let chosen = selection.includes(&remote.key, name, is_visible);
+            items.push((remote, project.clone(), is_visible, chosen));
+        }
+        items
+    };
+
+    let any_chosen = remembered.iter().any(|(_, _, _, chosen)| *chosen);
+    let fallback_idx = if any_chosen {
+        None
+    } else {
+        remembered
+            .iter()
+            .position(|(_, _, is_visible, _)| *is_visible)
+            .or(Some(0))
+    };
+
+    let mut fetched_sessions = Vec::new();
+    for (idx, (remote, project, _, chosen)) in remembered.into_iter().enumerate() {
+        let include = chosen || fallback_idx == Some(idx);
+        let raw_name = project["name"].as_str().unwrap_or("Paseo");
+        labels.insert(remote.key.clone(), format!("{raw_name} · {label}"));
+        all_projects.push(remote.key.clone());
+        if let Some(icon_path) = cache_project_icon(directory, &remote.key, &project)? {
+            icons.insert(remote.key.clone(), icon_path);
+        }
+        if include {
+            chosen_projects.push(remote.key.clone());
+            let response = connections.request(
+                &machine.id,
+                "sessions.list",
+                json!({"projectId": remote.project_id}),
+            )?;
+            let values = response
+                .as_array()
+                .or_else(|| response["values"].as_array())
+                .ok_or("Invalid Paseo sessions")?
+                .clone();
+            fetched_sessions.push((remote, values));
+        }
+    }
+
+    let (summaries, presentation, started_by) = {
+        let guard = store.lock().map_err(|_| "Store unavailable")?;
+        let mut all_summaries = Vec::new();
+        let mut all_presentation = std::collections::HashMap::new();
+        for (remote, values) in &fetched_sessions {
+            let registered = guard.sync_remote_summaries(remote, values)?;
+            for (r, v) in registered.into_iter().zip(values) {
+                all_presentation.insert(
+                    r.summary.id,
+                    json!({
+                        "bucket": v["paseoBucket"],
+                        "enteredAt": v["paseoStatusEnteredAt"],
+                        "createdAt": v["createdAt"],
+                        "workspaceAnchor": v["paseoWorkspaceAnchor"],
+                    }),
+                );
+                all_summaries.push((r.summary, r.running, r.needs_input, v["draft"] == true));
+            }
+        }
+        let retained: std::collections::HashSet<_> = chosen_projects.iter().cloned().collect();
+        guard.compact_remote_cache(&machine.environment_id, &retained)?;
+        let started_by = guard.started_links()?;
+        (all_summaries, all_presentation, started_by)
+    };
+
+    Ok(ConnectedRemoteHost {
+        server_id: machine.environment_id,
+        label,
+        projects: chosen_projects,
+        all_projects,
+        labels,
+        icons,
+        summaries,
+        presentation,
+        started_by,
+    })
+}
+
 pub(crate) struct Host {
     pub(crate) child: Arc<Mutex<Child>>,
     pub(crate) cwd: String,
@@ -156,6 +449,7 @@ pub(crate) struct Host {
     pub(crate) all_projects: Vec<String>,
     pub(crate) icons: std::collections::HashMap<String, String>,
     pub(crate) labels: std::collections::HashMap<String, String>,
+    pub(crate) hosts: Vec<RemoteHostInfo>,
 }
 impl Drop for Host {
     fn drop(&mut self) {
@@ -222,6 +516,7 @@ pub(crate) fn start(directory: &Path) -> Result<Host, String> {
         projects: Vec::new(),
         all_projects: Vec::new(),
         icons: Default::default(),
+        hosts: Vec::new(),
     };
     let (send, receive) = mpsc::channel();
     std::thread::spawn(move || {
@@ -271,6 +566,8 @@ pub(crate) fn start(directory: &Path) -> Result<Host, String> {
     }
     host.server_id = machine.environment_id.clone();
     host.endpoint = machine.endpoint.clone();
+    host.hosts = list_hosts(&connections, &host.server_id)
+        .unwrap_or_else(|_| parse_hosts_response(&host.server_id, &json!({})));
     let db = Store::open_monocode(&directory.join("monocode.db"))?;
     db.ephemeral_remote_status(&machine.environment_id);
     let visible = connections.request(&machine.id, "projects.list", json!({}))?;
@@ -340,36 +637,8 @@ pub(crate) fn start(directory: &Path) -> Result<Host, String> {
         if chosen {
             host.projects.push(remote.key.clone());
         }
-        if let Some(icon) = project.get("icon")
-            && let (Some(data), Some(mime)) = (icon["data"].as_str(), icon["mimeType"].as_str())
-            && data.len() <= 2_000_000
-            && let Some(extension) = match mime {
-                "image/png" => Some("png"),
-                "image/jpeg" => Some("jpg"),
-                "image/svg+xml" => Some("svg"),
-                "image/webp" => Some("webp"),
-                _ => None,
-            }
-        {
-            use base64::Engine;
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                let cache = directory.join("paseo-project-icons");
-                std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-                // Agent/project strings never become filesystem path segments.
-                let path = cache.join(format!(
-                    "{}.{}",
-                    {
-                        use std::hash::{Hash, Hasher};
-                        let mut h = std::hash::DefaultHasher::new();
-                        remote.key.hash(&mut h);
-                        h.finish()
-                    },
-                    extension
-                ));
-                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-                host.icons
-                    .insert(remote.key.clone(), path.to_string_lossy().into_owned());
-            }
+        if let Some(icon_path) = cache_project_icon(directory, &remote.key, project)? {
+            host.icons.insert(remote.key.clone(), icon_path);
         }
     }
     host.cwd = host
@@ -985,5 +1254,475 @@ mod tests {
             .unwrap()
             .save(output.join("r13-native-queue.png"))
             .unwrap();
+    }
+
+    struct MockLoopbackHost {
+        endpoint: String,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl MockLoopbackHost {
+        fn spawn(
+            env_id: &'static str,
+            expected_token: &'static str,
+            capabilities: Vec<&'static str>,
+            mut handler: impl FnMut(&str, &Value) -> Result<Value, String> + Send + 'static,
+        ) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let done = stopped.clone();
+            let join = std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut size = 0usize;
+                    let mut authorized = false;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("content-length") {
+                                size = v.trim().parse().unwrap_or(0);
+                            } else if k.eq_ignore_ascii_case("authorization") {
+                                authorized = v.trim() == format!("Bearer {expected_token}");
+                            }
+                        }
+                    }
+                    let mut buf = vec![0u8; size];
+                    let _ = reader.read_exact(&mut buf);
+                    if !authorized {
+                        let body = r#"{"error":"Device credential is invalid"}"#;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        continue;
+                    }
+                    let req: Value = serde_json::from_slice(&buf).unwrap_or_else(|_| json!({}));
+                    let method = req["method"].as_str().unwrap_or("");
+                    let reply = if method == "environment.describe" {
+                        Ok(json!({
+                            "protocolVersion": 1,
+                            "environmentId": env_id,
+                            "name": format!("Paseo {env_id}"),
+                            "providers": ["codex"],
+                            "capabilities": capabilities,
+                        }))
+                    } else if req["environmentId"].as_str() != Some(env_id) {
+                        Err("Host identity changed".into())
+                    } else {
+                        handler(method, &req["params"])
+                    };
+                    let (status, payload) = match reply {
+                        Ok(result) => ("200 OK", json!({ "result": result }).to_string()),
+                        Err(error) => ("400 Bad Request", json!({ "error": error }).to_string()),
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                }
+            });
+            Self {
+                endpoint,
+                stopped,
+                join: Some(join),
+            }
+        }
+    }
+    impl Drop for MockLoopbackHost {
+        fn drop(&mut self) {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    #[test]
+    fn multihost_terminal_and_local_file_isolation_and_cross_host_session_scoping() {
+        // Remote Devbox paths must never pass terminal_path or local_file against local-mac-id.
+        assert_eq!(
+            terminal_path(
+                true,
+                "local-mac-id",
+                "remote://devbox-boe-id/home/user/repo",
+                "http://127.0.0.1:1234",
+                "/home/user/repo",
+            ),
+            Err("Terminals are not available on remote projects.")
+        );
+        assert_eq!(
+            local_file(
+                true,
+                "local-mac-id",
+                "http://127.0.0.1:1234",
+                "remote://devbox-boe-id/home/user/repo/src/lib.rs:10:1",
+            ),
+            None
+        );
+        assert_eq!(
+            local_file(
+                true,
+                "local-mac-id",
+                "http://127.0.0.1:1234",
+                "remote://local-mac-id/Users/user/repo/src/lib.rs:10:1",
+            ),
+            Some("/Users/user/repo/src/lib.rs:10:1".into())
+        );
+
+        // Identical repo cwds and identical agent IDs on Local Mac vs devbox-boe vs devbox-ai
+        // never collide on project keys, session handles, or parent/child links.
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let proj_json =
+            json!({"id": "paseo:/work/ai_scope", "cwd": "/work/ai_scope", "name": "ai_scope"});
+        let mac_proj = store
+            .remember_remote_project("local-mac-id", &proj_json)
+            .unwrap();
+        let boe_proj = store
+            .remember_remote_project("devbox-boe-id", &proj_json)
+            .unwrap();
+        let ai_proj = store
+            .remember_remote_project("devbox-ai-id", &proj_json)
+            .unwrap();
+        assert_ne!(mac_proj.key, boe_proj.key);
+        assert_ne!(boe_proj.key, ai_proj.key);
+        assert_ne!(mac_proj.key, ai_proj.key);
+
+        let mac_sessions = vec![
+            json!({"id": "shared-root", "title": "Mac Root", "harness": "codex", "model": "codex:gpt-5.4", "status": "idle", "updatedAt": 1000}),
+        ];
+        let boe_sessions = vec![
+            json!({"id": "shared-root", "title": "BOE Root", "harness": "codex", "model": "codex:gpt-5.4", "status": "idle", "updatedAt": 2000}),
+            json!({"id": "boe-child-only", "title": "BOE Child", "harness": "codex", "model": "codex:gpt-5.4", "status": "running", "updatedAt": 2100, "paseoParentAgentId": "shared-root"}),
+            json!({"id": "orphan-foreign-child", "title": "Orphan Child", "harness": "codex", "model": "codex:gpt-5.4", "status": "idle", "updatedAt": 2200, "paseoParentAgentId": "mac-only-parent"}),
+        ];
+        let mac_only = vec![
+            json!({"id": "shared-root", "title": "Mac Root", "harness": "codex", "model": "codex:gpt-5.4", "status": "idle", "updatedAt": 1000}),
+            json!({"id": "mac-only-parent", "title": "Mac Only Parent", "harness": "codex", "model": "codex:gpt-5.4", "status": "idle", "updatedAt": 1500}),
+        ];
+        let _ = mac_sessions;
+        let mac_reg = store.sync_remote_summaries(&mac_proj, &mac_only).unwrap();
+        let boe_reg = store
+            .sync_remote_summaries(&boe_proj, &boe_sessions)
+            .unwrap();
+        assert_ne!(mac_reg[0].summary.id, boe_reg[0].summary.id);
+        let links = store.started_links().unwrap();
+        // boe-child-only links ONLY to BOE's shared-root, NEVER Mac's shared-root.
+        assert_eq!(
+            links.get(&boe_reg[1].summary.id),
+            Some(&boe_reg[0].summary.id)
+        );
+        // orphan-foreign-child does NOT cross-link to mac-only-parent on local-mac-id!
+        assert_eq!(links.get(&boe_reg[2].summary.id), None);
+    }
+
+    #[test]
+    fn multihost_discovery_and_connect_remote_host_roundtrip() {
+        const TOKEN: &str = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let dir = std::env::temp_dir().join(format!(
+            "paseo-multihost-rust-test-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("paseo-host-token"), TOKEN).unwrap();
+
+        let boe_server = MockLoopbackHost::spawn(
+            "srv-devbox-boe",
+            TOKEN,
+            vec!["sessions", "paseo.workspaces", "paseo.usage"],
+            |method, _params| match method {
+                "projects.list" => Ok(json!([
+                    {"id": "paseo:/home/user/ai_scope", "cwd": "/home/user/ai_scope", "name": "ai_scope", "exists": true, "active": true}
+                ])),
+                "sessions.list" => Ok(json!([
+                    {"id": "boe-root", "title": "Devbox BOE Task", "harness": "codex", "model": "codex:gpt-5.4", "status": "idle", "updatedAt": 5000, "paseoBucket": "done", "paseoWorkspaceAnchor": true},
+                    {"id": "boe-sub", "title": "Devbox Subagent", "harness": "codex", "model": "codex:gpt-5.4", "status": "running", "updatedAt": 5100, "paseoBucket": "running", "paseoParentAgentId": "boe-root"}
+                ])),
+                _ => Err(format!("unexpected remote method {method}")),
+            },
+        );
+        let boe_endpoint = boe_server.endpoint.clone();
+
+        let local_server = MockLoopbackHost::spawn(
+            "local-mac-id",
+            TOKEN,
+            vec!["sessions", "paseo.hosts", "files.read"],
+            move |method, params| match method {
+                "paseo.hosts.list" => Ok(json!({
+                    "supported": true,
+                    "self": {"serverId": "local-mac-id", "label": "Local Mac"},
+                    "hosts": [
+                        {"registrationId": "r1", "serverId": "srv-devbox-boe", "label": "devbox-boe", "enabled": true, "status": "online", "targetDescription": "ssh://devbox-boe", "connected": false},
+                        {"registrationId": "r2", "serverId": "srv-devbox-ai", "label": "devbox-ai", "enabled": true, "status": "offline", "targetDescription": "ssh://devbox-ai", "connected": false}
+                    ]
+                })),
+                "paseo.hosts.connect" => match params["serverId"].as_str() {
+                    Some("srv-devbox-boe") => Ok(json!({
+                        "serverId": "srv-devbox-boe",
+                        "label": "devbox-boe",
+                        "status": "online",
+                        "endpoint": boe_endpoint,
+                        "isRemote": true,
+                    })),
+                    Some("srv-non-loopback") => Ok(json!({
+                        "serverId": "srv-non-loopback",
+                        "label": "evil",
+                        "status": "online",
+                        "endpoint": "http://192.0.2.10:9999",
+                        "isRemote": true,
+                    })),
+                    _ => Err("Host offline".into()),
+                },
+                _ => Err(format!("unexpected local method {method}")),
+            },
+        );
+
+        let connections = Connections::new(&dir);
+        connections
+            .connect("Paseo".into(), local_server.endpoint.clone(), TOKEN.into())
+            .unwrap();
+        let store = Arc::new(Mutex::new(Store::open(&dir.join("monocode.db")).unwrap()));
+
+        let hosts = list_hosts(&connections, "local-mac-id").unwrap();
+        assert_eq!(hosts.len(), 3);
+        assert_eq!(hosts[0].label, "Local Mac");
+        assert!(!hosts[0].is_remote);
+        assert_eq!(hosts[1].label, "devbox-boe");
+        assert_eq!(hosts[1].status, "online");
+        assert_eq!(hosts[2].label, "devbox-ai");
+        assert_eq!(hosts[2].status, "offline");
+
+        assert!(
+            connect_remote_host(
+                &dir,
+                &store,
+                &connections,
+                "local-mac-id",
+                "local-mac-id",
+                &ProjectSelection::default(),
+            )
+            .is_err()
+        );
+        assert!(
+            connect_remote_host(
+                &dir,
+                &store,
+                &connections,
+                "local-mac-id",
+                "srv-non-loopback",
+                &ProjectSelection::default(),
+            )
+            .is_err()
+        );
+
+        let connected = connect_remote_host(
+            &dir,
+            &store,
+            &connections,
+            "local-mac-id",
+            "srv-devbox-boe",
+            &ProjectSelection::default(),
+        )
+        .unwrap();
+        assert_eq!(connected.server_id, "srv-devbox-boe");
+        assert_eq!(
+            connected.projects,
+            vec!["remote://srv-devbox-boe/home/user/ai_scope"]
+        );
+        assert_eq!(
+            connected
+                .labels
+                .get("remote://srv-devbox-boe/home/user/ai_scope"),
+            Some(&"ai_scope · devbox-boe".to_owned())
+        );
+        assert_eq!(connected.summaries.len(), 2);
+        let root_id = connected.summaries[0].0.id;
+        let sub_id = connected.summaries[1].0.id;
+        assert_eq!(connected.started_by.get(&sub_id), Some(&root_id));
+        assert!(
+            connections
+                .machine_for_environment("srv-devbox-boe")
+                .is_ok()
+        );
+
+        drop(boe_server);
+        drop(local_server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn paseo_shell_host_switcher_connects_devbox_and_keeps_local_authority_pinned(
+        cx: &mut TestAppContext,
+    ) {
+        const TOKEN: &str = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+        cx.update(configure);
+        let dir = std::env::temp_dir().join(format!(
+            "paseo-shell-multihost-test-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("paseo-host-token"), TOKEN).unwrap();
+
+        let boe_server = MockLoopbackHost::spawn(
+            "srv-devbox-boe",
+            TOKEN,
+            vec!["sessions", "paseo.workspaces"],
+            |method, _params| match method {
+                "projects.list" => Ok(json!([
+                    {"id": "paseo:/home/bianrenping.juns/ai_scope", "cwd": "/home/bianrenping.juns/ai_scope", "name": "ai_scope", "exists": true, "active": true}
+                ])),
+                "sessions.list" => Ok(json!([
+                    {"id": "boe-1", "title": "BOE Remote Session", "harness": "codex", "model": "codex:gpt-5.4", "status": "idle", "updatedAt": 9000, "paseoBucket": "done", "paseoWorkspaceAnchor": true}
+                ])),
+                _ => Err(format!("unexpected remote method {method}")),
+            },
+        );
+        let boe_endpoint = boe_server.endpoint.clone();
+        let initial_hosts = vec![
+            RemoteHostInfo {
+                registration_id: "self".into(),
+                server_id: Some("paseo-fixture".into()),
+                label: "Local Mac".into(),
+                enabled: true,
+                status: "online".into(),
+                target_description: "127.0.0.1".into(),
+                is_remote: false,
+                connected: true,
+            },
+            RemoteHostInfo {
+                registration_id: "r-boe".into(),
+                server_id: Some("srv-devbox-boe".into()),
+                label: "devbox-boe".into(),
+                enabled: true,
+                status: "online".into(),
+                target_description: "ssh://devbox-boe".into(),
+                is_remote: true,
+                connected: false,
+            },
+            RemoteHostInfo {
+                registration_id: "r-ai".into(),
+                server_id: Some("srv-devbox-ai".into()),
+                label: "devbox-ai".into(),
+                enabled: true,
+                status: "offline".into(),
+                target_description: "ssh://devbox-ai".into(),
+                is_remote: true,
+                connected: false,
+            },
+        ];
+
+        let local_server = MockLoopbackHost::spawn(
+            "paseo-fixture",
+            TOKEN,
+            vec!["sessions", "paseo.hosts", "files.read"],
+            move |method, params| match method {
+                "paseo.hosts.list" => Ok(json!({
+                    "supported": true,
+                    "self": {"serverId": "paseo-fixture", "label": "Local Mac"},
+                    "hosts": [
+                        {"registrationId": "r-boe", "serverId": "srv-devbox-boe", "label": "devbox-boe", "enabled": true, "status": "online", "targetDescription": "ssh://devbox-boe", "connected": false},
+                        {"registrationId": "r-ai", "serverId": "srv-devbox-ai", "label": "devbox-ai", "enabled": true, "status": "offline", "targetDescription": "ssh://devbox-ai", "connected": false}
+                    ]
+                })),
+                "paseo.hosts.connect" if params["serverId"] == "srv-devbox-boe" => Ok(json!({
+                    "serverId": "srv-devbox-boe",
+                    "label": "devbox-boe",
+                    "status": "online",
+                    "endpoint": boe_endpoint,
+                    "isRemote": true,
+                })),
+                "sessions.list" => Ok(json!([])),
+                _ => Err(format!("unexpected local method {method}")),
+            },
+        );
+
+        let connections = Arc::new(Connections::new(&dir));
+        connections
+            .connect("Paseo".into(), local_server.endpoint.clone(), TOKEN.into())
+            .unwrap();
+
+        let window = cx.add_window(|_, cx| crate::shell::paseo_shell_fixture(cx));
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+
+        let local_endpoint = local_server.endpoint.clone();
+        let dir_for_shell = dir.clone();
+        window
+            .update(visual, |shell, w, cx| {
+                shell.paseo_fixture_wire_multihost(
+                    dir_for_shell,
+                    connections.clone(),
+                    "paseo-fixture",
+                    &local_endpoint,
+                    initial_hosts,
+                );
+                // Offline devbox-ai is disabled in the Header menu and must not switch project.
+                shell.paseo_fixture_pick_header_action("paseo-host:srv-devbox-ai", w, cx);
+                assert_eq!(shell.workspace.project, "remote://paseo-fixture/fixture");
+
+                // Online devbox-boe connects on demand in background and switches project.
+                shell.paseo_fixture_pick_header_action("paseo-host:srv-devbox-boe", w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+
+        window
+            .update(visual, |shell, w, cx| {
+                assert_eq!(
+                    shell.workspace.project,
+                    "remote://srv-devbox-boe/home/bianrenping.juns/ai_scope"
+                );
+                assert_eq!(
+                    shell.paseo_fixture_current_project_label(),
+                    "ai_scope · devbox-boe"
+                );
+                assert_eq!(
+                    shell.paseo_fixture_session_titles_for_project(
+                        "remote://srv-devbox-boe/home/bianrenping.juns/ai_scope"
+                    ),
+                    vec!["BOE Remote Session".to_owned()]
+                );
+                shell.paseo_fixture_assert_remote_host_isolated(
+                    "paseo-fixture",
+                    "remote://srv-devbox-boe/home/bianrenping.juns/ai_scope/README.md:1:1",
+                    w,
+                    cx,
+                );
+
+                // Switching back to Local Mac restores the local Paseo project immediately.
+                shell.paseo_fixture_pick_header_action("paseo-host:paseo-fixture", w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+
+        window
+            .update(visual, |shell, _, _| {
+                assert_eq!(shell.workspace.project, "remote://paseo-fixture/fixture");
+            })
+            .unwrap();
+
+        drop(boe_server);
+        drop(local_server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
