@@ -88,6 +88,7 @@ pub fn review_index(cwd: &Path, previous: Option<&DiffIndex>) -> Result<DiffInde
             deletions: old.map_or(0, |f| f.deletions),
             staged: !untracked && x != b' ',
             unstaged: untracked || y != b' ',
+            index_oid: None,
         });
     }
     files.sort_by(|a, b| a.relative.cmp(&b.relative));
@@ -117,37 +118,125 @@ struct DiskVersion {
     identity: (u64, u64, i64, i64),
 }
 
+/// Most paths one `stat_files` request carries.
+const MAX_STAT_FILES: usize = 64;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteMtime {
+    mtime_ms: Option<u64>,
+}
+
+/// A remote file's version from the listing alone, or `None` when only its
+/// diff can tell (a host too old to send `indexOid`, or no stat available).
+/// `mtime` is `Some(None)` for a file the host could not stat as a regular
+/// file, and `None` when stat results are missing.
+pub(super) fn remote_fast_version(
+    file: &ChangedFile,
+    staged: bool,
+    head: &Option<String>,
+    mtime: Option<Option<u64>>,
+) -> Option<FileDiffVersion> {
+    let tracked = file.index_oid.is_some();
+    if staged {
+        let oid = file.index_oid.as_deref()?;
+        return Some(FileDiffVersion {
+            index: format!(
+                "{oid}:{}:{}:{}",
+                file.status, file.additions, file.deletions
+            ),
+            head: head.clone(),
+            disk: None,
+        });
+    }
+    if !tracked && file.status != "untracked" {
+        return None;
+    }
+    let mtime = mtime?;
+    Some(FileDiffVersion {
+        index: format!(
+            "{}:{}:{}:{}:{:?}",
+            file.index_oid.as_deref().unwrap_or(""),
+            file.status,
+            file.additions,
+            file.deletions,
+            mtime
+        ),
+        head: None,
+        disk: None,
+    })
+}
+
+/// Remote versions without a diff per file: index blob IDs from the listing
+/// plus one batched `stat_files` per 64 unstaged files. Files the listing
+/// cannot version fall back to fingerprinting their bounded diff contents so
+/// equal line counts cannot hide an external host edit.
+fn remote_file_diff_versions(
+    cwd: &Path,
+    snapshot: &DiffIndex,
+) -> Result<HashMap<String, FileDiffVersion>, String> {
+    use sha2::{Digest, Sha256};
+    let wanted: Vec<&ChangedFile> = snapshot
+        .files
+        .iter()
+        .filter(|file| file.unstaged && (file.index_oid.is_some() || file.status == "untracked"))
+        .collect();
+    let mut mtimes: HashMap<String, Option<u64>> = HashMap::new();
+    for chunk in wanted.chunks(MAX_STAT_FILES) {
+        let paths: Vec<&str> = chunk.iter().map(|file| file.path.as_str()).collect();
+        // The host answers in request order. A failed or mismatched stat only
+        // sends those files to the diff fallback.
+        if let Ok(stats) =
+            remote_workspace::command::<Vec<RemoteMtime>>("stat_files", json!({ "paths": paths }))
+        {
+            if stats.len() == chunk.len() {
+                mtimes.extend(
+                    chunk
+                        .iter()
+                        .zip(stats)
+                        .map(|(file, stat)| (file.path.clone(), stat.mtime_ms)),
+                );
+            }
+        }
+    }
+    let mut versions = HashMap::new();
+    for file in &snapshot.files {
+        for staged in [true, false] {
+            if if staged { !file.staged } else { !file.unstaged } {
+                continue;
+            }
+            let mtime = mtimes.get(&file.path).copied();
+            let version = match remote_fast_version(file, staged, &snapshot.head, mtime) {
+                Some(version) => version,
+                None => {
+                    let diff = file_diff(cwd, &file.relative, staged)?;
+                    let bytes = serde_json::to_vec(&diff).map_err(|error| error.to_string())?;
+                    FileDiffVersion {
+                        index: format!("{:x}", Sha256::digest(bytes)),
+                        head: snapshot.head.clone(),
+                        disk: None,
+                    }
+                }
+            };
+            versions.insert(
+                format!(
+                    "{}:{}",
+                    if staged { "staged" } else { "unstaged" },
+                    file.relative
+                ),
+                version,
+            );
+        }
+    }
+    Ok(versions)
+}
+
 pub fn file_diff_versions(
     cwd: &Path,
     snapshot: &DiffIndex,
 ) -> Result<HashMap<String, FileDiffVersion>, String> {
     if remote_workspace::is_remote(cwd) {
-        // The host exposes no index object IDs. Fingerprint the bounded diff
-        // contents so equal line counts cannot hide an external host edit.
-        use sha2::{Digest, Sha256};
-        let mut versions = HashMap::new();
-        for file in &snapshot.files {
-            for staged in [true, false] {
-                if if staged { !file.staged } else { !file.unstaged } {
-                    continue;
-                }
-                let diff = file_diff(cwd, &file.relative, staged)?;
-                let bytes = serde_json::to_vec(&diff).map_err(|error| error.to_string())?;
-                versions.insert(
-                    format!(
-                        "{}:{}",
-                        if staged { "staged" } else { "unstaged" },
-                        file.relative
-                    ),
-                    FileDiffVersion {
-                        index: format!("{:x}", Sha256::digest(bytes)),
-                        head: snapshot.head.clone(),
-                        disk: None,
-                    },
-                );
-            }
-        }
-        return Ok(versions);
+        return remote_file_diff_versions(cwd, snapshot);
     }
     let root = expand_home(cwd);
     let listing = git_run(&root, &["ls-files", "--stage", "-z", "--", "."])
@@ -288,6 +377,7 @@ pub fn commit_files(cwd: &Path, sha: &str) -> Result<Vec<ChangedFile>, String> {
         deletions,
         staged: false,
         unstaged: false,
+        index_oid: None,
     };
     for (relative, acc) in files {
         seen.insert(relative.clone());

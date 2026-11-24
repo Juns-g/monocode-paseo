@@ -342,6 +342,7 @@ fn session_files(cwd: &str, session: i64) -> Result<Listed, String> {
                 deletions: f.deletions,
                 staged: false,
                 unstaged: true,
+                index_oid: None,
             })
             .collect(),
         None,
@@ -2297,6 +2298,7 @@ mod tests {
             deletions: 0,
             staged,
             unstaged,
+            index_oid: None,
         }
     }
     #[test]

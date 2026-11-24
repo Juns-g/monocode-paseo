@@ -36,11 +36,33 @@ pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     if crate::files::remote::is_remote(cwd) {
         return Err("This isn’t available for projects on another machine yet.".into());
     }
-    let mut command = Command::new("git");
+    let mut command = Command::new(crate::scm::git_binary());
     command
         .current_dir(cwd)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
+    if !matches!(
+        args.first().copied(),
+        Some(
+            "switch"
+                | "checkout"
+                | "worktree"
+                | "branch"
+                | "commit"
+                | "push"
+                | "pull"
+                | "fetch"
+                | "merge"
+                | "rebase"
+                | "reset"
+                | "stash"
+                | "add"
+                | "restore"
+                | "clone"
+        )
+    ) {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
     crate::process::configure_child(&mut command);
     let out = command
         .output()

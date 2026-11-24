@@ -49,6 +49,10 @@ pub struct ChangedFile {
     pub deletions: i64,
     pub staged: bool,
     pub unstaged: bool,
+    /// The index blob ID of a tracked file, when the host reports it. Remote
+    /// hosts send it so versions can be compared without reading diffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_oid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -613,6 +617,7 @@ fn diff_index_with(root: &Path, include_sync: bool) -> DiffIndex {
             deletions: acc.deletions,
             staged: acc.staged,
             unstaged: acc.untracked || acc.unstaged,
+            index_oid: None,
         });
     }
     out.sort_by(|a, b| a.relative.cmp(&b.relative));
@@ -1149,11 +1154,71 @@ fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, String> {
 /// Any git can start a filter (git-lfs), which a Finder launch's bare PATH
 /// lacks. The cached search path finds it without waiting on the login shell.
 pub(crate) fn git_cmd() -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_binary());
     crate::process::configure_child(&mut cmd);
     cmd.env("PATH", shell::cached_gui_search_path())
         .env("GIT_TERMINAL_PROMPT", "0");
     cmd
+}
+
+/// The Git every spawn runs. On macOS a bare `git` is often a shell wrapper
+/// or the `/usr/bin/git` Xcode shim, each of which execs again before real
+/// Git starts; resolve the native binary once instead.
+pub(crate) fn git_binary() -> &'static Path {
+    static GIT_BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    GIT_BIN.get_or_init(resolve_real_git_binary).as_path()
+}
+
+fn resolve_real_git_binary() -> std::path::PathBuf {
+    if let Some(value) = std::env::var_os("MONOCODE_GIT_BIN").filter(|v| !v.is_empty()) {
+        return value.into();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::path::PathBuf;
+        for candidate in ["/opt/homebrew/bin/git", "/usr/local/bin/git"] {
+            if is_native_executable(Path::new(candidate)) {
+                return candidate.into();
+            }
+        }
+        if let Ok(output) = Command::new("/usr/bin/xcrun").args(["-f", "git"]).output() {
+            let found = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            if output.status.success()
+                && found != Path::new("/usr/bin/git")
+                && is_native_executable(&found)
+            {
+                return found;
+            }
+        }
+        if is_native_executable(Path::new("/usr/bin/git")) {
+            return "/usr/bin/git".into();
+        }
+    }
+    "git".into()
+}
+
+/// A regular executable file that is not a `#!` script.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn is_native_executable(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = true;
+    if !meta.is_file() || !executable {
+        return false;
+    }
+    let mut magic = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && &magic != b"#!"
 }
 
 fn git_cmd_for_args_with_path(args: &[&str], gui_path: impl FnOnce() -> String) -> Command {
@@ -1371,7 +1436,13 @@ pub fn git_dirs(root: &Path) -> Vec<std::path::PathBuf> {
 }
 
 fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
-    let output = git_cmd().arg("-C").arg(root).args(args).output().ok()?;
+    let output = git_cmd()
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

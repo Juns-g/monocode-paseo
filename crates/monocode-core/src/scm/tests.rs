@@ -1032,3 +1032,109 @@ fn commit_files_and_diffs_include_the_root_commit() {
     assert_eq!(commit_files(dir.path(), &root).unwrap().len(), 1);
     assert!(commit_files(dir.path(), "not-a-sha").is_err());
 }
+
+#[test]
+fn git_binary_skips_shell_wrappers_and_shims() {
+    let git = git_binary();
+    #[cfg(target_os = "macos")]
+    {
+        assert!(git.is_absolute(), "{git:?}");
+        assert_ne!(git, Path::new("/usr/bin/git"));
+        assert!(is_native_executable(git), "{git:?}");
+    }
+    assert!(Command::new(git)
+        .arg("--version")
+        .output()
+        .unwrap()
+        .status
+        .success());
+}
+
+#[test]
+fn native_executable_rejects_scripts_and_plain_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp();
+    let write = |name: &str, bytes: &[u8], mode: u32| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    };
+    assert!(!is_native_executable(&write(
+        "script",
+        b"#!/bin/bash\nexec git\n",
+        0o755
+    )));
+    assert!(!is_native_executable(&write("data", b"\x7fELF", 0o644)));
+    assert!(is_native_executable(&write("bin", b"\x7fELF", 0o755)));
+    assert!(!is_native_executable(&dir.path().join("missing")));
+}
+
+#[test]
+fn changed_file_reads_with_and_without_index_oid() {
+    let legacy = r#"{"path":"p","relative":"a","status":"modified","additions":1,"deletions":2,"staged":true,"unstaged":false}"#;
+    let file: ChangedFile = serde_json::from_str(legacy).unwrap();
+    assert_eq!(file.index_oid, None);
+    assert!(!serde_json::to_string(&file).unwrap().contains("indexOid"));
+    let current = legacy.replace(
+        "\"unstaged\":false",
+        "\"unstaged\":false,\"indexOid\":\"abc123\"",
+    );
+    let file: ChangedFile = serde_json::from_str(&current).unwrap();
+    assert_eq!(file.index_oid.as_deref(), Some("abc123"));
+    assert!(serde_json::to_string(&file)
+        .unwrap()
+        .contains("\"indexOid\":\"abc123\""));
+}
+
+fn remote_file(status: &str, oid: Option<&str>) -> ChangedFile {
+    ChangedFile {
+        path: "remote://env/repo/a".into(),
+        relative: "a".into(),
+        status: status.into(),
+        additions: 1,
+        deletions: 2,
+        staged: true,
+        unstaged: true,
+        index_oid: oid.map(Into::into),
+    }
+}
+
+#[test]
+fn remote_versions_use_listing_and_mtime_without_diffs() {
+    let head = Some("h1".to_string());
+    let tracked = remote_file("modified", Some("oid1"));
+    let staged = review::remote_fast_version(&tracked, true, &head, None).unwrap();
+    assert_eq!(
+        staged,
+        review::remote_fast_version(&tracked, true, &head, Some(Some(9))).unwrap(),
+        "staged versions ignore the disk"
+    );
+    let moved = Some("h2".to_string());
+    assert_ne!(
+        staged,
+        review::remote_fast_version(&tracked, true, &moved, None).unwrap()
+    );
+    let restaged = remote_file("modified", Some("oid2"));
+    assert_ne!(
+        staged,
+        review::remote_fast_version(&restaged, true, &head, None).unwrap()
+    );
+    // Unstaged needs a stat; edits change only the mtime part.
+    assert!(review::remote_fast_version(&tracked, false, &head, None).is_none());
+    let a = review::remote_fast_version(&tracked, false, &head, Some(Some(10))).unwrap();
+    let b = review::remote_fast_version(&tracked, false, &head, Some(Some(11))).unwrap();
+    let gone = review::remote_fast_version(&tracked, false, &head, Some(None)).unwrap();
+    assert!(a != b && a != gone);
+    // An untracked file has no index entry but is still versioned by mtime.
+    let untracked = remote_file("untracked", None);
+    assert!(review::remote_fast_version(&untracked, false, &head, Some(Some(5))).is_some());
+}
+
+#[test]
+fn remote_versions_fall_back_for_hosts_without_index_oid() {
+    let head = None;
+    let legacy = remote_file("modified", None);
+    assert!(review::remote_fast_version(&legacy, true, &head, Some(Some(1))).is_none());
+    assert!(review::remote_fast_version(&legacy, false, &head, Some(Some(1))).is_none());
+}

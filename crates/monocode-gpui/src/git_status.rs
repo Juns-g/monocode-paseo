@@ -11,8 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Without a file watcher, visible status polls on this interval.
-const POLL: Duration = Duration::from_secs(2);
+/// Without a file watcher, a visible local checkout polls on this interval.
+const LOCAL_POLL: Duration = Duration::from_secs(2);
+/// A project on another machine can't be watched from here. It polls this
+/// often, backing off up to `REMOTE_POLL_MAX` while reads are slow or failing.
+const REMOTE_POLL_BASE: Duration = Duration::from_secs(15);
+const REMOTE_POLL_MAX: Duration = Duration::from_secs(60);
+const SLOW_RELOAD: Duration = Duration::from_secs(1);
+/// The host serves a repeated status read from a cache for about 3s, so a
+/// working-tree edit seen by the watcher is read once more after it expires.
+const HOST_CACHE_SETTLE: Duration = Duration::from_millis(3200);
+/// Focus and visibility changes within this long of a read don't repeat it.
+const FOCUS_DEDUPE: Duration = Duration::from_secs(2);
 const RESUME_TTL: Duration = Duration::from_secs(30);
 /// A burst of writes settles into one read this long after the last.
 const SETTLE: Duration = Duration::from_millis(300);
@@ -79,7 +89,9 @@ pub(crate) struct ProjectGit {
     pending: bool,
     stats_loaded: Option<Instant>,
     /// Reads while status is visible: a file watcher, or a timer without one.
-    poll: Option<[Task<()>; 2]>,
+    poll: Option<Task<()>>,
+    last_reload_ok: bool,
+    last_reload_duration: Duration,
 }
 impl EventEmitter<GitChanged> for ProjectGit {}
 
@@ -100,6 +112,8 @@ impl ProjectGit {
             pending: false,
             stats_loaded: None,
             poll: None,
+            last_reload_ok: true,
+            last_reload_duration: Duration::ZERO,
         };
         this.set_project(project, cx);
         this
@@ -140,7 +154,8 @@ impl ProjectGit {
     }
     /// While the project's Git status is visible, read it again whenever the
     /// checkout or its Git directory changes on disk, and every 30s besides.
-    /// Without a file watcher, poll every 2s instead.
+    /// Without a file watcher, poll instead: every 2s for a local checkout,
+    /// every 15s (backing off) for a project on another machine.
     pub(crate) fn set_polling(&mut self, polling: bool, cx: &mut Context<Self>) {
         if polling == self.poll.is_some() {
             return;
@@ -149,28 +164,56 @@ impl ProjectGit {
             self.poll = None;
             return;
         }
-        self.reload(cx);
-        let project = PathBuf::from(&self.project);
-        let watched = cx.spawn(async move |this, cx| {
-            let watch = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut roots = vec![project.clone()];
-                    roots.extend(
-                        scm::git_dirs(&project)
-                            .into_iter()
-                            .filter(|dir| !dir.starts_with(&project)),
-                    );
-                    crate::fs_watch::watch(&roots)
-                })
-                .await;
+        self.reload_unless_fresh(cx);
+        let remote = self.project.starts_with("remote://");
+        // Only a checkout on this Mac is watched; a host elsewhere never
+        // resolves to a local path.
+        let watch_dir = local_watch_dir(&self.project, cx);
+        self.poll = Some(cx.spawn(async move |this, cx| {
+            let watch = match watch_dir {
+                Some(dir) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            let mut roots = vec![dir.clone()];
+                            roots.extend(
+                                scm::git_dirs(&dir)
+                                    .into_iter()
+                                    .filter(|git| !git.starts_with(&dir)),
+                            );
+                            crate::fs_watch::watch(&roots)
+                        })
+                        .await
+                }
+                None => None,
+            };
             let Some((_watch, changes)) = watch else {
+                let mut interval = if remote { REMOTE_POLL_BASE } else { LOCAL_POLL };
                 loop {
-                    cx.background_executor().timer(POLL).await;
-                    if this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                    cx.background_executor().timer(interval).await;
+                    let Ok((ok, took)) = this.update(cx, |this, cx| {
+                        this.reload(cx);
+                        (this.last_reload_ok, this.last_reload_duration)
+                    }) else {
                         return;
+                    };
+                    if remote {
+                        interval = next_remote_poll_interval(interval, ok, took);
                     }
                 }
+            };
+            // Only alongside a watcher: a missed event is repaired by a slow
+            // read. It stops with the watcher when `poll` drops.
+            let Ok(_repair) = this.update(cx, |_, cx| {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(REPAIR).await;
+                        if this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                            break;
+                        }
+                    }
+                })
+            }) else {
+                return;
             };
             while changes.recv().await.is_ok() {
                 cx.background_executor().timer(SETTLE).await;
@@ -178,17 +221,29 @@ impl ProjectGit {
                 if this.update(cx, |this, cx| this.reload(cx)).is_err() {
                     return;
                 }
-            }
-        });
-        let repair = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(REPAIR).await;
-                if this.update(cx, |this, cx| this.reload(cx)).is_err() {
-                    break;
+                if remote {
+                    // A host that cached the last read may have missed this
+                    // edit; read once more when its cache has expired, unless
+                    // a newer change already asked.
+                    cx.background_executor().timer(HOST_CACHE_SETTLE).await;
+                    if changes.is_empty() && this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                        return;
+                    }
                 }
             }
-        });
-        self.poll = Some([watched, repair]);
+        }));
+    }
+    /// Reads now unless one just ran or is running: focus and visibility
+    /// changes arrive together and would otherwise read twice.
+    fn reload_unless_fresh(&mut self, cx: &mut Context<Self>) {
+        if self.in_flight
+            || self
+                .stats_loaded
+                .is_some_and(|at| at.elapsed() < FOCUS_DEDUPE)
+        {
+            return;
+        }
+        self.reload(cx);
     }
     /// useProjectDiffStats reads again on focus once its snapshot is 30s old.
     pub(crate) fn resume(&mut self, cx: &mut Context<Self>) {
@@ -198,7 +253,7 @@ impl ProjectGit {
             || self.poll.is_some()
         {
             self.warm_choices(cx);
-            self.reload(cx);
+            self.reload_unless_fresh(cx);
         }
     }
     /// A mutation or file operation: reread now and tell every view.
@@ -231,6 +286,7 @@ impl ProjectGit {
         self.in_flight = true;
         let project = self.project.clone();
         let path = PathBuf::from(&project);
+        let started = Instant::now();
         let work = cx.background_executor().spawn(async move {
             let index = scm::diff_index(&path)?;
             let versions = scm::file_diff_versions(&path, &index).ok();
@@ -240,6 +296,8 @@ impl ProjectGit {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.in_flight = false;
+                this.last_reload_ok = result.is_ok();
+                this.last_reload_duration = started.elapsed();
                 // A slow or unavailable checkout keeps its last snapshot, and
                 // never takes another checkout's.
                 if this.project == project
@@ -292,6 +350,45 @@ impl ProjectGit {
         self.stats.as_ref().is_some_and(|s| s.files > 0)
     }
 }
+/// The next remote poll wait: back off while reads are slow or failing,
+/// return to the base once one is quick and succeeds.
+fn next_remote_poll_interval(current: Duration, ok: bool, took: Duration) -> Duration {
+    if !ok || took >= SLOW_RELOAD {
+        (current * 2).min(REMOTE_POLL_MAX)
+    } else {
+        REMOTE_POLL_BASE
+    }
+}
+
+/// The folder to watch for a project on this Mac. A `remote://` project is
+/// local only when it names this Mac's own loopback Paseo host; any other
+/// host's path never maps onto a local one.
+fn watch_path(enabled: bool, expected: &str, endpoint: &str, project: &str) -> Option<PathBuf> {
+    if !project.starts_with("remote://") {
+        return Some(PathBuf::from(project));
+    }
+    let local = crate::paseo_host::local_file(enabled, expected, endpoint, project)?;
+    let path = PathBuf::from(local);
+    if !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+fn local_watch_dir(project: &str, cx: &gpui::App) -> Option<PathBuf> {
+    if !project.starts_with("remote://") {
+        return Some(PathBuf::from(project));
+    }
+    let prefs = cx.try_global::<crate::settings::Preferences>()?;
+    let extra = |key: &str| prefs.extra.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    watch_path(
+        crate::paseo_host::project_ui(prefs),
+        extra("paseo_environment"),
+        extra("paseo_host_endpoint"),
+        project,
+    )
+}
+
 fn stats_of(index: &DiffIndex) -> DiffStats {
     DiffStats {
         files: index.files.len() as i64,
@@ -304,6 +401,7 @@ fn stats_of(index: &DiffIndex) -> DiffStats {
 mod tests {
     use super::*;
     use monocode_core::scm::ChangedFile;
+    use std::path::Path;
     fn file(path: &str, status: &str) -> ChangedFile {
         ChangedFile {
             path: path.into(),
@@ -313,6 +411,7 @@ mod tests {
             deletions: 0,
             staged: false,
             unstaged: true,
+            index_oid: None,
         }
     }
     #[test]
@@ -330,5 +429,48 @@ mod tests {
         assert_eq!(map.dirs["/r/a"], "modified");
         assert!(!map.dirs.contains_key("/r"));
         assert_eq!(map.files["/r/a/gone.rs"], "deleted");
+    }
+
+    #[test]
+    fn remote_polls_back_off_on_slow_or_failed_reads_and_reset_when_quick() {
+        let fast = Duration::from_millis(50);
+        let slow = Duration::from_secs(1);
+        let mut at = REMOTE_POLL_BASE;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            at = next_remote_poll_interval(at, true, slow);
+            seen.push(at.as_secs());
+        }
+        assert_eq!(seen, [30, 60, 60, 60]);
+        assert_eq!(next_remote_poll_interval(at, false, fast).as_secs(), 60);
+        assert_eq!(next_remote_poll_interval(at, true, fast), REMOTE_POLL_BASE);
+        assert_eq!(
+            next_remote_poll_interval(REMOTE_POLL_BASE, false, fast).as_secs(),
+            30
+        );
+    }
+
+    #[test]
+    fn only_a_loopback_hosts_projects_resolve_to_a_local_watch_folder() {
+        let dir = std::env::temp_dir().join(format!("monocode-watch-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.canonicalize().unwrap();
+        let host = real.to_str().unwrap();
+        let link = monocode_core::remote::remote_path("fixture", host);
+        let local = "http://127.0.0.1:1234";
+        assert_eq!(
+            watch_path(true, "fixture", local, &link).as_deref(),
+            Some(real.as_path())
+        );
+        assert_eq!(
+            watch_path(false, "x", "", "/plain/dir").as_deref(),
+            Some(Path::new("/plain/dir"))
+        );
+        assert!(watch_path(true, "other", local, &link).is_none());
+        assert!(watch_path(true, "fixture", "http://example.invalid:1234", &link).is_none());
+        assert!(watch_path(false, "fixture", local, &link).is_none());
+        let missing = monocode_core::remote::remote_path("fixture", "/synthetic/missing");
+        assert!(watch_path(true, "fixture", local, &missing).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

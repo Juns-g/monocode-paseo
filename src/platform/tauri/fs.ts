@@ -191,6 +191,7 @@ export type GitChangedFile = {
   deletions: number;
   staged: boolean;
   unstaged: boolean;
+  indexOid?: string;
 };
 
 export type GitDiffIndex = {

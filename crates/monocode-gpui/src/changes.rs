@@ -2024,6 +2024,7 @@ mod tests {
             deletions: 0,
             staged: false,
             unstaged: true,
+            index_oid: None,
         }
     }
     #[test]
