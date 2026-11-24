@@ -573,7 +573,8 @@ impl Conversation {
         });
         let transcript = cx.new(|_| {
             let mut view = TranscriptView::new();
-            view.identity(&summary.provider, Kind::from_id(&summary.provider).label());
+            let brand = crate::theme::canonical_provider_brand(&summary.provider);
+            view.identity(&summary.provider, Kind::from_id(brand).label());
             view.file_link_base = Some(summary.cwd.clone());
             view
         });

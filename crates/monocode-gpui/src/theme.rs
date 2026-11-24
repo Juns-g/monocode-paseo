@@ -436,10 +436,20 @@ pub(crate) fn icon(path: &'static str, side: f32) -> Svg {
         .text_color(content(0.5))
         .flex_shrink_0()
 }
+/// Normalize Paseo custom provider aliases (e.g. `agy`, `agy-polish`, `omp-acp`)
+/// to their visual brand identity without altering wire provider IDs.
+pub(crate) fn canonical_provider_brand(provider: &str) -> &str {
+    match provider {
+        "agy" => "antigravity",
+        p if p.starts_with("agy-") => "antigravity",
+        "omp-acp" => "omp",
+        p => p,
+    }
+}
 /// A provider's brand fill for its icon tile, top and bottom of a gentle
 /// gradient. `None` for a multicolour logo that keeps a light tile.
 pub(crate) fn provider_tile(provider: &str) -> Option<(Hsla, Hsla)> {
-    let (top, bottom) = match provider {
+    let (top, bottom) = match canonical_provider_brand(provider) {
         "claude" => (0xE3876A, 0xD06A49),
         "antigravity" => return None,
         // The violet-to-pink of its mark.
@@ -456,7 +466,7 @@ pub(crate) fn provider_tile(provider: &str) -> Option<(Hsla, Hsla)> {
 /// The provider's mark in white, to sit on its [`provider_tile`] colour.
 /// A multicolour logo sits on a neutral tile in that tile's ink.
 pub(crate) fn provider_glyph(provider: &str, side: f32) -> AnyElement {
-    let (path, scale) = match provider {
+    let (path, scale) = match canonical_provider_brand(provider) {
         // A multicolour logo on a neutral tile: one colour, like the rest.
         "antigravity" => {
             return svg()
@@ -489,7 +499,7 @@ pub(crate) fn provider_glyph(provider: &str, side: f32) -> AnyElement {
 }
 
 pub(crate) fn provider_icon(provider: &str, side: f32) -> Div {
-    let (path, monochrome, scale) = match provider {
+    let (path, monochrome, scale) = match canonical_provider_brand(provider) {
         "claude" => ("claude.svg", false, 1.),
         "cursor" => ("cursor.svg", true, 1.),
         "grok" => ("grok.svg", true, 1.),
@@ -714,5 +724,19 @@ mod composer_tests {
         assert!(configure_project(&preferences, None, false, false));
         assert!(!tweening());
         assert_eq!(accent_color(), app_accent);
+    }
+
+    #[test]
+    fn paseo_provider_aliases_map_to_expected_brand_and_tile() {
+        assert_eq!(canonical_provider_brand("agy"), "antigravity");
+        assert_eq!(canonical_provider_brand("agy-polish"), "antigravity");
+        assert_eq!(canonical_provider_brand("antigravity"), "antigravity");
+        assert_eq!(canonical_provider_brand("omp-acp"), "omp");
+        assert_eq!(canonical_provider_brand("codex"), "codex");
+        assert_eq!(provider_tile("agy"), None);
+        assert_eq!(provider_tile("agy-polish"), None);
+        assert_eq!(provider_tile("antigravity"), None);
+        assert_eq!(provider_tile("omp-acp"), provider_tile("omp"));
+        assert_ne!(provider_tile("agy"), provider_tile("codex"));
     }
 }
