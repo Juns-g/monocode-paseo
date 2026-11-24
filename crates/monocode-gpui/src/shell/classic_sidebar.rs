@@ -270,6 +270,11 @@ impl Shell {
     pub(super) fn classic_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.refresh_sidebar_structure(cx);
         let (slide_x, neighbor_page) = self.sidebar_carousel_layout(cx);
+        if let Some((ref neighbor_path, _)) = neighbor_page {
+            self.ensure_sidebar_preview_cache(neighbor_path, cx);
+        }
+        let width = self.workspace.sidebar_width.max(160.);
+        let show_divider = slide_x.abs() > 0.5 && (width - slide_x.abs()) > 0.5;
         if self
             .classic_worktree_picker
             .as_ref()
@@ -391,7 +396,12 @@ impl Shell {
                                 .h_full()
                                 .flex()
                                 .flex_col()
-                                .child(self.sidebar_project_preview(&neighbor_path, cx)),
+                                .child(self.sidebar_project_preview(
+                                    &neighbor_path,
+                                    false,
+                                    show_divider,
+                                    cx,
+                                )),
                         )
                     }),
             )

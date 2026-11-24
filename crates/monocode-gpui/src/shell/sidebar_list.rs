@@ -286,7 +286,7 @@ impl Shell {
 
     /// A Paseo folder lists only rows the sidebar shows on their own: a
     /// sub agent travels with its parent's rail. A folder with none is hidden.
-    fn visible_folder_entry(&self, entry: &Entry) -> Option<Entry> {
+    fn visible_folder_entry_with(&self, entry: &Entry, children: &HashSet<i64>) -> Option<Entry> {
         let Entry::Folder { id, sessions } = entry else {
             return Some(entry.clone());
         };
@@ -296,7 +296,7 @@ impl Shell {
         let sessions: Vec<_> = sessions
             .iter()
             .copied()
-            .filter(|id| !self.rails.children.contains(id))
+            .filter(|id| !children.contains(id))
             .collect();
         (!sessions.is_empty()).then(|| Entry::Folder {
             id: id.clone(),
@@ -305,6 +305,28 @@ impl Shell {
     }
 
     pub(super) fn prepare_sidebar_list(&mut self, entries: &[Entry], cx: &App) {
+        let ids = self.sidebar_session_ids(cx);
+        let rows = self.build_sidebar_rows_for(
+            &self.workspace.project,
+            &ids,
+            entries,
+            &self.rails.children,
+            cx,
+        );
+        self.sidebar_list.update(self.sidebar_scope(), rows);
+    }
+
+    /// Pure sidebar row planner shared by both the live virtualized sidebar and
+    /// the adjacent-project carousel preview so both render identical structure.
+    pub(super) fn build_sidebar_rows_for(
+        &self,
+        project: &str,
+        all_ids: &[i64],
+        entries: &[Entry],
+        children: &HashSet<i64>,
+        cx: &App,
+    ) -> Vec<Row> {
+        let groups = self.project_groups_for(project);
         if crate::paseo_host::project_ui(&self.workspace.preferences)
             && self
                 .workspace
@@ -315,8 +337,11 @@ impl Shell {
                 == Some("status")
         {
             let mut rows = vec![Row::Navigation];
-            let mut ids = self.sidebar_session_ids(cx);
-            ids.retain(|id| !self.rails.children.contains(id));
+            let mut ids: Vec<i64> = all_ids
+                .iter()
+                .copied()
+                .filter(|id| !children.contains(id))
+                .collect();
             let empty = ids.is_empty();
             if let Some(entry @ Entry::Pinned { sessions }) = entries
                 .iter()
@@ -325,7 +350,7 @@ impl Shell {
                 let pinned: HashSet<_> = sessions
                     .iter()
                     .copied()
-                    .filter(|id| !self.rails.children.contains(id))
+                    .filter(|id| !children.contains(id))
                     .collect();
                 if !pinned.is_empty() {
                     rows.push(if self.workspace.classic_layout {
@@ -334,7 +359,7 @@ impl Shell {
                         Row::Pinned
                     });
                     if !self.workspace.classic_layout
-                        || !self.project_groups().pinned_collapsed
+                        || !groups.pinned_collapsed
                         || !self.query.is_empty()
                     {
                         rows.extend(
@@ -349,13 +374,12 @@ impl Shell {
                 }
             }
             // Folders follow Pinned; their members leave the status buckets.
-            let groups = self.project_groups();
             let mut folders = false;
             for entry in entries {
                 let Entry::Folder { id, .. } = entry else {
                     continue;
                 };
-                let Some(entry) = self.visible_folder_entry(entry) else {
+                let Some(entry) = self.visible_folder_entry_with(entry, children) else {
                     continue;
                 };
                 let Entry::Folder { sessions, .. } = &entry else {
@@ -456,19 +480,16 @@ impl Shell {
                 });
                 rows.push(Row::Empty);
             }
-            self.sidebar_list.update(self.sidebar_scope(), rows);
-            return;
+            return rows;
         }
         if self.workspace.classic_layout {
-            self.prepare_classic_sidebar_list(entries);
-            return;
+            return self.build_classic_sidebar_rows_for(&groups, entries, children);
         }
-        let groups = self.project_groups();
         let now = monocode_core::time::now_ms();
         let mut rows = vec![Row::Navigation, Row::Monos];
         let mut folders = false;
         for entry in entries {
-            let Some(entry) = self.visible_folder_entry(entry) else {
+            let Some(entry) = self.visible_folder_entry_with(entry, children) else {
                 continue;
             };
             let entry = &entry;
@@ -484,7 +505,7 @@ impl Shell {
                     rows.extend(
                         sessions
                             .iter()
-                            .filter(|id| !self.rails.children.contains(id))
+                            .filter(|id| !children.contains(id))
                             .map(|id| Row::Session(*id)),
                     );
                     rows.push(Row::Gap);
@@ -508,7 +529,7 @@ impl Shell {
                 let members: Vec<_> = members
                     .iter()
                     .copied()
-                    .filter(|id| !self.rails.children.contains(id))
+                    .filter(|id| !children.contains(id))
                     .collect();
                 rows.extend(
                     members
@@ -531,7 +552,7 @@ impl Shell {
             let Entry::Session(id) = entry else {
                 continue;
             };
-            if self.rails.children.contains(id) {
+            if children.contains(id) {
                 continue;
             }
             let created = crate::paseo_host::project_ui(&self.workspace.preferences)
@@ -567,16 +588,20 @@ impl Shell {
                 rows.push(Row::Empty);
             }
         }
-        self.sidebar_list.update(self.sidebar_scope(), rows);
+        rows
     }
 
-    fn prepare_classic_sidebar_list(&mut self, entries: &[Entry]) {
-        let groups = self.project_groups();
+    fn build_classic_sidebar_rows_for(
+        &self,
+        groups: &monocode_core::session_groups::Groups,
+        entries: &[Entry],
+        children: &HashSet<i64>,
+    ) -> Vec<Row> {
         // Original Sidebar.tsx: the list has p-1.5, gap-0.5 and pb-10.
         // Its project navigation and Mono roster belong to the first rail.
         let mut rows = vec![Row::ClassicGap(6)];
         for (ix, entry) in entries.iter().enumerate() {
-            let Some(entry) = self.visible_folder_entry(entry) else {
+            let Some(entry) = self.visible_folder_entry_with(entry, children) else {
                 continue;
             };
             let entry = &entry;
@@ -585,7 +610,7 @@ impl Shell {
             }
             let (members, collapsed) = match entry {
                 Entry::Session(id) => {
-                    if !self.rails.children.contains(id) {
+                    if !children.contains(id) {
                         rows.push(Row::Session(*id));
                     }
                     continue;
@@ -606,7 +631,7 @@ impl Shell {
                 let members: Vec<_> = members
                     .iter()
                     .copied()
-                    .filter(|id| !self.rails.children.contains(id))
+                    .filter(|id| !children.contains(id))
                     .collect();
                 rows.extend(
                     members
@@ -631,7 +656,7 @@ impl Shell {
             rows.push(Row::Empty);
         }
         rows.push(Row::ClassicGap(40));
-        self.sidebar_list.update(self.sidebar_scope(), rows);
+        rows
     }
 
     fn sync_sidebar_list_visibility(&mut self) {
@@ -804,6 +829,16 @@ impl Shell {
 /// The navigation rows' trailing column: centred 7px in from the row's
 /// padding, on the same axis as the section headers' 24px icon buttons.
 const TRAILING_SLOT: f32 = 14.;
+
+pub(super) fn sidebar_nav_label(label: &'static str) -> String {
+    // In zh-CN, global `"New": "新"` is meant for diff Old/New headers; the
+    // sidebar's New row starts a new conversation and should read "新建对话".
+    if label == "New" && crate::i18n::language() == "zh-CN" {
+        crate::i18n::t("New chat")
+    } else {
+        crate::i18n::t(label)
+    }
+}
 
 impl Shell {
     pub(super) fn sidebar_options_menu_items(&self) -> Vec<MenuItem> {
@@ -1026,7 +1061,7 @@ impl Shell {
                         } else {
                             0.35
                         })))
-                        .child(div().flex_1().child(crate::i18n::t(label)))
+                        .child(div().flex_1().child(sidebar_nav_label(label)))
                         .when_some(
                             match label {
                                 "New" => Some(format!("{MOD}T").into_any_element()),
@@ -1081,6 +1116,109 @@ impl Shell {
                             }
                             this.notify_navigation(cx);
                         }))
+                }),
+            )
+            .into_any()
+    }
+    /// Static pixel-identical navigation row for an adjacent project's carousel preview.
+    pub(super) fn preview_sidebar_navigation(&self, blank_session: bool, cx: &App) -> AnyElement {
+        let focused = !self.workspace.classic_layout;
+        div()
+            .w_full()
+            .px_2()
+            .pt(px(if self.workspace.classic_layout {
+                2.
+            } else {
+                4.
+            }))
+            .pb(px(if self.workspace.classic_layout {
+                8.
+            } else {
+                12.
+            }))
+            .flex()
+            .flex_col()
+            .gap_px()
+            .children(
+                [
+                    ("New", "square-plus"),
+                    ("Inbox", "inbox"),
+                    ("Notes", "note"),
+                    ("Automations", "zap"),
+                ]
+                .into_iter()
+                .filter(|(label, _)| match *label {
+                    "New" => focused,
+                    "Notes" => {
+                        self.workspace.preferences.notes && self.workspace.sidebar_notes_visible
+                    }
+                    "Automations" => self.workspace.sidebar_automations_visible,
+                    "Inbox" => self.workspace.sidebar_inbox_visible,
+                    _ => true,
+                })
+                .map(|(label, glyph)| {
+                    let glyph = if self.workspace.classic_layout && label == "Notes" {
+                        "file"
+                    } else {
+                        glyph
+                    };
+                    let selected = label == "New" && blank_session;
+                    let unread = label == "Inbox"
+                        && self
+                            .inbox
+                            .as_ref()
+                            .is_some_and(|inbox| inbox.read(cx).unread_count() > 0);
+                    div()
+                        .h(px(32.))
+                        .px_2()
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(content(if selected { 1. } else { 0.5 }))
+                        .when(selected, |d| d.bg(content(0.1)))
+                        .child(icon(glyph, 16.).text_color(content(if selected {
+                            0.7
+                        } else {
+                            0.35
+                        })))
+                        .child(div().flex_1().child(sidebar_nav_label(label)))
+                        .when_some(
+                            match label {
+                                "New" => Some(format!("{MOD}T").into_any_element()),
+                                "Notes" => self
+                                    .note_count
+                                    .map(|count| count.to_string().into_any_element()),
+                                "Inbox" if unread => Some(
+                                    div()
+                                        .flex_shrink_0()
+                                        .size(px(if self.workspace.classic_layout {
+                                            8.
+                                        } else {
+                                            6.
+                                        }))
+                                        .rounded_full()
+                                        .bg(accent_color())
+                                        .into_any_element(),
+                                ),
+                                _ => None,
+                            },
+                            |row, trailing| {
+                                row.child(
+                                    div()
+                                        .w(px(TRAILING_SLOT))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .justify_center()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(content(0.35))
+                                        .child(trailing),
+                                )
+                            },
+                        )
                 }),
             )
             .into_any()
@@ -2347,15 +2485,39 @@ mod tests {
                 assert_eq!(s.carousel_active_project(), "/work/proj-b");
             })
             .unwrap();
-        // Fast-forward spring start and tick frame -> lands seamlessly on proj-b (never proj-c!).
+        // Fast-forward spring start and tick frame -> keeps proj-b pinned at x=0 (zero 1-frame
+        // flash back to proj-a!) until deferred commit atomically swaps to proj-b (never proj-c!).
         window
             .update(visual, |s, w, cx| {
                 if let Some(sl) = &mut s.project_slide {
                     sl.start = std::time::Instant::now() - std::time::Duration::from_secs(1);
                 }
-                if let Some(target) = s.tick_sidebar_carousel(cx) {
-                    s.commit_sidebar_carousel_project(target, w, cx);
-                }
+                let target = s
+                    .tick_sidebar_carousel(cx)
+                    .expect("settled commit spring returns target once");
+                assert_eq!(target, "/work/proj-b");
+                // Before deferred commit fires, preview MUST stay pinned at x = 0 (no flash back).
+                let (_, pinned_neighbor) = s.sidebar_carousel_layout(cx);
+                let (pinned_path, pinned_x) =
+                    pinned_neighbor.expect("incoming preview stays pinned until deferred commit");
+                assert_eq!(pinned_path, "/work/proj-b");
+                assert!(
+                    pinned_x.abs() < 0.5,
+                    "incoming preview must sit at x=0 before commit, got {pinned_x}"
+                );
+                // Second tick before defer must not double-dispatch.
+                assert!(s.tick_sidebar_carousel(cx).is_none());
+                // Preview cache shares the exact real sidebar row structure (starts with Navigation).
+                s.ensure_sidebar_preview_cache("/work/proj-b", cx);
+                let cached = s
+                    .sidebar_swipe
+                    .preview_cache
+                    .as_ref()
+                    .expect("preview cache populated");
+                assert_eq!(cached.project, "/work/proj-b");
+                assert!(matches!(cached.rows.first(), Some(Row::Navigation)));
+                s.commit_sidebar_carousel_project(target, w, cx);
+                assert!(s.project_slide.is_none());
             })
             .unwrap();
         assert_eq!(
@@ -2410,5 +2572,25 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[test]
+    fn sidebar_new_nav_label_uses_new_chat_in_zh_cn() {
+        let mut prefs = crate::settings::Preferences {
+            native_locale: Some("zh-CN".into()),
+            ..Default::default()
+        };
+        prefs.extra.insert(
+            crate::paseo_host::PROJECT_SELECTION.into(),
+            serde_json::json!({}),
+        );
+        crate::i18n::configure(&prefs);
+        assert_eq!(super::sidebar_nav_label("New"), "新建对话");
+        // Diff headers still keep `"New" -> "新"` via global i18n.
+        assert_eq!(crate::i18n::t("New"), "新");
+
+        prefs.native_locale = Some("en".into());
+        crate::i18n::configure(&prefs);
+        assert_eq!(super::sidebar_nav_label("New"), "New");
     }
 }

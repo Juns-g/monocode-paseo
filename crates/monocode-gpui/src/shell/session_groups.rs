@@ -293,10 +293,10 @@ impl Shell {
         self.notify_sidebar(cx);
     }
     pub(super) fn project_groups(&self) -> Groups {
-        self.groups
-            .get(&self.workspace.project)
-            .cloned()
-            .unwrap_or_default()
+        self.project_groups_for(&self.workspace.project)
+    }
+    pub(super) fn project_groups_for(&self, project: &str) -> Groups {
+        self.groups.get(project).cloned().unwrap_or_default()
     }
     /// A Paseo sub agent currently nested on its parent's rail.
     pub(super) fn paseo_nested_child(&self, id: i64) -> bool {
@@ -370,6 +370,9 @@ impl Shell {
 
     /// The project's sidebar entries, reminders first.
     pub(super) fn session_entries(&self, ids: &[i64], cx: &App) -> Vec<Entry> {
+        self.session_entries_for(&self.workspace.project, ids, cx)
+    }
+    pub(super) fn session_entries_for(&self, project: &str, ids: &[i64], cx: &App) -> Vec<Entry> {
         let reminders: Vec<_> = self
             .reminders
             .iter()
@@ -378,7 +381,7 @@ impl Shell {
         build_list(
             ids,
             |id| self.session_metadata(id, cx).summary.pinned,
-            &self.project_groups(),
+            &self.project_groups_for(project),
             &reminders,
         )
     }
@@ -1348,6 +1351,121 @@ impl Shell {
             .as_ref()
             .and_then(|f| self.rename_row(&RenameTarget::Folder(f.clone()), cx))
             .unwrap_or_else(|| self.group_row(&key, name, glyph, color, expanded, sessions, cx))
+    }
+    /// Static pixel-identical group header for an adjacent project's carousel preview.
+    pub(super) fn preview_group_header(
+        &self,
+        project: &str,
+        entry: &Entry,
+        cx: &App,
+    ) -> AnyElement {
+        let searching = !self.query.is_empty();
+        let folders = self.project_groups_for(project);
+        let (name, glyph, color, collapsed, sessions): (
+            String,
+            &'static str,
+            Option<gpui::Hsla>,
+            bool,
+            &Vec<i64>,
+        ) = match entry {
+            Entry::Reminders {
+                collapsed,
+                sessions,
+            } => (
+                "Reminders".into(),
+                "clock",
+                Some(rgb(REMINDERS_COLOR).into()),
+                *collapsed,
+                sessions,
+            ),
+            Entry::Folder { id, sessions } => {
+                let Some(folder) = folders.folder(id) else {
+                    return div().into_any();
+                };
+                (
+                    folder.name.clone(),
+                    "folder",
+                    folder
+                        .custom_color
+                        .as_deref()
+                        .and_then(|color| color.strip_prefix('#'))
+                        .and_then(|color| u32::from_str_radix(color, 16).ok())
+                        .map(|color| rgb(color).into())
+                        .or_else(|| folder.color_index.and_then(folder_color)),
+                    folder.collapsed,
+                    sessions,
+                )
+            }
+            Entry::Pinned { sessions } if self.workspace.classic_layout => (
+                "Pinned".into(),
+                "pin",
+                None,
+                folders.pinned_collapsed,
+                sessions,
+            ),
+            Entry::Pinned { .. } | Entry::Session(_) => return div().into_any(),
+        };
+        let expanded = searching || !collapsed;
+        let approval = sessions
+            .iter()
+            .any(|id| self.session_metadata(*id, cx).needs_approval());
+        let done = sessions.iter().any(|id| self.unseen_finished.contains(id));
+        let mark = {
+            let icon = icon(glyph, 16.);
+            match color {
+                Some(color) => icon.text_color(color),
+                None => icon,
+            }
+        };
+        div()
+            .h(px(32.))
+            .px_2()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_color(content(0.5))
+            .when(expanded, |d| d.bg(content(0.05)).text_color(content(0.8)))
+            .child(
+                div()
+                    .size(px(16.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.7)
+                    .child(if expanded {
+                        icon("chevron-down", 16.).into_any_element()
+                    } else {
+                        mark.into_any_element()
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .text_color(content(0.4))
+                    .when(!expanded && approval, |d| {
+                        d.child(icon("circle-alert", 12.).text_color(rgb(0xfbbf24)))
+                    })
+                    .when(!expanded && !approval && done, |d| {
+                        d.child(icon("check-circle-2", 12.).text_color(rgb(0x2dd4bf)))
+                    })
+                    .child(sessions.len().to_string()),
+            )
+            .into_any()
     }
     #[allow(clippy::too_many_arguments)]
     fn group_row(

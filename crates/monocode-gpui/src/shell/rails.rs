@@ -359,6 +359,91 @@ impl Shell {
             }))
             .into_any_element()
     }
+    /// Static read-only replica of `paseo_child_rail_button` for carousel previews
+    /// (zero duplicate element IDs, pixel-identical badge & chevron geometry).
+    pub(super) fn preview_paseo_child_rail_button(
+        &self,
+        children: &[i64],
+        open: bool,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        use crate::paseo_host::StatusBucket;
+        if !crate::paseo_host::project_ui(&self.workspace.preferences) || children.is_empty() {
+            return None;
+        }
+        let glyph = if open {
+            "chevron-down"
+        } else {
+            "chevron-right"
+        };
+        let toggle = div()
+            .size(px(20.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .child(icon(glyph, 14.).text_color(content(0.65)));
+        if open {
+            return Some(toggle.into_any_element());
+        }
+        let summary = self.child_rail_summary(children, cx);
+        let bucket = summary.highest_priority();
+        let tint = |c: gpui::Hsla, fill: f32, edge: f32| (c, c.opacity(fill), c.opacity(edge));
+        let amber: gpui::Hsla = rgb(0xfbbf24).into();
+        let red: gpui::Hsla = rgb(0xf87171).into();
+        let teal: gpui::Hsla = rgb(0x2dd4bf).into();
+        let accent = accent_color();
+        let (fg, fill, edge) = match bucket {
+            StatusBucket::NeedsInput => tint(amber, 0.16, 0.32),
+            StatusBucket::Failed => tint(red, 0.16, 0.32),
+            StatusBucket::Attention => tint(teal, 0.14, 0.28),
+            StatusBucket::Working => tint(accent, 0.15, 0.28),
+            StatusBucket::Done => (content(0.55), content(0.08), content(0.12)),
+        };
+        let indicator = match bucket {
+            StatusBucket::NeedsInput | StatusBucket::Failed => {
+                Some(icon("circle-alert", 10.).text_color(fg).into_any_element())
+            }
+            StatusBucket::Attention => Some(
+                icon("check-circle-2", 10.)
+                    .text_color(fg)
+                    .into_any_element(),
+            ),
+            StatusBucket::Working => {
+                Some(div().size(px(6.)).rounded_full().bg(fg).into_any_element())
+            }
+            StatusBucket::Done => None,
+        };
+        let badge = div()
+            .h(px(18.))
+            .px(px(5.))
+            .rounded_full()
+            .border_1()
+            .border_color(edge)
+            .bg(fill)
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .text_size(px(10.))
+            .line_height(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .font_features(crate::right_panel::tabular())
+            .text_color(fg)
+            .children(indicator)
+            .child(summary.compact_text());
+        Some(
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(badge)
+                .child(toggle)
+                .into_any_element(),
+        )
+    }
 
     /// Moves each rail toward its open state. A rail the sidebar first shows
     /// is simply there; later changes grow and fold.

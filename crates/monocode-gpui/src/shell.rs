@@ -388,6 +388,10 @@ struct SidebarSlide {
     neighbor: Option<(String, f32)>,
     /// Deferred project commit executed on the exact frame the spring lands at `target_x`.
     commit_target: Option<String>,
+    /// True once `window.defer` has been scheduled for `commit_target`, keeping
+    /// the settled incoming preview pinned at `x = 0` until the deferred swap runs
+    /// (prevents a 1-frame flash back to the previous project).
+    commit_dispatched: bool,
 }
 
 impl SidebarSlide {
@@ -398,7 +402,7 @@ impl SidebarSlide {
         let exp = (-w * t).exp();
         let dx = (dx0 + (self.v0 + w * dx0) * t) * exp;
         let v = (self.v0 - w * (self.v0 + w * dx0) * t) * exp;
-        let settled = (dx.abs() < 0.6 && v.abs() < 12.) || t >= 0.55;
+        let settled = (dx.abs() < 1.2 && v.abs() < 30.) || t >= 0.36;
         if settled {
             (self.target_x, 0., true)
         } else {
@@ -412,6 +416,12 @@ enum SwipeAxis {
     Pending,
     Horizontal,
     Reserved,
+}
+
+struct SidebarPreviewCache {
+    project: String,
+    rows: Vec<sidebar_list::Row>,
+    started: HashMap<i64, Vec<i64>>,
 }
 
 struct SidebarProjectSwipe {
@@ -429,6 +439,8 @@ struct SidebarProjectSwipe {
     ignoring_momentum: bool,
     /// Suppresses starting a second click-slide when committing a completed swipe spring.
     skip_click_slide: bool,
+    /// Cached row plan for the adjacent project page so 120Hz frames skip sorting/grouping.
+    preview_cache: Option<SidebarPreviewCache>,
 }
 
 impl Default for SidebarProjectSwipe {
@@ -442,6 +454,7 @@ impl Default for SidebarProjectSwipe {
             velocity_x: 0.,
             ignoring_momentum: false,
             skip_click_slide: false,
+            preview_cache: None,
         }
     }
 }
@@ -4724,6 +4737,7 @@ impl Shell {
             monos.update(cx, |m, cx| m.close(cx));
         }
         let previous_project = self.workspace.project.clone();
+        self.sidebar_swipe.preview_cache = None;
         if previous_project != path && !self.sidebar_swipe.skip_click_slide && !cx.reduce_motion() {
             let order = self.workspace.visible_project_order();
             if let (Some(old_ix), Some(new_ix)) = (
@@ -4737,10 +4751,11 @@ impl Shell {
                     start_x: direction * width,
                     target_x: 0.,
                     v0: 0.,
-                    omega: 21.,
+                    omega: 26.,
                     start: std::time::Instant::now(),
                     neighbor: Some((previous_project, -direction)),
                     commit_target: None,
+                    commit_dispatched: false,
                 });
             }
         }
@@ -7411,6 +7426,10 @@ impl Shell {
 
     /// The project's sessions as the sidebar lists them, top to bottom.
     fn sidebar_session_ids(&self, cx: &App) -> Vec<i64> {
+        self.sidebar_session_ids_for(&self.workspace.project, cx)
+    }
+
+    pub(super) fn sidebar_session_ids_for(&self, project: &str, cx: &App) -> Vec<i64> {
         let start = self
             .workspace
             .session_filters
@@ -7424,10 +7443,10 @@ impl Shell {
                 .monos
                 .as_ref()
                 .is_some_and(|m| m.read(cx).hidden_session(id))
-                && s.summary.cwd == self.workspace.project
+                && s.summary.cwd == project
                 && s.summary.has_messages
                 && !self.orchestration_worker(id)
-                && self.in_sidebar_worktree_scope(id, cx)
+                && self.in_sidebar_worktree_scope_for(project, id, cx)
         };
         let shown: HashSet<_> = self
             .order
@@ -7548,7 +7567,9 @@ impl Shell {
         }
     }
     pub(super) fn sidebar_slide_animating(&self) -> bool {
-        self.project_slide.is_some()
+        self.project_slide
+            .as_ref()
+            .is_some_and(|s| !s.commit_dispatched)
             || self.sidebar_swipe.axis == SwipeAxis::Horizontal
             || self.sidebar_swipe.drag_offset.abs() > 0.1
     }
@@ -7614,6 +7635,7 @@ impl Shell {
 
         if offset.abs() < 0.5 && vel.abs() < 120. {
             self.project_slide = None;
+            self.sidebar_swipe.preview_cache = None;
             return;
         }
         let dir = if offset < 0. || (offset == 0. && vel < 0.) {
@@ -7634,10 +7656,11 @@ impl Shell {
                 start_x: offset,
                 target_x,
                 v0: vel,
-                omega: 24.,
+                omega: 28.,
                 start: std::time::Instant::now(),
                 neighbor: Some((target.clone(), side)),
                 commit_target: Some(target),
+                commit_dispatched: false,
             });
         } else {
             let side = if dir > 0 { 1. } else { -1. };
@@ -7645,27 +7668,33 @@ impl Shell {
                 start_x: offset,
                 target_x: 0.,
                 v0: vel,
-                omega: 26.,
+                omega: 30.,
                 start: std::time::Instant::now(),
                 neighbor: neighbor.map(|p| (p, side)),
                 commit_target: None,
+                commit_dispatched: false,
             });
         }
         if notify_frame {
             self.sidebar_frame.update(cx, |_, cx| cx.notify());
         }
     }
-    /// Commits a settled swipe target outside `Chrome::render` (zero re-entrant borrow).
+    /// Commits a settled swipe target outside `Chrome::render` (zero re-entrant
+    /// borrow, and atomically drops the pinned preview at the exact swap point).
     pub(super) fn commit_sidebar_carousel_project(
         &mut self,
         target: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.project_slide = None;
+        self.sidebar_swipe.preview_cache = None;
         if target != self.workspace.project {
             self.sidebar_swipe.skip_click_slide = true;
             self.select_project(target, window, cx);
             self.sidebar_swipe.skip_click_slide = false;
+        } else {
+            self.sidebar_frame.update(cx, |_, cx| cx.notify());
         }
     }
     /// Advances the sidebar carousel before rendering a frame, returning any
@@ -7677,6 +7706,7 @@ impl Shell {
                 .take()
                 .and_then(|slide| slide.commit_target);
             self.sidebar_swipe.drag_offset = 0.;
+            self.sidebar_swipe.preview_cache = None;
             return commit;
         }
         // Fallback for non-trackpad horizontal wheels that never emit TouchPhase::Ended.
@@ -7690,10 +7720,21 @@ impl Shell {
             self.release_sidebar_swipe(false, cx);
         }
         let now = std::time::Instant::now();
-        if let Some(slide) = &self.project_slide {
+        if let Some(slide) = self.project_slide.as_mut() {
             let (_, _, settled) = slide.sample(now);
             if settled {
-                return self.project_slide.take().and_then(|s| s.commit_target);
+                if let Some(target) = slide.commit_target.clone() {
+                    // Keep `project_slide` pinned at `target_x` (neighbor at x = 0)
+                    // through this frame so we never flash back to the previous project
+                    // before `window.defer` runs `commit_sidebar_carousel_project`.
+                    if !slide.commit_dispatched {
+                        slide.commit_dispatched = true;
+                        return Some(target);
+                    }
+                    return None;
+                }
+                self.project_slide = None;
+                self.sidebar_swipe.preview_cache = None;
             }
         }
         None
@@ -7718,7 +7759,7 @@ impl Shell {
         }
         if let Some(slide) = &self.project_slide {
             let (offset, _, settled) = slide.sample(std::time::Instant::now());
-            if settled {
+            if settled && slide.commit_target.is_none() {
                 return (0., None);
             }
             let neighbor = slide
@@ -7729,116 +7770,646 @@ impl Shell {
         }
         (0., None)
     }
-    /// Lightweight, zero-I/O preview page for an adjacent project rendered
-    /// beside the active sidebar during a 120Hz dual-page carousel glide.
-    pub(super) fn sidebar_project_preview(&self, project: &str, _cx: &App) -> AnyElement {
-        let compact = self.workspace.compact_session_cards;
-        let paseo = crate::paseo_host::project_ui(&self.workspace.preferences);
-        let appearance = self.appearance(project);
-        let label = self.project_label(project);
-        let mut items: Vec<_> = self
-            .session_summaries
-            .values()
-            .filter(|s| {
-                !s.archived
-                    && s.cwd == project
-                    && !self.sidebar_hidden_sessions.contains(&s.id)
-                    && !self.started_by.contains_key(&s.id)
-            })
-            .collect();
-        items.sort_by(|a, b| {
-            b.pinned
-                .cmp(&a.pinned)
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
-                .then_with(|| b.id.cmp(&a.id))
+    /// Computes and caches the adjacent project's exact sidebar row plan once
+    /// per swipe/slide so 120Hz animation frames stay O(visible rows) with zero I/O.
+    pub(super) fn ensure_sidebar_preview_cache(&mut self, project: &str, cx: &App) {
+        if self
+            .sidebar_swipe
+            .preview_cache
+            .as_ref()
+            .is_some_and(|cache| cache.project == project)
+        {
+            return;
+        }
+        self.ensure_groups_for(project);
+        let ids = self.sidebar_session_ids_for(project, cx);
+        let (started, children) = if self.workspace.classic_layout
+            && !crate::paseo_host::project_ui(&self.workspace.preferences)
+        {
+            (HashMap::new(), HashSet::new())
+        } else {
+            self.started_groups(&ids)
+        };
+        let entries = self.session_entries_for(project, &ids, cx);
+        let mut rows = self.build_sidebar_rows_for(project, &ids, &entries, &children, cx);
+        rows.truncate(28);
+        self.sidebar_swipe.preview_cache = Some(SidebarPreviewCache {
+            project: project.to_string(),
+            rows,
+            started,
         });
-        items.truncate(18);
-        let row_h = if compact { 32. } else { 42. };
+    }
+    fn preview_active_session(&self, project: &str, cx: &App) -> Option<i64> {
+        let scope = self
+            .worktree_focus
+            .get(project)
+            .map(|focus| focus.path.clone())
+            .unwrap_or_else(|| project.to_owned());
+        if let Some(TitleTab::Session(tab)) = self.workspace.scope_focus.get(&scope) {
+            let pane = self.workspace.tab_focus(*tab);
+            let sid = self.workspace.session_for_pane(pane);
+            if self.session_summaries.contains_key(&sid)
+                && self.session_metadata(sid, cx).summary.cwd == project
+            {
+                return Some(sid);
+            }
+        }
+        self.workspace
+            .project_focus
+            .get(project)
+            .copied()
+            .filter(|id| {
+                let sid = self.workspace.session_for_pane(*id);
+                self.workspace.tab_of(*id).is_some()
+                    && self.session_summaries.contains_key(&sid)
+                    && self.session_metadata(sid, cx).summary.cwd == project
+            })
+            .map(|id| self.workspace.session_for_pane(id))
+            .or_else(|| {
+                self.workspace.tabs.iter().rev().find_map(|tab| {
+                    let pane = self.workspace.scope_pane(*tab);
+                    let sid = self.workspace.session_for_pane(pane);
+                    (self.session_summaries.contains_key(&sid)
+                        && self.session_metadata(sid, cx).summary.cwd == project)
+                        .then_some(sid)
+                })
+            })
+    }
+    fn preview_session_suffix(
+        &self,
+        id: i64,
+        session: &session_loading::Metadata<'_>,
+        compact: bool,
+    ) -> AnyElement {
+        let detailed = !compact;
+        let details = self
+            .remote_details
+            .get(&id)
+            .unwrap_or(&serde_json::Value::Null);
+        let bucket = crate::paseo_host::StatusBucket::from_details(
+            details,
+            session.busy,
+            session.needs_approval(),
+        );
+        if crate::paseo_host::project_ui(&self.workspace.preferences)
+            && bucket == crate::paseo_host::StatusBucket::Failed
+        {
+            return div()
+                .flex()
+                .gap_1()
+                .text_size(px(11.))
+                .text_color(rgb(0xf87171))
+                .child(icon("circle-alert", 14.))
+                .child(crate::i18n::t("Failed"))
+                .into_any();
+        }
         div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .border_l_1()
-            .border_r_1()
-            .border_color(content(0.06))
+            .flex_shrink_0()
+            .text_size(px(11.))
+            .line_height(px(16.))
+            .font_weight(FontWeight::NORMAL)
+            .text_color(content(0.4))
             .child(
-                div()
-                    .h(px(39.))
-                    .flex_shrink_0()
-                    .px_3()
-                    .pb_px()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(28.))
-                            .px_1p5()
-                            .ml(px(-4.))
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(crate::project_settings::header_project_icon(
-                                &appearance,
-                                project,
-                            ))
-                            .child(div().min_w_0().truncate().child(label))
-                            .child(icon("chevron-down", 14.)),
-                    )
-                    .when(paseo, |d| {
-                        d.child(
+                if session.needs_approval()
+                    || (crate::paseo_host::project_ui(&self.workspace.preferences)
+                        && bucket == crate::paseo_host::StatusBucket::NeedsInput)
+                {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(rgb(0xfbbf24))
+                        .child(icon("circle-alert", 14.))
+                        .when(detailed, |d| d.child(crate::i18n::t("Needs approval")))
+                        .into_any()
+                } else if detailed
+                    && (session.responding()
+                        || (crate::paseo_host::project_ui(&self.workspace.preferences)
+                            && bucket == crate::paseo_host::StatusBucket::Working))
+                {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(content(0.5))
+                        .child(crate::i18n::t("Working…"))
+                        .into_any()
+                } else if detailed
+                    && (self.unseen_finished.contains(&id)
+                        || (crate::paseo_host::project_ui(&self.workspace.preferences)
+                            && bucket == crate::paseo_host::StatusBucket::Attention))
+                {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(rgb(0x2dd4bf))
+                        .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
+                        .child(crate::i18n::t("Done"))
+                        .into_any()
+                } else if session.has_saved_draft() {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(icon("circle-dashed-hi", 14.).text_color(content(0.4)))
+                        .when(detailed, |d| d.child(crate::i18n::t("Draft")))
+                        .into_any()
+                } else if let Some(reminder) = self.reminders.iter().find(|r| r.session_id == id) {
+                    div()
+                        .text_color(rgb(0xf59e0b))
+                        .child(session_groups::reminder_caption(reminder.due_at))
+                        .into_any()
+                } else {
+                    div()
+                        .child(monocode_core::time::relative(
+                            session.summary.updated_at,
+                            monocode_core::time::now_ms(),
+                        ))
+                        .into_any()
+                },
+            )
+            .into_any()
+    }
+    fn preview_session_row(
+        &self,
+        id: i64,
+        nested: bool,
+        child_toggle: Option<AnyElement>,
+        active_id: Option<i64>,
+        cx: &App,
+    ) -> AnyElement {
+        let compact = nested || self.workspace.compact_session_cards;
+        let side = if nested || !compact { 14. } else { 16. };
+        let session = self.session_metadata(id, cx);
+        let active = active_id == Some(id);
+        let draft = session.has_saved_draft();
+        let pinned = session.summary.pinned;
+        let mark = div()
+            .size(px(side))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(provider_icon(&session.summary.provider, side));
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .h(px(20.))
+            .truncate()
+            .when(nested, |d| {
+                d.text_size(px(13.))
+                    .text_color(content(if active { 1. } else { 0.55 }))
+            })
+            .when(!nested && compact, |d| {
+                d.text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(content(1.))
+            })
+            .when(!compact, |d| {
+                d.text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(content(1.))
+            })
+            .child(session.display_title());
+        let suffix = self.preview_session_suffix(id, &session, compact);
+        let body = if compact {
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(if nested { 6. } else { 8. }))
+                .child(mark)
+                .child(title)
+                .child(suffix)
+                .children(child_toggle)
+                .into_any_element()
+        } else {
+            let saved = self.session_details.get(&id);
+            let live = self
+                .sessions
+                .get(&id)
+                .and_then(|view| view.read(cx).sidebar_details());
+            let (model, branch) = live.unwrap_or_else(|| {
+                (
+                    crate::pickers::cached_model_name(
+                        Kind::from_id(&session.summary.provider),
+                        saved.and_then(|data| data.model.as_deref()),
+                    ),
+                    None,
+                )
+            });
+            let cwd = self
+                .session_worktrees
+                .get(&id)
+                .and_then(|cwd| cwd.as_deref())
+                .unwrap_or(&session.summary.cwd);
+            let branch = branch.or_else(|| saved.and_then(|data| data.branch.clone()));
+            let directory = std::path::Path::new(cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(cwd);
+            let workspace_label = branch.clone().unwrap_or_else(|| directory.to_owned());
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(pinned, |d| {
+                            d.child(icon("pin", 12.).text_color(content(0.45)))
+                        })
+                        .child(title)
+                        .child(suffix)
+                        .children(child_toggle),
+                )
+                .child(
+                    div()
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
                             div()
-                                .h(px(28.))
-                                .px_2()
-                                .gap_1()
-                                .rounded_md()
+                                .flex_1()
+                                .min_w_0()
                                 .flex()
                                 .items_center()
-                                .text_size(px(12.))
-                                .text_color(content(1.))
-                                .bg(content(0.1))
-                                .child(icon("plus", 14.))
-                                .child(crate::i18n::t("New chat")),
+                                .gap_1()
+                                .text_size(px(11.))
+                                .text_color(content(0.45))
+                                .child(icon(
+                                    if branch.is_some() {
+                                        "git-branch"
+                                    } else {
+                                        "folder"
+                                    },
+                                    12.,
+                                ))
+                                .child(div().min_w_0().truncate().child(workspace_label)),
                         )
-                    }),
-            )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .min_w_0()
+                                .max_w(gpui::relative(0.5))
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_size(px(11.))
+                                .text_color(content(0.5))
+                                .child(div().min_w_0().truncate().child(model))
+                                .child(provider_icon(&session.summary.provider, 14.)),
+                        ),
+                )
+                .into_any_element()
+        };
+        div()
+            .relative()
+            .h(px(if compact {
+                if nested { 28. } else { 32. }
+            } else if nested {
+                56.
+            } else {
+                60.
+            }))
+            .px(px(if nested { 7. } else { 9. }))
+            .rounded_md()
+            .flex()
+            .items_center()
+            .when(active, |d| d.bg(content(0.1)))
+            .when(draft, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .rounded_md()
+                        .border_1()
+                        .border_dashed()
+                        .border_color(content(if active { 0.3 } else { 0.25 })),
+                )
+            })
+            .child(body)
+            .into_any()
+    }
+    fn preview_session_card(
+        &self,
+        id: i64,
+        nested: bool,
+        started: &HashMap<i64, Vec<i64>>,
+        active_id: Option<i64>,
+        cx: &App,
+    ) -> AnyElement {
+        let children = started.get(&id).filter(|c| !c.is_empty());
+        let open = children.is_some_and(|kids| {
+            if crate::paseo_host::project_ui(&self.workspace.preferences) {
+                self.rails
+                    .paseo_disclosures
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(!self.query.is_empty())
+            } else {
+                active_id == Some(id) || kids.iter().any(|c| active_id == Some(*c))
+            }
+        });
+        let toggle = children.and_then(|kids| self.preview_paseo_child_rail_button(kids, open, cx));
+        let row = self.preview_session_row(id, nested, toggle, active_id, cx);
+        if !open {
+            return row;
+        }
+        let Some(kids) = children else {
+            return row;
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(row)
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .px_2()
                     .pt_1()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .children(items.into_iter().map(|s| {
-                        let title = if s.title.trim().is_empty() {
-                            crate::i18n::t("New chat")
-                        } else {
-                            s.title.clone()
-                        };
-                        div()
-                            .h(px(row_h))
-                            .flex_shrink_0()
-                            .px_2()
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(px(13.))
-                            .text_color(content(0.85))
-                            .child(provider_icon(&s.provider, 14.))
-                            .child(div().flex_1().min_w_0().truncate().child(title))
-                            .when(s.pinned, |d| {
-                                d.child(icon("pin", 11.).text_color(content(0.35)))
-                            })
+                    .children(kids.iter().enumerate().map(|(ix, child)| {
+                        rails::step(
+                            ix + 1 == kids.len(),
+                            self.preview_session_row(*child, true, None, active_id, cx),
+                        )
                     })),
             )
+            .into_any()
+    }
+    /// Pixel-identical, zero-I/O preview page for an adjacent project rendered
+    /// beside the active sidebar during a 120Hz dual-page carousel glide.
+    pub(super) fn sidebar_project_preview(
+        &self,
+        project: &str,
+        include_header: bool,
+        show_divider: bool,
+        cx: &App,
+    ) -> AnyElement {
+        let paseo = crate::paseo_host::project_ui(&self.workspace.preferences);
+        let appearance = self.appearance(project);
+        let label = self.project_label(project);
+        let active_id = self.preview_active_session(project, cx);
+        let blank_session = !self.workspace.classic_layout
+            && active_id.is_some_and(|id| {
+                self.session_summaries.contains_key(&id)
+                    && !self.session_metadata(id, cx).summary.has_messages
+            });
+        let cached = self
+            .sidebar_swipe
+            .preview_cache
+            .as_ref()
+            .filter(|cache| cache.project == project);
+        let static_chrome_icon = |path: &'static str| {
+            div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .size(px(24.))
+                .rounded_md()
+                .child(icon(path, 14.).text_color(content(0.5)))
+        };
+        let static_filter_icon = || {
+            div()
+                .mr(px(if self.workspace.classic_layout {
+                    0.
+                } else {
+                    -5.
+                }))
+                .size(px(24.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    icon(
+                        "filter",
+                        if self.workspace.classic_layout {
+                            12.
+                        } else {
+                            14.
+                        },
+                    )
+                    .text_color(content(0.5)),
+                )
+        };
+        let rows_view = cached.map(|cache| {
+            cache
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(ix, row)| {
+                    use sidebar_list::Row;
+                    let content = match row {
+                        Row::Navigation => {
+                            return div()
+                                .flex_shrink_0()
+                                .child(self.preview_sidebar_navigation(blank_session, cx))
+                                .into_any();
+                        }
+                        Row::Monos => return div().flex_shrink_0().into_any(),
+                        Row::Pinned => section_label("Pinned").into_any(),
+                        Row::Folders => section_label("Folders").into_any(),
+                        Row::Group(entry) => self.preview_group_header(project, entry, cx),
+                        Row::Gap => return div().flex_shrink_0().h(px(12.)).into_any(),
+                        Row::Heading { label, first } => section_label(label)
+                            .when(!*first, |d| d.mt_3())
+                            .when(*first, |d| d.child(static_filter_icon()))
+                            .into_any(),
+                        Row::Session(id) => {
+                            self.preview_session_card(*id, false, &cache.started, active_id, cx)
+                        }
+                        Row::GroupedSession { id, first, last } => {
+                            return div()
+                                .flex_shrink_0()
+                                .px_2()
+                                .child(div().ml(px(10.)).when(*first, |d| d.pt_1()).child(
+                                    rails::step(
+                                        *last,
+                                        self.preview_session_card(
+                                            *id,
+                                            true,
+                                            &cache.started,
+                                            active_id,
+                                            cx,
+                                        ),
+                                    ),
+                                ))
+                                .into_any();
+                        }
+                        Row::ClassicGroupMember { id, .. } => {
+                            return div()
+                                .flex_shrink_0()
+                                .px(px(6.))
+                                .child(self.preview_session_card(
+                                    *id,
+                                    true,
+                                    &cache.started,
+                                    active_id,
+                                    cx,
+                                ))
+                                .into_any();
+                        }
+                        Row::ClassicFolderNew(_) => {
+                            return div().flex_shrink_0().h(px(28.)).into_any();
+                        }
+                        Row::ClassicGap(height) => {
+                            return div().flex_shrink_0().h(px(*height as f32)).into_any();
+                        }
+                        Row::Status(bucket, count) => div()
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.))
+                            .text_color(content(0.5))
+                            .child(div().flex_1().child(format!(
+                                "{} · {}",
+                                crate::i18n::t(bucket.label()),
+                                count
+                            )))
+                            .when(ix == 1 && !self.workspace.classic_layout, |d| {
+                                d.child(static_filter_icon())
+                            })
+                            .when(*bucket == crate::paseo_host::StatusBucket::Done, |d| {
+                                d.child(icon("chevron-down", 12.))
+                            })
+                            .into_any(),
+                        Row::Empty => div()
+                            .px_2()
+                            .py_2()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child(if self.query.is_empty() {
+                                "No sessions yet"
+                            } else {
+                                "No matching sessions"
+                            })
+                            .into_any(),
+                    };
+                    div()
+                        .flex_shrink_0()
+                        .when(self.workspace.classic_layout, |d| d.px(px(6.)))
+                        .when(!self.workspace.classic_layout, |d| d.px_2().pb_px())
+                        .child(content)
+                        .into_any()
+                })
+                .collect::<Vec<_>>()
+        });
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .when(include_header, |d| {
+                d.child(
+                    div()
+                        .h(px(39.))
+                        .flex_shrink_0()
+                        .px_3()
+                        .pb_px()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div().flex_1().min_w_0().flex().items_center().child(
+                                div()
+                                    .when(paseo, |d| d.flex_1())
+                                    .h(px(28.))
+                                    .px_1p5()
+                                    .ml(px(-4.))
+                                    .rounded_md()
+                                    .max_w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(crate::project_settings::header_project_icon(
+                                        &appearance,
+                                        project,
+                                    ))
+                                    .child(div().min_w_0().truncate().child(label))
+                                    .when_some(self.worktree_focus.get(project), |d, focus| {
+                                        d.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .font_weight(FontWeight::NORMAL)
+                                                .text_color(content(0.45))
+                                                .child(
+                                                    focus
+                                                        .branch
+                                                        .clone()
+                                                        .unwrap_or_else(|| "detached".into()),
+                                                ),
+                                        )
+                                    })
+                                    .child(icon("chevron-down", 14.)),
+                            ),
+                        )
+                        .when(paseo, |d| {
+                            d.child(
+                                div()
+                                    .h(px(28.))
+                                    .px_2()
+                                    .gap_1()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(12.))
+                                    .text_color(content(1.))
+                                    .bg(content(0.1))
+                                    .child(icon("plus", 14.))
+                                    .child(crate::i18n::t("New chat")),
+                            )
+                        })
+                        .when(self.workspace.sidebar_search_visible, |d| {
+                            d.child(static_chrome_icon("search"))
+                        })
+                        .child(static_chrome_icon("more-horizontal")),
+                )
+            })
+            .child(
+                div().flex_1().min_h_0().overflow_hidden().child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .children(rows_view.unwrap_or_default()),
+                ),
+            )
+            // Hairline page separator painted without shrinking the preview's box width.
+            .when(show_divider, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(1.))
+                        .bg(content(0.07)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(1.))
+                        .bg(content(0.07)),
+                )
+            })
             .into_any_element()
     }
     /// Ardia / Arc-style 1:1 finger-locked horizontal trackpad swipe over the
@@ -7887,6 +8458,7 @@ impl Shell {
                 velocity_x: 0.,
                 ignoring_momentum: false,
                 skip_click_slide: false,
+                preview_cache: None,
             };
         } else if self.sidebar_swipe.ignoring_momentum {
             if self
@@ -8071,6 +8643,11 @@ impl Shell {
         }
         self.refresh_sidebar_structure(cx);
         let (slide_x, neighbor_page) = self.sidebar_carousel_layout(cx);
+        if let Some((ref neighbor_path, _)) = neighbor_page {
+            self.ensure_sidebar_preview_cache(neighbor_path, cx);
+        }
+        let width = self.workspace.sidebar_width.max(160.);
+        let show_divider = slide_x.abs() > 0.5 && (width - slide_x.abs()) > 0.5;
         let live_agents = self.live_agents_preview(cx);
         div()
             .id("monocode-sidebar")
@@ -8295,7 +8872,12 @@ impl Shell {
                                 .h_full()
                                 .flex()
                                 .flex_col()
-                                .child(self.sidebar_project_preview(&neighbor_path, cx)),
+                                .child(self.sidebar_project_preview(
+                                    &neighbor_path,
+                                    true,
+                                    show_divider,
+                                    cx,
+                                )),
                         )
                     }),
             )

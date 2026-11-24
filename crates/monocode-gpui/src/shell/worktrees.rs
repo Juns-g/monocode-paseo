@@ -32,11 +32,12 @@ impl Shell {
         path_key(scope) == path_key(self.working_copy())
     }
     pub(super) fn in_sidebar_worktree_scope(&self, id: i64, cx: &App) -> bool {
-        self.worktree_focus
-            .get(&self.workspace.project)
-            .is_none_or(|focus| {
-                path_key(self.session_working_copy(id, cx)) == path_key(&focus.path)
-            })
+        self.in_sidebar_worktree_scope_for(&self.workspace.project, id, cx)
+    }
+    pub(super) fn in_sidebar_worktree_scope_for(&self, project: &str, id: i64, cx: &App) -> bool {
+        self.worktree_focus.get(project).is_none_or(|focus| {
+            path_key(self.session_working_copy(id, cx)) == path_key(&focus.path)
+        })
     }
     pub(super) fn record_worktree_session(&mut self, id: i64, _cx: &App) {
         let project = self.workspace.project.clone();
