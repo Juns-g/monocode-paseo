@@ -4,7 +4,7 @@
 
 基于 [MonoCode](https://github.com/hardbeat920/monocode) 的原生 GPUI 客户端（同步到 `main` (`09d04436`, 2026-11-12)），把后端换成本机的 [Paseo](https://github.com/getpaseo/paseo) daemon。界面沿用原版 MonoCode 原生 Shell；对话、执行和历史都留在 Paseo 里，Paseo 各端和本客户端看到的是同一批对话，可以互相接着聊。
 
-> ⚠️ **个人实验版本**：只在作者自己的 macOS（Apple Silicon）+ Paseo 0.14.0 上用过，不保证效果、兼容性或稳定性，不提供支持。需要正式体验请用原版 MonoCode。原版说明见 [README.upstream.md](README.upstream.md)。
+> ⚠️ **个人实验版本**：只在作者自己的 macOS（Apple Silicon）+ Paseo 0.17.4 上用过，不保证效果、兼容性或稳定性，不提供支持。需要正式体验请用原版 MonoCode。原版说明见 [README.upstream.md](README.upstream.md)。
 <img width="2600" height="1784" alt="image" src="https://github.com/user-attachments/assets/d7802cf2-7a4e-42cf-bf43-23f9fbcb4a16" />
 
 ## 怎么用
@@ -35,17 +35,22 @@ open "/tmp/monocode-paseo/Monocode Paseo Prototype.app"
 - 回合一开始就显示“工作中”和计时，不用等第一行输出。
 - 新建对话首次发送时才在 Paseo 创建，防止重复；可选新建独立工作区，或加入同项目最近 20 个工作区之一。默认模型依次取：项目默认 → 设置里的默认 → 当前对话 → 最近一次选择。
 - 切换模型和推理强度、预设、收藏模型（在模型选择器里点星标；预设也出现在 Favorites 里）。
-- 子 Agent 嵌套在父对话下显示；同一 Git 仓库的 linked worktree 合并到一个项目导航。
+- 子 Agent 嵌套在父对话下显示（折叠时显示子对话聚合状态徽标，优先提示待输入/失败/待查看/工作中）；同一 Git 仓库的 linked worktree 合并到一个项目导航。
+- 输入框支持粘贴、拖拽和上传图片/截图附件，经 Paseo 图片接口发送并在对话中回显。
+- 侧栏底部内置额度用量条，接入 Paseo `listUsageReports()`（仅展示 Codex 与 Antigravity 剩余额度、重置倒计时与消耗速率预测）。
+- 支持 Paseo 原生 Rewind 回退（仅空闲态可用，带确认弹窗，可选仅回退对话或同时回退文件）与新草稿直接创建/复用 Paseo 托管 Git Worktree。
+- 支持侧栏宿主机切换器，经本机 Paseo daemon 路由连接远程宿主机（如 devbox），并对远程宿主机严格隔离本机文件与终端访问。
 - 权限审批与问题回答、取消当前回合。
 - 回合进行中继续发送：设置 → 聊天 →「后续消息行为」选**排队**（当前回合结束后自动发出，可编辑、移除）或 **Steer**（立即插入当前回合；不支持插入的 provider 由 Paseo 中断并替换回合）。按 Cmd+Enter 发送时，这一条用相反的方式。队列只保存在本客户端，发送成功后两端才会看到；结果不确定时不自动重发。Steer 只支持纯文本。
 - 侧栏：筛选、按项目或**按状态分组**（需要输入 → 失败 → 待查看 → 工作中 → 已完成）、按最近活动或创建时间排序；归档和取消归档、改名、置顶（仅主对话）、文件夹。
 - 项目图标、底部项目切换（可只保留常用项目，其余手动加回）。
-- 只读的文件和 Git 面板；本机项目可直接打开**本地终端**。
+- 只读的文件和 Git 面板，支持 Diff 多行框选与多条行内评审批注（汇总插入输入框，不自动发送）；本机项目可直接打开**本地终端**。
+- 支持更早历史分页加载（`historyBefore`）。
 - 本地笔记；界面 **English / 简体中文** 切换（设置 → 通用 → 语言，默认跟随系统）。
 
 **隐藏 / 未实现**
-- 额度用量显示、远端 PTY / relay / tunnel。
-- 删除对话、标签、更早历史分页。
+- 远端 PTY / relay / tunnel，以及远程宿主机的本地文件/Git 面板。
+- 删除对话、标签。
 - 快速输入框、Monos、自动化、Inbox、多 Agent 编排等依赖原版本地执行的功能。
 - 权限选择器：新对话默认使用 provider 的完全访问模式，不在界面显示。
 

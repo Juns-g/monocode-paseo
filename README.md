@@ -4,7 +4,7 @@
 
 A fork of the native GPUI client of [MonoCode](https://github.com/hardbeat920/monocode) (synced to `main` (`09d04436`, 2026-11-12)) that uses a local [Paseo](https://github.com/getpaseo/paseo) daemon as its backend. The UI is the original MonoCode native shell; conversations, execution and history stay in Paseo, so the Paseo apps and this client see the same conversations and can continue each other's work.
 
-> ⚠️ **Personal experiment.** Only used on the author's own macOS (Apple Silicon) machine with Paseo 0.14.0. No guarantees on behavior, compatibility or stability, and no support. For the real thing, use upstream MonoCode. The upstream README is kept as [README.upstream.md](README.upstream.md).
+> ⚠️ **Personal experiment.** Only used on the author's own macOS (Apple Silicon) machine with Paseo 0.17.4. No guarantees on behavior, compatibility or stability, and no support. For the real thing, use upstream MonoCode. The upstream README is kept as [README.upstream.md](README.upstream.md).
 <img width="2600" height="1784" alt="image" src="https://github.com/user-attachments/assets/af4ad010-1e00-481f-b3a8-eaf71ecc07fd" />
 
 ## Usage
@@ -35,17 +35,22 @@ open "/tmp/monocode-paseo/Monocode Paseo Prototype.app"
 - A "working" line with a timer appears as soon as a turn starts, before the first output arrives.
 - New conversations are created in Paseo only on first send, which avoids duplicates. They can start in a new workspace or join one of the 20 most recent workspaces in the same project. The default model follows the project default, then the Settings default, then the current conversation, then your most recent choice.
 - Model and effort switching, presets, and favorite models (star a model in the picker; presets also appear under Favorites).
-- Sub-agents nest under their parent conversation; linked worktrees of the same Git repository share one project entry.
+- Sub-agents nest under their parent conversation (with a collapsed aggregate status badge for running/needs-input/failed children); linked worktrees of the same Git repository share one project entry.
+- Image/screenshot attachments in composer (paste, drag-and-drop, or upload) routed through Paseo's image payload API.
+- Built-in Codex & Antigravity quota/usage footer powered by Paseo's `listUsageReports()` (with reset countdown and pace forecast).
+- Paseo-native Rewind (idle-only, with confirmation modal supporting conversation-only or conversation+files revert) and Paseo-managed Git worktree creation/reuse on new drafts.
+- Multi-host sidebar switcher connecting through the local Paseo daemon to remote Paseo hosts (such as devboxes) with strict remote filesystem/terminal isolation.
 - Permission approvals, answering questions, and cancelling the current turn.
 - Sending while a turn is running: Settings → Chat → "Follow-up behavior" chooses **Queue** (sent automatically when the turn ends, editable and removable) or **Steer** (inserted into the current turn; providers that cannot steer get the turn interrupted and replaced by Paseo). Cmd+Enter uses the opposite behavior for that message. The queue lives only in this client, and both ends see a message only after it is sent; uncertain results are never resent automatically. Steer supports plain text only.
 - Sidebar: filtering, grouping by project or **by status** (needs input → failed → unread → working → done), sorting by latest activity or creation time; archive and unarchive, rename, pin (top-level conversations), and folders.
 - Project icons and the bottom project switcher (keep only the projects you use; add others back by hand).
-- Read-only file and Git panels; a **local terminal** for projects on this machine.
+- Read-only file and Git panels with multi-line Diff selection and inline review annotation tray (inserts formatted review notes into composer without auto-sending); a **local terminal** for projects on this machine.
+- Older conversation history pagination (`historyBefore`).
 - Local notes; **English / 简体中文** UI (Settings → General → Language, follows the system by default).
 
 **Hidden / not implemented**
-- Usage display; remote PTY / relay / tunnel.
-- Deleting conversations, labels, paging through older history.
+- Remote PTY / relay / tunnel; local filesystem/git panels for remote hosts.
+- Deleting conversations and labels.
 - Quick input, Monos, automations, Inbox, multi-agent orchestration and other features that depend on upstream's local execution.
 - Permission picker: new conversations use the provider's full-access mode, and it is not shown in the UI.
 

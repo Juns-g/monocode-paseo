@@ -2668,7 +2668,7 @@ mod tests {
                 view.set_files(files, cx);
             })
             .unwrap();
-        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let visual = gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
         (window, visual, events)
     }
