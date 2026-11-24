@@ -179,6 +179,124 @@ pub fn format_comment(path: &str, line: &Line, comment: &str) -> String {
     )
 }
 
+/// Most diff lines `format_annotation` quotes before omitting the rest.
+pub const MAX_QUOTED_DIFF_LINES: usize = 40;
+
+/// One queued review note: a selection of diff lines and the reviewer's note.
+#[derive(Clone, Copy, Debug)]
+pub struct ReviewNote<'a> {
+    pub path: &'a str,
+    pub lines: &'a [Line],
+    pub note: &'a str,
+}
+
+/// `path:Lstart` or `path:Lstart-Lend` for a run of diff lines. Hunk headers
+/// are skipped; an all-deleted run uses old numbers, anything else new ones.
+pub fn selection_location(path: &str, lines: &[Line]) -> String {
+    let body: Vec<&Line> = lines.iter().filter(|l| l.kind != LineKind::Hunk).collect();
+    let all_deleted = !body.is_empty() && body.iter().all(|l| l.kind == LineKind::Del);
+    let numbers: Vec<u32> = body
+        .iter()
+        .filter_map(|l| {
+            if all_deleted {
+                l.old_number
+            } else {
+                l.new_number.or(l.old_number)
+            }
+        })
+        .collect();
+    match (numbers.iter().min(), numbers.iter().max()) {
+        (Some(lo), Some(hi)) if lo == hi => format!("{path}:L{lo}"),
+        (Some(lo), Some(hi)) => format!("{path}:L{lo}-L{hi}"),
+        _ => path.to_owned(),
+    }
+}
+
+/// A selection (and optional note) as Markdown for the composer: the
+/// location, a fenced `diff` snippet, then the note. Empty when there is
+/// neither a quotable line nor a note.
+pub fn format_annotation(path: &str, lines: &[Line], note: &str) -> String {
+    let body: Vec<&Line> = lines.iter().filter(|l| l.kind != LineKind::Hunk).collect();
+    let note = note.replace("\r\n", "\n").replace('\r', "\n");
+    let note = note.trim();
+    if body.is_empty() && note.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    if body.is_empty() {
+        out.push_str(note);
+        return out;
+    }
+    let deleted = if body.iter().all(|l| l.kind == LineKind::Del) {
+        " (deleted)"
+    } else {
+        ""
+    };
+    let location = selection_location(path, lines).replace('`', "\\`");
+    out.push_str(&format!("`{location}`{deleted}\n"));
+    let mut snippet: Vec<String> = body
+        .iter()
+        .take(MAX_QUOTED_DIFF_LINES)
+        .map(|l| {
+            let marker = match l.kind {
+                LineKind::Add => '+',
+                LineKind::Del => '-',
+                _ => ' ',
+            };
+            format!(
+                "{marker}{}",
+                l.text.replace("\r\n", "\n").trim_end_matches('\n')
+            )
+        })
+        .collect();
+    if body.len() > MAX_QUOTED_DIFF_LINES {
+        snippet.push(format!(
+            "... ({} more lines omitted)",
+            body.len() - MAX_QUOTED_DIFF_LINES
+        ));
+    }
+    let snippet = snippet.join("\n");
+    let mut longest = 0;
+    let mut run = 0;
+    for ch in snippet.chars() {
+        if ch == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    out.push_str(&format!("{fence}diff\n{snippet}\n{fence}"));
+    if !note.is_empty() {
+        out.push('\n');
+        out.push_str(note);
+    }
+    out
+}
+
+/// Several review notes as one composer payload: nothing for none, the bare
+/// annotation for one, a numbered `Review comments (N):` list for more.
+pub fn format_review_batch(notes: &[ReviewNote<'_>]) -> String {
+    let formatted: Vec<String> = notes
+        .iter()
+        .map(|n| format_annotation(n.path, n.lines, n.note))
+        .filter(|s| !s.is_empty())
+        .collect();
+    match formatted.len() {
+        0 => String::new(),
+        1 => formatted.into_iter().next().unwrap_or_default(),
+        n => {
+            let items: Vec<String> = formatted
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{}. {s}", i + 1))
+                .collect();
+            format!("Review comments ({n}):\n\n{}", items.join("\n\n"))
+        }
+    }
+}
+
 /// Monospace columns: tab stops of 4, wide CJK and emoji 2, marks 0.
 pub fn visual_columns(text: &str) -> usize {
     use unicode_width::UnicodeWidthChar;
@@ -666,6 +784,103 @@ mod tests {
                 .filter(|b| matches!(b, Block::Hunk { .. }))
                 .count(),
             10
+        );
+    }
+
+    fn numbered(kind: LineKind, text: &str, old: Option<u32>, new: Option<u32>) -> Line {
+        Line {
+            kind,
+            text: text.into(),
+            old_number: old,
+            new_number: new,
+            chunk: None,
+        }
+    }
+
+    #[test]
+    fn selection_location_handles_single_range_deleted_and_mixed_lines() {
+        let add = |n| numbered(LineKind::Add, "x", None, Some(n));
+        let del = |n| numbered(LineKind::Del, "x", Some(n), None);
+        assert_eq!(selection_location("src/a.rs", &[add(12)]), "src/a.rs:L12");
+        assert_eq!(
+            selection_location("src/a.rs", &[add(12), add(14), add(16)]),
+            "src/a.rs:L12-L16"
+        );
+        assert_eq!(
+            selection_location("src/a.rs", &[del(4), del(5), del(6)]),
+            "src/a.rs:L4-L6"
+        );
+        assert_eq!(
+            selection_location("src/a.rs", &[del(4), add(4), add(5)]),
+            "src/a.rs:L4-L5"
+        );
+        let hunk = numbered(LineKind::Hunk, "@@", None, None);
+        assert_eq!(selection_location("src/a.rs", &[hunk.clone()]), "src/a.rs");
+        assert_eq!(selection_location("src/a.rs", &[]), "src/a.rs");
+        assert_eq!(
+            selection_location("src/a.rs", &[hunk, add(3)]),
+            "src/a.rs:L3"
+        );
+    }
+
+    #[test]
+    fn format_annotation_supports_quote_only_notes_truncation_and_backtick_fencing() {
+        let del = numbered(LineKind::Del, "old", Some(7), None);
+        let add = numbered(LineKind::Add, "new", None, Some(7));
+        let ctx = numbered(LineKind::Context, "same", Some(8), Some(8));
+        assert_eq!(
+            format_annotation("a.rs", &[del.clone(), add.clone(), ctx.clone()], ""),
+            "`a.rs:L7-L8`\n```diff\n-old\n+new\n same\n```"
+        );
+        assert_eq!(
+            format_annotation("a.rs", &[del.clone()], "  why?\r\nreally  "),
+            "`a.rs:L7` (deleted)\n```diff\n-old\n```\nwhy?\nreally"
+        );
+        let fenced = numbered(LineKind::Add, "```", None, Some(1));
+        assert_eq!(
+            format_annotation("a.rs", &[fenced], ""),
+            "`a.rs:L1`\n````diff\n+```\n````"
+        );
+        let many: Vec<Line> = (1..=45)
+            .map(|n| numbered(LineKind::Add, "x", None, Some(n)))
+            .collect();
+        let text = format_annotation("a.rs", &many, "");
+        assert_eq!(text.matches("\n+x").count(), 40);
+        assert!(text.contains("... (5 more lines omitted)\n```"));
+        assert!(text.starts_with("`a.rs:L1-L45`"));
+        assert_eq!(format_annotation("a.rs", &[], "  "), "");
+        assert_eq!(
+            format_annotation("a.rs", &[numbered(LineKind::Hunk, "@@", None, None)], ""),
+            ""
+        );
+    }
+
+    #[test]
+    fn format_review_batch_formats_single_and_multiple_notes() {
+        let a = [numbered(LineKind::Add, "one", None, Some(1))];
+        let b = [numbered(LineKind::Del, "two", Some(2), None)];
+        assert_eq!(format_review_batch(&[]), "");
+        let first = ReviewNote {
+            path: "a.rs",
+            lines: &a,
+            note: "fix",
+        };
+        assert_eq!(
+            format_review_batch(&[first]),
+            format_annotation("a.rs", &a, "fix")
+        );
+        let second = ReviewNote {
+            path: "b.rs",
+            lines: &b,
+            note: "drop",
+        };
+        assert_eq!(
+            format_review_batch(&[first, second]),
+            format!(
+                "Review comments (2):\n\n1. {}\n\n2. {}",
+                format_annotation("a.rs", &a, "fix"),
+                format_annotation("b.rs", &b, "drop")
+            )
         );
     }
 }

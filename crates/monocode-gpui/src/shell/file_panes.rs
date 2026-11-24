@@ -928,4 +928,116 @@ mod tests {
                 .unwrap();
         }
     }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[gpui::test]
+    fn diff_review_annotations_append_to_active_composer_and_focus_without_sending(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        let root =
+            std::env::temp_dir().join(format!("monocode-diff-annotation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "base"]);
+        std::fs::write(root.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let status = run_git(&root, &["status", "--porcelain"]);
+        let cwd = root.to_string_lossy().into_owned();
+
+        let (window, first, _) = window(cx);
+        let chat = window
+            .update(cx, |shell, w, cx| {
+                shell.sessions[&first].update(cx, |s, _| s.summary.cwd = cwd.clone());
+                shell.workspace.project = cwd.clone();
+                shell.open(first, w, cx);
+                shell.open_review(
+                    ReviewTab::Changes {
+                        cwd: cwd.clone(),
+                        path: None,
+                        staged: None,
+                    },
+                    w,
+                    cx,
+                );
+                let chat = shell.sessions[&first].clone();
+                chat.read(cx)
+                    .input
+                    .clone()
+                    .update(cx, |input, cx| input.set_text("Existing prompt".into(), cx));
+                chat
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let before = window
+            .update(visual, |_, _, cx| {
+                let chat = chat.read(cx);
+                (chat.busy, chat.summary.has_messages)
+            })
+            .unwrap();
+
+        // Rows: file header, hunk header, `one`, `two` (removed), `TWO`.
+        for (selector, shift) in [("diff-line-3", false), ("diff-line-4", true)] {
+            let at = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is not on screen"))
+                .center();
+            let modifiers = if shift {
+                gpui::Modifiers::shift()
+            } else {
+                Default::default()
+            };
+            visual.simulate_click(at, modifiers);
+            visual.run_until_parked();
+        }
+        let quote = visual
+            .debug_bounds("diff-selection-quote")
+            .unwrap()
+            .center();
+        visual.simulate_click(quote, Default::default());
+        visual.run_until_parked();
+
+        window
+            .update(visual, |shell, w, cx| {
+                let input = chat.read(cx).input.clone();
+                let text = input.read(cx).content.to_string();
+                assert!(text.starts_with("Existing prompt\n\n"), "{text:?}");
+                assert!(text.contains("a.txt:L2"), "{text:?}");
+                assert!(text.contains("```diff\n-two\n+TWO\n```"), "{text:?}");
+                assert!(input.focus_handle(cx).is_focused(w));
+                assert!(!shell.review_focused);
+                let chat = chat.read(cx);
+                assert_eq!((chat.busy, chat.summary.has_messages), before);
+            })
+            .unwrap();
+        assert_eq!(run_git(&root, &["status", "--porcelain"]), status);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
