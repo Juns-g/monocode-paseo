@@ -803,16 +803,13 @@ impl Shell {
             })
             .flex()
             .items_center()
-            .child(div().flex_1().min_w_0().when(
-                !crate::paseo_host::project_ui(&self.workspace.preferences),
-                |d| {
-                    d.child(
-                        self.usage_footer
-                            .clone()
-                            .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
-                    )
-                },
-            ))
+            .child(
+                div().flex_1().min_w_0().child(
+                    self.usage_footer
+                        .clone()
+                        .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
+                ),
+            )
             .map(|d| {
                 let pressure = self.pressure_chip(cx);
                 let terminal = self.terminal_footer(cx);

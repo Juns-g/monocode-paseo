@@ -394,8 +394,10 @@ impl Shell {
                 view.apply_preferences(&self.workspace.preferences, cx)
             });
         }
+        let paseo = crate::paseo_host::project_ui(&self.workspace.preferences);
         self.usage_footer.update(cx, |footer, cx| {
-            footer.set_remaining(self.workspace.preferences.show_remaining_usage, cx)
+            footer.set_paseo_mode(paseo, cx);
+            footer.set_remaining(self.workspace.preferences.show_remaining_usage, cx);
         });
     }
     fn choose_chat_background(&mut self, cx: &mut Context<Self>) {

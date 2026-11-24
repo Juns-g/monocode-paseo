@@ -618,7 +618,13 @@ pub(crate) fn restrict_workspace(w: &mut crate::workspace::Workspace) {
     w.sidebar_inbox_visible = false;
     w.preferences.monos = false;
     w.preferences.quick_composer = false;
-    w.preferences.show_remaining_usage = false;
+    // Paseo quota defaults to remaining %, once; later explicit choices are kept.
+    if !w.preferences.extra.contains_key("paseo_usage_v1") {
+        w.preferences.show_remaining_usage = true;
+        w.preferences
+            .extra
+            .insert("paseo_usage_v1".into(), json!(true));
+    }
     w.preferences.idle_agents = 0;
     w.title_order.retain(|tab| {
         matches!(

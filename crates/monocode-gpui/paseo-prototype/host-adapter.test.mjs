@@ -940,3 +940,18 @@ test('the sync window stays bounded, reports its cursor, has no history notice a
     assert.equal(page.blocks.at(-1).id,`e:${value.session.historyWindow.before-1}`);assert.equal(h.entries[0].seqStart,value.session.historyWindow.before);
   }finally{f.close();}
 });
+test('paseo.usage is advertised and relays only Codex and Antigravity reports through the daemon client',async()=>{
+  const f=fixture();try{
+    f.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+    const caps=(await f.host.request('environment.describe',{})).result.capabilities;assert.ok(caps.includes('paseo.usage'));
+    const seen=[];
+    const report=(sourceId,id)=>({id,sourceId,sourceLabel:sourceId,account:{},fetchedAt:'2026-10-25T00:00:00Z',
+      report:{status:'available',windows:[{id:'w',label:'Session',usedPct:30,resetsAt:'2026-10-25T05:00:00Z'}]}});
+    f.client.listUsageReports=async(options,onReport)=>{seen.push(options);onReport(report('grok','g'));return {requestId:'r',reports:[report('antigravity','a'),report('codex','c'),report('grok','g')]};};
+    const out=(await f.host.request('paseo.usage',{forceRefresh:true})).result;
+    assert.deepEqual(seen,[{forceRefresh:true}]);
+    assert.deepEqual(out.sources.map(s=>s.sourceId),['codex','antigravity']);
+    assert.equal(out.sources[0].windows[0].remainingPct,70);
+    await f.host.request('paseo.usage',{});assert.deepEqual(seen.at(-1),{forceRefresh:false});
+  }finally{f.close();}
+});

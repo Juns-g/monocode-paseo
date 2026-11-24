@@ -1200,7 +1200,7 @@ mod tests {
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        assert!(visual.debug_bounds("usage-footer").is_none());
+        assert!(visual.debug_bounds("usage-footer").is_some());
         assert!(visual.debug_bounds("sidebar-filter-button").is_some());
         assert!(visual.debug_bounds("terminal-dock").is_some());
     }

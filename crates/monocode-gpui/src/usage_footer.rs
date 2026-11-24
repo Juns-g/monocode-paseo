@@ -11,6 +11,7 @@ use monocode_core::usage::{FetchError, Snapshot};
 use monocode_core::{provider::Kind, usage};
 use std::time::{Duration, Instant};
 
+mod paseo;
 mod resets;
 
 actions!(usage_footer, [DismissUsage, ToggleUsage, RefreshUsage]);
@@ -60,6 +61,9 @@ pub(crate) struct UsageFooter {
     /// UsageFooter's `footer` variant: the classic layout's bordered strip.
     classic: bool,
     show_remaining: bool,
+    /// Paseo bundle: Codex + Antigravity quota relayed by the daemon, no local credentials.
+    paseo_mode: bool,
+    paseo: paseo::PaseoUsageState,
     _clock: gpui::Task<()>,
 }
 impl UsageFooter {
@@ -75,6 +79,13 @@ impl UsageFooter {
         let key = Key::new(kind, profile, model);
         self.project = project;
         self.session = session;
+        if self.paseo_mode {
+            // Paseo quota is workspace-wide: tab switches keep the cache and popover.
+            self.kind = kind;
+            self.key = key;
+            self.refresh(false, cx);
+            return;
+        }
         if self.key != key {
             self.kind = kind;
             self.key = key;
@@ -105,6 +116,9 @@ impl UsageFooter {
         });
         let observation = crate::accounts::get(cx).map(|center| {
             cx.observe(&center, |this, center, cx| {
+                if this.paseo_mode {
+                    return;
+                }
                 if let Some(state) = center.read(cx).usage.get(&this.key).cloned() {
                     this.cache[index(this.kind)] = state;
                 }
@@ -115,7 +129,10 @@ impl UsageFooter {
             _account_events: crate::accounts::get(cx).map(|center| {
                 cx.subscribe(
                     &center,
-                    |_this, center, event: &crate::accounts::AccountEvent, cx| {
+                    |this, center, event: &crate::accounts::AccountEvent, cx| {
+                        if this.paseo_mode {
+                            return;
+                        }
                         let modal_auth =
                             matches!(event, crate::accounts::AccountEvent::AuthStarted)
                                 && center.read(cx).has_modal_auth();
@@ -151,7 +168,9 @@ impl UsageFooter {
             previous_focus: None,
             open: false,
             classic: false,
-            show_remaining: false,
+            show_remaining: crate::paseo_host::active(),
+            paseo_mode: crate::paseo_host::active(),
+            paseo: Default::default(),
             _clock: clock,
         };
         this.refresh(false, cx);
@@ -177,6 +196,17 @@ impl UsageFooter {
             if self.show_remaining { "left" } else { "used" }
         )
     }
+    pub(crate) fn set_paseo_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.paseo_mode == enabled {
+            return;
+        }
+        self.paseo_mode = enabled;
+        self.open = false;
+        self.show_accounts = false;
+        self.confirm_reset = None;
+        self.refresh(false, cx);
+        cx.notify();
+    }
     pub(crate) fn set_classic(&mut self, classic: bool, cx: &mut Context<Self>) {
         if self.classic != classic {
             self.classic = classic;
@@ -194,7 +224,8 @@ impl UsageFooter {
         }
     }
     fn refresh(&mut self, force: bool, cx: &mut Context<Self>) {
-        if crate::paseo_host::active() {
+        if self.paseo_mode {
+            self.refresh_paseo(force, cx);
             return;
         }
         if let Some(center) = crate::accounts::get(cx) {
@@ -254,7 +285,9 @@ impl UsageFooter {
             self.previous_focus = window.focused(cx).filter(|f| *f != self.trigger);
             self.open = true;
             self.show_accounts = false;
-            if let Some(center) = crate::accounts::get(cx) {
+            if self.paseo_mode {
+                self.refresh(false, cx);
+            } else if let Some(center) = crate::accounts::get(cx) {
                 let kind = self.kind;
                 let key = self.key.clone();
                 center.update(cx, |center, cx| {
@@ -283,6 +316,9 @@ impl UsageFooter {
         cx.notify();
     }
     fn login_view(&self, cx: &App) -> bool {
+        if self.paseo_mode {
+            return false;
+        }
         let state = &self.cache[index(self.kind)];
         monocode_core::accounts::login_arguments(
             self.kind,
@@ -338,6 +374,9 @@ impl UsageFooter {
             .into_any_element()
     }
     fn details(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.paseo_mode {
+            return self.paseo_details(usage::now_ms(), cx);
+        }
         if self.show_accounts
             && let Some(center) = crate::accounts::get(cx)
         {
@@ -816,6 +855,15 @@ impl UsageFooter {
 use crate::accounts::ui::bar_color as usage_color;
 impl Render for UsageFooter {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.paseo_mode {
+            self.render_paseo(cx)
+        } else {
+            self.render_default(cx).into_any_element()
+        }
+    }
+}
+impl UsageFooter {
+    fn render_default(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.cache[index(self.kind)];
         let now = usage::now_ms();
         let label = if let Some(snapshot) = &state.snapshot {
