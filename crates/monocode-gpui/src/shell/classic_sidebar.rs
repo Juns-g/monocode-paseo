@@ -285,6 +285,7 @@ impl Shell {
         div()
             .id("monocode-sidebar")
             .debug_selector(|| "sidebar-content".into())
+            .relative()
             .track_focus(&self.sidebar_focus)
             .when(sessions, |d| {
                 d.key_context("SessionSidebar")
@@ -305,6 +306,7 @@ impl Shell {
             .min_h_0()
             .flex()
             .flex_col()
+            .child(self.sidebar_project_swipe_capture(cx))
             .child(
                 div()
                     .id("classic-workspace-header")

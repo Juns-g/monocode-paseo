@@ -1263,6 +1263,7 @@ mod tests {
                         "paseo_group".into(),
                         serde_json::json!(if status { "status" } else { "project" }),
                     );
+                    shell.rails.paseo_disclosures.clear();
                     shell.invalidate_chrome(cx);
                     shell.refresh_sidebar_structure(cx);
                     assert_eq!(shell.started_by.get(&child), Some(&root));
@@ -1286,12 +1287,44 @@ mod tests {
                 })
                 .unwrap();
             visual.run_until_parked();
+            visual.refresh().unwrap();
+            let parent_bounds = visual
+                .debug_bounds(root_selector)
+                .expect("workspace is visible");
+            // Clicking or opening a parent must keep its children collapsed by default.
+            assert!(
+                visual.debug_bounds(child_selector).is_none(),
+                "child rail must stay collapsed by default even when parent is active"
+            );
+            window
+                .read_with(visual, |shell, cx| {
+                    assert!(!shell.sidebar_navigation_ids(cx).contains(&child));
+                })
+                .unwrap();
+            visual.simulate_click(parent_bounds.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(
+                visual.debug_bounds(child_selector).is_none(),
+                "clicking the parent row must not auto-expand children"
+            );
+
+            // Expanding explicitly via the chevron toggle reveals the child nested underneath.
+            let toggle = visual
+                .debug_bounds(toggle_selector)
+                .expect("parent has a separate control to expand its children");
+            visual.simulate_mouse_move(toggle.center(), None, Default::default());
+            visual.refresh().unwrap();
+            assert_eq!(visual.debug_bounds(toggle_selector), Some(toggle));
+            visual.simulate_click(toggle.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
             let parent_bounds = visual
                 .debug_bounds(root_selector)
                 .expect("workspace is visible");
             let child_bounds = visual
                 .debug_bounds(child_selector)
-                .expect("child rail is expanded");
+                .expect("child rail is expanded after clicking toggle");
             assert!(child_bounds.left() > parent_bounds.left());
             assert!(child_bounds.top() >= parent_bounds.bottom());
 
@@ -2095,13 +2128,26 @@ mod tests {
             visual.refresh().unwrap();
             let layout =
                 format!("classic={classic} status={status} compact={compact} folder={folder}");
+            // Active parent starts collapsed by default, showing the status badge right away.
+            assert!(visual.debug_bounds(child_selector).is_none(), "{layout}");
+            assert!(
+                visual.debug_bounds(badge_selector).is_some(),
+                "collapsed-by-default parent shows badge immediately: {layout}"
+            );
+            // Expanding via toggle hides the badge and reveals children; collapsing restores badge.
+            let toggle = visual
+                .debug_bounds(toggle_selector)
+                .unwrap_or_else(|| panic!("toggle present: {layout}"));
+            visual.simulate_click(toggle.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
             assert!(
                 visual.debug_bounds(badge_selector).is_none(),
                 "expanded parent shows no badge: {layout}"
             );
             let toggle = visual
                 .debug_bounds(toggle_selector)
-                .unwrap_or_else(|| panic!("toggle present: {layout}"));
+                .unwrap_or_else(|| panic!("toggle present while expanded: {layout}"));
             visual.simulate_click(toggle.center(), Default::default());
             visual.run_until_parked();
             visual.refresh().unwrap();
@@ -2223,5 +2269,79 @@ mod tests {
                 "{layout}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn sidebar_horizontal_swipe_switches_projects_once_per_gesture(cx: &mut TestAppContext) {
+        use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+        let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let summaries = store.sessions().unwrap();
+        let mut state = Workspace::default();
+        state.add_project("/work/proj-a");
+        state.add_project("/work/proj-b");
+        state.add_project("/work/proj-c");
+        state.project = "/work/proj-a".into();
+        let saved = serde_json::to_string(&state).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let window = cx.add_window(move |_, cx| {
+            Shell::new(store, summaries, "/work/proj-a".into(), Some(saved), cx)
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let sidebar = visual
+            .debug_bounds("sidebar-content")
+            .expect("sidebar rendered")
+            .center();
+
+        let wheel = |visual: &mut gpui::VisualTestContext, phase: TouchPhase, dx: f32, dy: f32| {
+            visual.simulate_event(ScrollWheelEvent {
+                position: sidebar,
+                delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                modifiers: Default::default(),
+                touch_phase: phase,
+            });
+            visual.run_until_parked();
+        };
+
+        // Vertical scroll with slight horizontal drift must NOT switch projects.
+        wheel(visual, TouchPhase::Started, -6., -24.);
+        wheel(visual, TouchPhase::Moved, -35., -40.);
+        assert_eq!(
+            window
+                .read_with(visual, |s, _| s.workspace.project.clone())
+                .unwrap(),
+            "/work/proj-a"
+        );
+
+        // Swipe left (dx < 0) switches proj-a -> proj-b once, ignoring long momentum tail.
+        wheel(visual, TouchPhase::Started, -16., 0.);
+        wheel(visual, TouchPhase::Moved, -20., 1.);
+        wheel(visual, TouchPhase::Moved, -45., 0.);
+        wheel(visual, TouchPhase::Ended, -30., 0.);
+        wheel(visual, TouchPhase::Moved, -40., 0.);
+        assert_eq!(
+            window
+                .read_with(visual, |s, _| s.workspace.project.clone())
+                .unwrap(),
+            "/work/proj-b"
+        );
+
+        // New gesture swiping right (dx > 0) switches back proj-b -> proj-a, and stops at edge.
+        wheel(visual, TouchPhase::Started, 20., 0.);
+        wheel(visual, TouchPhase::Moved, 20., 0.);
+        assert_eq!(
+            window
+                .read_with(visual, |s, _| s.workspace.project.clone())
+                .unwrap(),
+            "/work/proj-a"
+        );
+        wheel(visual, TouchPhase::Started, 40., 0.);
+        assert_eq!(
+            window
+                .read_with(visual, |s, _| s.workspace.project.clone())
+                .unwrap(),
+            "/work/proj-a"
+        );
     }
 }

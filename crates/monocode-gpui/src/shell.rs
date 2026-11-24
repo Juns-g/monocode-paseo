@@ -362,6 +362,33 @@ fn adjacent<T: PartialEq + Clone>(items: &[T], current: Option<&T>, step: isize)
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwipeAxis {
+    Pending,
+    Horizontal,
+    Reserved,
+}
+
+struct SidebarProjectSwipe {
+    last_event: Option<std::time::Instant>,
+    x: f32,
+    y: f32,
+    axis: SwipeAxis,
+    consumed: bool,
+}
+
+impl Default for SidebarProjectSwipe {
+    fn default() -> Self {
+        Self {
+            last_event: None,
+            x: 0.,
+            y: 0.,
+            axis: SwipeAxis::Pending,
+            consumed: false,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) enum MenuTarget {
     Tab(i64),
@@ -738,6 +765,7 @@ pub(crate) struct Shell {
     pub(crate) workspace: Workspace,
     focus: FocusHandle,
     sidebar_focus: FocusHandle,
+    sidebar_swipe: SidebarProjectSwipe,
     query: String,
     sidebar_hover: Option<&'static str>,
     tab_hover: Option<i64>,
@@ -1143,6 +1171,7 @@ impl Shell {
             workspace,
             focus: cx.focus_handle(),
             sidebar_focus: cx.focus_handle(),
+            sidebar_swipe: Default::default(),
             query: String::new(),
             sidebar_hover: None,
             tab_hover: None,
@@ -7431,6 +7460,122 @@ impl Shell {
             self.select_project(next, window, cx);
         }
     }
+    /// Port of React's `useProjectSwipe`: a horizontal trackpad swipe over the
+    /// left sidebar switches between adjacent projects in the bottom spaces bar
+    /// (once per gesture, ignoring momentum tails and vertical scrolling).
+    pub(super) fn handle_sidebar_project_swipe(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        const GESTURE_IDLE: std::time::Duration = std::time::Duration::from_millis(220);
+        const CONSUMED_IDLE: std::time::Duration = std::time::Duration::from_millis(450);
+        const SWIPE_DISTANCE: f32 = 30.;
+
+        let now = std::time::Instant::now();
+        let idle = if self.sidebar_swipe.consumed {
+            CONSUMED_IDLE
+        } else {
+            GESTURE_IDLE
+        };
+        let fresh = matches!(event.touch_phase, gpui::TouchPhase::Started)
+            || self
+                .sidebar_swipe
+                .last_event
+                .is_none_or(|at| now.duration_since(at) > idle);
+        if fresh {
+            self.sidebar_swipe = SidebarProjectSwipe::default();
+        }
+        self.sidebar_swipe.last_event = Some(now);
+
+        if event.modifiers.control
+            || event.modifiers.platform
+            || event.modifiers.alt
+            || event.modifiers.shift
+            || self.menu.is_some()
+            || self.settings.is_some()
+            || self.renaming.is_some()
+        {
+            self.sidebar_swipe.axis = SwipeAxis::Reserved;
+            return false;
+        }
+
+        let projects = self.workspace.visible_project_order();
+        if self.sidebar_swipe.axis == SwipeAxis::Reserved || projects.len() < 2 {
+            return false;
+        }
+
+        let delta = event.delta.pixel_delta(px(16.));
+        // GPUI exposes macOS NSEvent scrollingDeltaX/Y directly (opposite sign to DOM WheelEvent).
+        // Two-finger swipe left (content shifts left -> next project on the right) gives delta.x < 0.
+        self.sidebar_swipe.x += -delta.x.as_f32();
+        self.sidebar_swipe.y += -delta.y.as_f32();
+
+        if self.sidebar_swipe.axis == SwipeAxis::Pending {
+            let ax = self.sidebar_swipe.x.abs();
+            let ay = self.sidebar_swipe.y.abs();
+            if ax.max(ay) < 10. {
+                return false;
+            }
+            self.sidebar_swipe.axis = if ax > ay * 1.5 {
+                SwipeAxis::Horizontal
+            } else {
+                SwipeAxis::Reserved
+            };
+            if self.sidebar_swipe.axis == SwipeAxis::Reserved {
+                return false;
+            }
+        }
+
+        if !self.sidebar_swipe.consumed && self.sidebar_swipe.x.abs() >= SWIPE_DISTANCE {
+            self.sidebar_swipe.consumed = true;
+            if let Some(index) = projects
+                .iter()
+                .position(|path| path == &self.workspace.project)
+            {
+                let target = if self.sidebar_swipe.x > 0. {
+                    index.checked_add(1).and_then(|i| projects.get(i))
+                } else {
+                    index.checked_sub(1).and_then(|i| projects.get(i))
+                };
+                if let Some(next) = target.cloned()
+                    && next != self.workspace.project
+                {
+                    self.select_project(next, window, cx);
+                    // Refresh timestamp after project switch completes so its work
+                    // never expires the momentum guard for trailing inertia events.
+                    self.sidebar_swipe.last_event = Some(std::time::Instant::now());
+                }
+            }
+        }
+        true
+    }
+    pub(super) fn sidebar_project_swipe_capture(&self, cx: &Context<Self>) -> AnyElement {
+        let weak = cx.weak_entity();
+        gpui::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let weak = weak.clone();
+                window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Capture || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    let took = weak
+                        .update(cx, |this, cx| {
+                            this.handle_sidebar_project_swipe(event, window, cx)
+                        })
+                        .unwrap_or(false);
+                    if took {
+                        cx.stop_propagation();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
+    }
     fn close_other_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.active_title_tab(cx) else {
             return;
@@ -7479,6 +7624,7 @@ impl Shell {
         div()
             .id("monocode-sidebar")
             .debug_selector(|| "sidebar-content".into())
+            .relative()
             .track_focus(&self.sidebar_focus)
             .key_context("SessionSidebar")
             .on_action(
@@ -7496,6 +7642,7 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
+            .child(self.sidebar_project_swipe_capture(cx))
             .child(
                 div().flex_1().min_h_0().child(
                     div()

@@ -194,10 +194,16 @@ impl Shell {
             // orchestrationExpanded: the lead in view, chosen or working.
             Rail::Agents(_) => self.in_play(id, cx),
             Rail::Started(children) => {
-                if crate::paseo_host::project_ui(&self.workspace.preferences)
-                    && let Some(open) = self.rails.paseo_disclosures.get(&id)
-                {
-                    return *open;
+                if crate::paseo_host::project_ui(&self.workspace.preferences) {
+                    // Paseo child rails stay collapsed by default even when the parent
+                    // conversation is clicked/active; users expand them explicitly via
+                    // the chevron toggle or collapsed status badge (search auto-reveals).
+                    return self
+                        .rails
+                        .paseo_disclosures
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(!self.query.is_empty());
                 }
                 self.in_play(id, cx) || children.iter().any(|c| self.in_play(*c, cx))
             }

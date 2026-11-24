@@ -386,15 +386,21 @@ impl Shell {
     pub(super) fn sidebar_navigation_ids(&self, cx: &App) -> Vec<i64> {
         let mut ids = self.sidebar_session_ids(cx);
         if crate::paseo_host::project_ui(&self.workspace.preferences)
-            && !self.rails.paseo_disclosures.is_empty()
+            && !self.rails.started.is_empty()
         {
             let hidden: HashSet<_> = self
                 .rails
-                .paseo_disclosures
+                .started
                 .iter()
-                .filter(|(_, open)| !**open)
-                .filter_map(|(parent, _)| self.rails.started.get(parent))
-                .flatten()
+                .filter(|(parent, _)| {
+                    !self
+                        .rails
+                        .paseo_disclosures
+                        .get(parent)
+                        .copied()
+                        .unwrap_or(!self.query.is_empty())
+                })
+                .flat_map(|(_, children)| children.iter().copied())
                 .collect();
             ids.retain(|id| !hidden.contains(id));
         }
