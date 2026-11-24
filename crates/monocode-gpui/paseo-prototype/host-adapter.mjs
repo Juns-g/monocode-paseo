@@ -7,11 +7,13 @@ import {Controller,boundedEntries,joinEntries} from './controller.mjs';
 import {parseQuestionFormQuestions} from 'paseo-source/packages/app/src/components/question-form-card-core.ts';
 import {fullAccessMode,nativeModel,nativeSettings,configuration} from './configuration.mjs';
 import {SyncTransfers} from '../../../host/sync-transfer.ts';
+import {fetchPaseoUsage} from './usage.mjs';
 
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
 const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume and never answer (its own wait is 60 s).
 export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.history-pages','sessions.no-delete','sessions.list-revision',
+  'paseo.usage',
   'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
 const stamp=value=>{const n=typeof value==='number'?value:Date.parse(value);return Number.isFinite(n)?n:0;};
@@ -478,6 +480,7 @@ export class PaseoHost {
       await this.directory();
       return {result:this.workspaceChoices(p.projectId).slice(0,WORKSPACE_CHOICE_LIMIT)};
     }
+    if(method==='paseo.usage')return {result:await fetchPaseoUsage(this.client,p)};
     if(method==='environment.describe')return {result:{protocolVersion:1,environmentId:this.serverId,name:`Paseo ${this.client.getLastServerInfoMessage()?.version??''}`,
       platform:process.platform,providers:[...new Set((await this.providers()).map(harness))],capabilities:CAPABILITIES}};
     if(['projects.list','sessions.list','projects.open'].includes(method)){
