@@ -1155,6 +1155,7 @@ mod tests {
     fn paseo_remote_hierarchy_keeps_children_under_their_parent_in_every_layout(
         cx: &mut TestAppContext,
     ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
         let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
         let project = store
             .remember_remote_project(
@@ -1184,16 +1185,27 @@ mod tests {
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         static ROOT_SELECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         static CHILD_SELECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static TOGGLE_SELECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         let root_selector = ROOT_SELECTOR
             .get_or_init(|| format!("sidebar-session-{root}"))
             .as_str();
         let child_selector = CHILD_SELECTOR
             .get_or_init(|| format!("sidebar-session-{child}"))
             .as_str();
-        for (classic, status) in [(false, false), (false, true), (true, false)] {
+        let toggle_selector = TOGGLE_SELECTOR
+            .get_or_init(|| format!("sidebar-rail-toggle-{root}"))
+            .as_str();
+        for (classic, status, compact) in [
+            (false, false, false),
+            (false, false, true),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+        ] {
             window
                 .update(visual, |shell, _, cx| {
                     shell.workspace.classic_layout = classic;
+                    shell.workspace.compact_session_cards = compact;
                     shell.workspace.preferences.extra.insert(
                         "paseo_group".into(),
                         serde_json::json!(if status { "status" } else { "project" }),
@@ -1229,6 +1241,42 @@ mod tests {
                 .expect("child rail is expanded");
             assert!(child_bounds.left() > parent_bounds.left());
             assert!(child_bounds.top() >= parent_bounds.bottom());
+
+            visual.simulate_click(child_bounds.center(), Default::default());
+            visual.run_until_parked();
+            let toggle = visual
+                .debug_bounds(toggle_selector)
+                .expect("parent has a separate control to collapse its children");
+            visual.simulate_mouse_move(toggle.center(), None, Default::default());
+            visual.refresh().unwrap();
+            assert_eq!(visual.debug_bounds(toggle_selector), Some(toggle));
+            visual.simulate_click(toggle.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            window
+                .read_with(visual, |shell, cx| {
+                    assert_eq!(shell.workspace.active, Some(child));
+                    assert!(!shell.sidebar_navigation_ids(cx).contains(&child));
+                })
+                .unwrap();
+            assert!(visual.debug_bounds(child_selector).is_none());
+
+            let parent = visual.debug_bounds(root_selector).unwrap();
+            visual.simulate_click(parent.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(visual.debug_bounds(child_selector).is_none());
+            window
+                .read_with(visual, |shell, _| {
+                    assert_eq!(shell.workspace.active, Some(root));
+                })
+                .unwrap();
+
+            let toggle = visual.debug_bounds(toggle_selector).unwrap();
+            visual.simulate_click(toggle.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(visual.debug_bounds(child_selector).is_some());
         }
         window
             .update(visual, |shell, _, cx| {

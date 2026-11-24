@@ -1,7 +1,7 @@
 //! Sidebar.tsx's rails: an orchestrator's agents (OrchestrationSidebarAgents,
 //! `tree`) and the sessions an /operator thread started hang off a line under
-//! its row. Each rail opens while its thread, or one of the thread's
-//! sessions, is in view, chosen or working, and RevealHeight grows it in.
+//! its row. Rails follow selection and activity by default. Paseo also lets
+//! the user open or close the children directly.
 use super::*;
 use crate::reveal::{Disclosure, bezier};
 use std::time::{Duration, Instant};
@@ -15,6 +15,8 @@ pub(crate) struct Rails {
     motions: HashMap<i64, Motion>,
     /// Agent rows opened to their details, by lead and task.
     open_tasks: HashSet<(i64, usize)>,
+    /// Explicit disclosure choices for Paseo parent sessions in this window.
+    pub(super) paseo_disclosures: HashMap<i64, bool>,
     /// This frame's /operator groups, and the sessions they took from the list.
     pub(super) started: HashMap<i64, Vec<i64>>,
     pub(super) children: HashSet<i64>,
@@ -121,10 +123,62 @@ impl Shell {
             // orchestrationExpanded: the lead in view, chosen or working.
             Rail::Agents(_) => self.in_play(id, cx),
             Rail::Started(children) => {
+                if crate::paseo_host::project_ui(&self.workspace.preferences)
+                    && let Some(open) = self.rails.paseo_disclosures.get(&id)
+                {
+                    return *open;
+                }
                 self.in_play(id, cx) || children.iter().any(|c| self.in_play(*c, cx))
             }
         }
     }
+
+    pub(super) fn paseo_child_rail_button(
+        &self,
+        id: i64,
+        rail: Option<(&Rail, bool)>,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let (Rail::Started(_), open) = rail? else {
+            return None;
+        };
+        if !crate::paseo_host::project_ui(&self.workspace.preferences) {
+            return None;
+        }
+        let (glyph, label) = if open {
+            ("chevron-down", "Collapse child conversations")
+        } else {
+            ("chevron-right", "Expand child conversations")
+        };
+        Some(
+            div()
+                .id(("sidebar-rail-toggle", id as usize))
+                .debug_selector(move || format!("sidebar-rail-toggle-{id}"))
+                .role(Role::Button)
+                .aria_label(crate::i18n::t(label))
+                .aria_expanded(open)
+                .cursor_pointer()
+                .size(px(20.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .hover(|s| s.bg(content(0.1)))
+                .child(icon(glyph, 14.).text_color(content(0.65)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.rails.paseo_disclosures.insert(id, !open);
+                    if open && let Some(children) = this.rails.started.get(&id) {
+                        this.selected_sessions.retain(|child| !children.contains(child));
+                    }
+                    this.notify_sidebar(cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// Moves each rail toward its open state. A rail the sidebar first shows
     /// is simply there; later changes grow and fold.
     pub(super) fn sync_rails(&mut self, ids: &[i64], cx: &mut Context<Self>) {
@@ -322,6 +376,8 @@ impl Shell {
         let draft = session.has_saved_draft();
         let approval = session.needs_approval();
         let orchestration = matches!(rail, Some((Rail::Agents(_), true)));
+        let child_toggle = self.paseo_child_rail_button(id, rail, cx);
+        let mode_badge = rail.filter(|_| child_toggle.is_none());
         let header = !compact || orchestration;
         let started_in_view = match rail {
             Some((Rail::Started(children), _)) => children.iter().any(|child| {
@@ -441,7 +497,8 @@ impl Shell {
                                 .pl_2()
                                 .child(self.classic_session_status(id, &session, cx)),
                         )
-                    }),
+                    })
+                    .children(child_toggle),
             )
             .children(agents)
             .child(
@@ -489,7 +546,7 @@ impl Shell {
                                 self.automation_state.session_automations.contains_key(&id),
                                 |d| d.child(icon("zap", 12.).text_color(rgb(0xfbbf24))),
                             )
-                            .when_some(rail, |d, (rail, _)| {
+                            .when_some(mode_badge, |d, (rail, _)| {
                                 d.child(
                                     icon(
                                         match rail {

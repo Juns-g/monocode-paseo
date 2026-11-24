@@ -6235,10 +6235,11 @@ impl Shell {
         if let Some(row) = self.rename_row(&session_groups::RenameTarget::Session(id), cx) {
             return row;
         }
-        // A collapsed thread shows a chevron in its mark's place on hover:
-        // selecting it opens the rail below.
-        let expandable = rail.is_some_and(|(_, open)| !open);
-        let mode = rail.map(|(rail, _)| match rail {
+        let child_toggle = self.paseo_child_rail_button(id, rail, cx);
+        let other_rail = rail.filter(|_| child_toggle.is_none());
+        // Keep the hover hint for other rails that open when selected.
+        let expandable = other_rail.is_some_and(|(_, open)| !open);
+        let mode = other_rail.map(|(rail, _)| match rail {
             rails::Rail::Agents(summary) => (
                 "share",
                 // fuchsia-200/90
@@ -6442,6 +6443,7 @@ impl Shell {
                 .child(title)
                 .when(has_badges, |d| d.child(badges))
                 .child(suffix)
+                .children(child_toggle)
                 .into_any_element()
         } else {
             div()
@@ -6460,7 +6462,8 @@ impl Shell {
                             d.child(icon("pin", 12.).text_color(content(0.45)))
                         })
                         .child(title)
-                        .child(suffix),
+                        .child(suffix)
+                        .children(child_toggle),
                 )
                 .child(
                     div()

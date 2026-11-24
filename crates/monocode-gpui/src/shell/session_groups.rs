@@ -384,7 +384,20 @@ impl Shell {
     }
     /// The sessions in the order the sidebar shows them, for stepping.
     pub(super) fn sidebar_navigation_ids(&self, cx: &App) -> Vec<i64> {
-        let ids = self.sidebar_session_ids(cx);
+        let mut ids = self.sidebar_session_ids(cx);
+        if crate::paseo_host::project_ui(&self.workspace.preferences)
+            && !self.rails.paseo_disclosures.is_empty()
+        {
+            let hidden: HashSet<_> = self
+                .rails
+                .paseo_disclosures
+                .iter()
+                .filter(|(_, open)| !**open)
+                .filter_map(|(parent, _)| self.rails.started.get(parent))
+                .flatten()
+                .collect();
+            ids.retain(|id| !hidden.contains(id));
+        }
         let groups = self.project_groups();
         let entries: Vec<_> = self
             .session_entries(&ids, cx)
