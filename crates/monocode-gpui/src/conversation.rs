@@ -2548,8 +2548,16 @@ impl Conversation {
             cx.notify();
             return;
         }
-        if self.paseo_controls() && matches!(kind, ComposerMenu::Access | ComposerMenu::Add) {
-            self.status = "附件和工作区设置请在 Paseo 管理".into();
+        if self.paseo_controls() && kind == ComposerMenu::Access {
+            self.status = "工作区权限设置请在 Paseo 管理".into();
+            cx.notify();
+            return;
+        }
+        if self.paseo_controls()
+            && kind == ComposerMenu::Add
+            && !self.remote_state.capabilities.contains("attachments.upload")
+        {
+            self.status = "当前 Paseo 桥接不支持发送图片附件".into();
             cx.notify();
             return;
         }
@@ -2736,6 +2744,19 @@ impl Conversation {
                 )
             }
             // Composer.tsx's plus menu with native mode and attachment actions.
+            // Paseo accepts images only; Plan, Draft, Operator and Orchestrator stay unreachable.
+            ComposerMenu::Add if self.paseo_controls() => (
+                "Add to message",
+                vec![
+                    MenuItem::Header("Add to message".into()),
+                    MenuAction::new("upload", crate::i18n::t("Upload image"))
+                        .icon("file-add")
+                        .description("PNG, JPEG, WebP, GIF · up to 20 MB")
+                        .into(),
+                ],
+                250.,
+                MenuStyle::Composer,
+            ),
             ComposerMenu::Add => {
                 let mut items = vec![MenuItem::Header("Add to message".into())];
                 items.extend(

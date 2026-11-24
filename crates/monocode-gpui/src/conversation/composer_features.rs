@@ -159,12 +159,23 @@ impl Conversation {
         }
         text
     }
+    /// The Paseo bridge forwards inline images only; other files stay in Paseo.
+    pub(super) fn paseo_image_only_attachments(&self) -> bool {
+        self.paseo_controls()
+    }
     pub(super) fn choose_attachments(&mut self, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Attach files".into()),
+            prompt: Some(
+                if self.paseo_image_only_attachments() {
+                    "Attach images"
+                } else {
+                    "Attach files"
+                }
+                .into(),
+            ),
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = paths.await {
@@ -207,6 +218,7 @@ impl Conversation {
         self.attaching = true;
         let store = self.store.clone();
         let id = self.summary.id;
+        let image_only = self.paseo_image_only_attachments();
         let mut all = self.attachments.clone();
         let existing = all.len();
         let work = cx.background_executor().spawn(async move {
@@ -227,6 +239,9 @@ impl Conversation {
                     monocode_core::mono::new_id(),
                     image.format().extension()
                 ));
+                if image_only && monocode_core::composer::image_mime(&path).is_none() {
+                    return Err("Paseo 目前仅支持 PNG、JPEG、WebP、GIF 图片。".to_owned());
+                }
                 std::fs::write(&path, image.bytes()).map_err(|e| e.to_string())?;
                 all.push(path);
             }
@@ -244,6 +259,18 @@ impl Conversation {
         true
     }
     pub(super) fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        // Atomic: one unsupported file rejects the whole batch before anything is queued.
+        if self.paseo_image_only_attachments()
+            && paths.iter().any(|path| {
+                !monocode_core::remote::attachments::is_attachment_source(&path.to_string_lossy())
+                    && monocode_core::composer::image_mime(path).is_none()
+            })
+        {
+            self.attachment_error =
+                Some("Paseo 目前仅支持图片附件（PNG、JPEG、WebP、GIF）。".into());
+            cx.notify();
+            return;
+        }
         for path in paths {
             if !self.attachments.contains(&path) && !self.pending_attachments.contains(&path) {
                 self.pending_attachments.push(path);

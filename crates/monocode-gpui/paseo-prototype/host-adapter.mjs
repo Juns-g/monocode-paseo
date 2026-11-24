@@ -8,12 +8,13 @@ import {parseQuestionFormQuestions} from 'paseo-source/packages/app/src/componen
 import {fullAccessMode,nativeModel,nativeSettings,configuration} from './configuration.mjs';
 import {SyncTransfers} from '../../../host/sync-transfer.ts';
 import {fetchPaseoUsage} from './usage.mjs';
+import {AttachmentStore} from './attachments.mjs';
 
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
 const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume and never answer (its own wait is 60 s).
 export const CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.history-pages','sessions.no-delete','sessions.list-revision',
-  'paseo.usage',
+  'attachments.upload','attachments.read','paseo.usage',
   'files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
 const stamp=value=>{const n=typeof value==='number'?value:Date.parse(value);return Number.isFinite(n)?n:0;};
@@ -52,7 +53,7 @@ export function summary(entry,projectId) {
     paseoBucket:entry.paseoBucket,paseoStatusEnteredAt:entry.paseoStatusEnteredAt,
     branch:entry.project.checkout.currentBranch,providerSessionId:a.persistence?.sessionId};
 }
-export function projectBlocks(page,entries=page.displayEntries??page.entries,requestNumber=()=>null) {
+export function projectBlocks(page,entries=page.displayEntries??page.entries,requestNumber=()=>null,attachmentsFor=()=>null) {
   const blocks=[];let prompt,last=0;
   for(const entry of boundedEntries(entries)) {
     const item=entry.item,role={user_message:'user',assistant_message:'assistant',reasoning:'reasoning',tool_call:'tool',error:'error'}[item.type];
@@ -65,6 +66,8 @@ export function projectBlocks(page,entries=page.displayEntries??page.entries,req
     const block={id:`${page.epoch}:${entry.seqStart}`,role,text:item.text??item.message??'',sentAt:at};
     if(role==='user'){
       block.startedAt=at;block.providerTurnId=entry.turnId??undefined;prompt=block;
+      const files=item.clientMessageId?attachmentsFor(item.clientMessageId):null;
+      if(files?.length)block.attachments=files;
     }
     if(role==='tool') {
       const d=item.detail??{};
@@ -129,6 +132,7 @@ export class PaseoHost {
     this.seenPath=join(directory,'paseo-seen-attention.json');this.seen=new Map();this.clearing=new Map();this.clearTimeoutMs=CLEAR_ATTENTION_TIMEOUT_MS;
     try{for(const [id,at] of JSON.parse(readFileSync(this.seenPath,'utf8')))if(typeof id==='string'&&Number.isFinite(at))this.seen.set(id,at);}catch{}
     this.transfers=new SyncTransfers();
+    this.attachments=new AttachmentStore(directory);
     this.directoryAt=0;this.directoryRequests=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
   }
   fileProjects(){return [...this.projects.keys()].flatMap(id=>{
@@ -277,7 +281,7 @@ export class PaseoHost {
       h.entries=rows;h.page={...page,hasOlder};h.dirty=h.generation!==generation;
     }
     if(agentChanged||!h.snapshot||h.changedRows!==h.entries){
-      const s=summary(entry,entry.projectId),blocks=projectBlocks({...h.page,agent:entry.agent},this.projectTimeline(h.entries),request=>this.number(id,request));
+      const s=summary(entry,entry.projectId),blocks=projectBlocks({...h.page,agent:entry.agent},this.projectTimeline(h.entries),request=>this.number(id,request),messageId=>this.attachments.forMessage(id,messageId));
       const session={id,harness:s.harness,providerSessionId:s.providerSessionId,model:s.model,modelSettings:nativeSettings(entry.agent),runtimeMode:s.runtimeMode,title:s.title,cwd:s.cwd,
         busy:s.status==='running',blocks,paseoModeId:entry.agent.currentModeId,
         historyWindow:{epoch:h.page.epoch,before:h.page.hasOlder&&h.entries.length?h.entries[0].seqStart:null}};
@@ -438,8 +442,12 @@ export class PaseoHost {
           for(const [id,value] of Object.entries(config.featureValues??{})){this.identity();await this.client.setAgentFeature(agent.id,id,value);}
         }
       }else if(c.type==='send'){
-        if(c.attachments?.length||c.intent||c.draftBlockId||c.planBlockId)throw Error('此适配层暂不支持附件、计划或草稿；请在 Paseo 发送。');
-        const result=await control.dispatch({...base,op:'send',messageId:c.commandId,text:c.text,acknowledgeRace:true,
+        if(c.intent||c.draftBlockId||c.planBlockId)throw Error('此适配层暂不支持计划或草稿；请在 Paseo 发送。');
+        if(c.activeTurnBehavior==='steer'&&c.attachments?.length)throw Error('Paseo 追问（steer）仅支持纯文本，请等待当前轮次完成后发送图片。');
+        const {refs,images}=this.attachments.prepareSend(c.attachments);
+        // Bound before dispatch: the canonical timeline can echo the message before the send call returns.
+        this.attachments.bindToMessage(agent.id,c.commandId,refs);
+        const result=await control.dispatch({...base,op:'send',messageId:c.commandId,text:c.text??'',images,acknowledgeRace:true,
           activeTurnBehavior:c.activeTurnBehavior,turnId:c.runId});
         if(result.deferred)return {commandId:c.commandId,sessionId:agent.id,revision:this.revision,deferred:true};
       }else if(c.type==='cancel'){
@@ -476,6 +484,8 @@ export class PaseoHost {
   }
   async request(method,p){
     this.identity();
+    if(method==='attachments.upload')return {result:this.attachments.upload(p)};
+    if(method==='attachments.read')return {result:this.attachments.read(p)};
     if(method==='paseo.workspaces'){
       await this.directory();
       return {result:this.workspaceChoices(p.projectId).slice(0,WORKSPACE_CHOICE_LIMIT)};

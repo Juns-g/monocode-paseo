@@ -1405,3 +1405,309 @@ fn unpaged_host_installs_the_snapshot_without_a_window_or_pager(cx: &mut TestApp
         assert_eq!(transcript.older_history_cursor(), None);
     });
 }
+
+fn menu_action_ids(
+    view: &mut Conversation,
+    kind: ComposerMenu,
+    window: &mut Window,
+    cx: &mut Context<Conversation>,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    let (_, items, _, _) = view.menu_items(kind, &mut events, window, cx);
+    items
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Action(action) => Some(action.id.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn paseo_image_conversation(
+    cx: &mut TestAppContext,
+    capabilities: &[&str],
+) -> gpui::WindowHandle<Conversation> {
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let mut summary = store.create("codex", "/test-project").unwrap();
+    summary.cwd = "remote://remote-ui-tests/home/me/project".into();
+    let capabilities: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
+    cx.open_window(Default::default(), |_, cx| {
+        let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+        view.loaded = true;
+        view.remote_state.online = true;
+        view.remote_state.capabilities = capabilities.into_iter().collect();
+        view
+    })
+}
+
+#[gpui::test]
+fn paseo_composer_add_menu_allows_image_upload_and_keeps_access_plan_draft_blocked(
+    cx: &mut TestAppContext,
+) {
+    let window = paseo_image_conversation(cx, &["paseo.configure", "attachments.upload"]);
+    window
+        .update(cx, |view, window, cx| {
+            assert!(view.paseo_controls());
+            view.toggle_menu(ComposerMenu::Add, window, cx);
+            assert!(view.menu_is(ComposerMenu::Add), "{}", view.status);
+            let actions = menu_action_ids(view, ComposerMenu::Add, window, cx);
+            assert_eq!(actions, ["upload"]);
+            view.menu = None;
+            view.toggle_menu(ComposerMenu::Access, window, cx);
+            assert!(view.menu.is_none());
+            assert!(view.status.contains("Paseo"));
+        })
+        .unwrap();
+    // A bridge without upload support keeps the plus menu closed and says why.
+    let window = paseo_image_conversation(cx, &["paseo.configure"]);
+    window
+        .update(cx, |view, window, cx| {
+            view.toggle_menu(ComposerMenu::Add, window, cx);
+            assert!(view.menu.is_none());
+            assert!(view.status.contains("图片附件"), "{}", view.status);
+        })
+        .unwrap();
+    // Ordinary remote hosts keep the full menu.
+    let window = paseo_image_conversation(cx, &["attachments.upload", "sessions.plan"]);
+    window
+        .update(cx, |view, window, cx| {
+            assert!(!view.paseo_controls());
+            let actions = menu_action_ids(view, ComposerMenu::Add, window, cx);
+            assert!(actions.contains(&"plan".to_owned()) && actions.contains(&"draft".to_owned()));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn paseo_rejects_non_image_attachments_on_add_and_send(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("paseo-attach-ui-{}", monocode_core::mono::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (png, pdf, txt) = (dir.join("a.png"), dir.join("b.pdf"), dir.join("c.txt"));
+    for path in [&png, &pdf, &txt] {
+        std::fs::write(path, b"x").unwrap();
+    }
+    let window = paseo_image_conversation(cx, &["paseo.configure", "attachments.upload"]);
+    window
+        .update(cx, |view, _, cx| {
+            view.add_attachments(vec![pdf.clone()], cx);
+            assert!(view.attachments.is_empty() && view.pending_attachments.is_empty());
+            assert!(view.attachment_error.as_deref().unwrap().contains("图片"));
+            // One unsupported file rejects the whole batch atomically.
+            view.attachment_error = None;
+            view.add_attachments(vec![png.clone(), txt.clone()], cx);
+            assert!(view.attachments.is_empty() && view.pending_attachments.is_empty());
+            assert!(!view.attaching);
+            assert!(view.attachment_error.is_some());
+            view.add_attachments(vec![png.clone()], cx);
+            assert!(view.attaching);
+            // Defense in depth: a non-image that slipped in still cannot be sent.
+            view.attachments = vec![pdf.clone()];
+            assert!(view.remote_send_guard(cx));
+            assert!(view.status.contains("图片附件"), "{}", view.status);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert_eq!(view.attachments, [pdf.clone(), png.clone()]);
+            assert!(view.attachment_error.is_none());
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+fn paseo_sends_image_attachment_over_real_transport_including_image_only(cx: &mut TestAppContext) {
+    use base64::Engine;
+    let png_bytes = b"\x89PNG\r\n\x1a\nfake-png".to_vec();
+    let dir =
+        std::env::temp_dir().join(format!("paseo-send-img-{}", monocode_core::mono::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("shot.png");
+    std::fs::write(&png, &png_bytes).unwrap();
+
+    let uploaded: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sends: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let drop_second_send_once = Arc::new(AtomicBool::new(false));
+    let uploaded_ref = uploaded.clone();
+    let sends_ref = sends.clone();
+    let drop_ref = drop_second_send_once.clone();
+    let expected_bytes = png_bytes.clone();
+    let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let rev_ref = revision.clone();
+
+    let host = crate::runtime::remote::TestHost::with_capabilities(
+        vec![
+            "paseo.configure",
+            "paseo.steer",
+            "attachments.upload",
+            "attachments.read",
+            "sessions.sync",
+        ],
+        move |request| match request["method"].as_str().unwrap() {
+            "sessions.sync" => {
+                let rev = rev_ref.load(Ordering::Relaxed);
+                Some(json!({
+                    "kind": "snapshot",
+                    "value": {
+                        "projectId": "paseo:/repo",
+                        "revision": rev,
+                        "status": "idle",
+                        "runId": null,
+                        "updatedAt": 100 + rev,
+                        "session": {
+                            "id": "paseo-session",
+                            "title": "Paseo image chat",
+                            "harness": "codex",
+                            "model": "codex:gpt-test",
+                            "runtimeMode": "full-access",
+                            "modelSettings": {},
+                            "blocks": []
+                        }
+                    }
+                }))
+            }
+            "attachments.upload" => {
+                let params = &request["params"];
+                let id = params["id"].as_str().unwrap().to_owned();
+                assert_eq!(params["offset"], 0);
+                assert_eq!(params["size"], expected_bytes.len());
+                let chunk = base64::engine::general_purpose::STANDARD
+                    .decode(params["data"].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(chunk, expected_bytes);
+                uploaded_ref.lock().unwrap().push((id, chunk.clone()));
+                Some(json!({"offset": chunk.len()}))
+            }
+            "commands.dispatch" => {
+                let command = &request["params"];
+                if command["type"] == "send" {
+                    sends_ref.lock().unwrap().push(command.clone());
+                    if drop_ref.swap(false, Ordering::Relaxed) {
+                        return None;
+                    }
+                }
+                let rev = rev_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                Some(json!({
+                    "commandId": command["commandId"],
+                    "sessionId": "paseo-session",
+                    "revision": rev
+                }))
+            }
+            other => panic!("unexpected method: {other}"),
+        },
+    );
+
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let project = store
+        .remember_remote_project("env", &json!({"id": "paseo:/repo", "cwd": "/repo"}))
+        .unwrap();
+    let initial = json!({
+        "projectId": "paseo:/repo",
+        "revision": 1,
+        "status": "idle",
+        "updatedAt": 100,
+        "session": {
+            "id": "paseo-session",
+            "title": "Paseo image chat",
+            "harness": "codex",
+            "model": "codex:gpt-test",
+            "runtimeMode": "full-access",
+            "modelSettings": {},
+            "blocks": []
+        }
+    });
+    let summary = store.register_remote_summary(&project, &initial).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            view.remote_state.client = Some(host.client.clone());
+            view.load_remote(cx);
+            view
+        })
+    });
+    let wait_settled = |cx: &mut TestAppContext| {
+        for _ in 0..1000 {
+            cx.run_until_parked();
+            if cx.update(|cx| {
+                let view = view.read(cx);
+                view.loaded && !view.busy && !view.remote_state.refreshing && !view.attaching
+            }) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        cx.update(|cx| panic!("conversation did not settle: {}", view.read(cx).status));
+    };
+    wait_settled(cx);
+
+    // 1. Image-only send (empty text + PNG attachment).
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.paseo_controls());
+            view.input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+            view.add_attachments(vec![png.clone()], cx);
+        })
+    });
+    wait_settled(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.attachments, [png.clone()]);
+            view.send(cx);
+            assert!(view.attachments.is_empty());
+        })
+    });
+    wait_settled(cx);
+
+    assert_eq!(uploaded.lock().unwrap().len(), 1);
+    {
+        let dispatches = sends.lock().unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0]["text"], "");
+        let att = &dispatches[0]["attachments"][0];
+        assert_eq!(att["id"], uploaded.lock().unwrap()[0].0);
+        assert_eq!(att["name"], "shot.png");
+        assert_eq!(att["mimeType"], "image/png");
+        assert_eq!(att["kind"], "image");
+        assert_eq!(att["size"], png_bytes.len());
+    }
+
+    // 2. Text + image send with a lost HTTP response followed by idempotent retry.
+    drop_second_send_once.store(true, Ordering::Relaxed);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.input.update(cx, |input, cx| {
+                input.set_text("Inspect screenshot".into(), cx)
+            });
+            view.add_attachments(vec![png.clone()], cx);
+        })
+    });
+    wait_settled(cx);
+    cx.update(|cx| view.update(cx, |view, cx| view.send(cx)));
+    wait_settled(cx);
+
+    // Upload completed once; the dropped send reply leaves the command pending.
+    assert_eq!(uploaded.lock().unwrap().len(), 2);
+    assert_eq!(sends.lock().unwrap().len(), 2);
+    cx.update(|cx| assert!(view.read(cx).remote_state.pending));
+
+    cx.update(|cx| view.update(cx, |view, cx| view.retry_remote(cx)));
+    wait_settled(cx);
+
+    // Retry reuses the exact commandId and does not re-upload the attachment.
+    assert_eq!(uploaded.lock().unwrap().len(), 2);
+    {
+        let dispatches = sends.lock().unwrap();
+        assert_eq!(dispatches.len(), 3);
+        assert_eq!(dispatches[1]["commandId"], dispatches[2]["commandId"]);
+        assert_eq!(dispatches[2]["text"], "Inspect screenshot");
+        assert_eq!(
+            dispatches[2]["attachments"][0]["id"],
+            uploaded.lock().unwrap()[1].0
+        );
+    }
+    cx.update(|cx| assert!(!view.read(cx).remote_state.pending));
+    let _ = std::fs::remove_dir_all(dir);
+}

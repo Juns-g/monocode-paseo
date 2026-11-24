@@ -626,6 +626,16 @@ impl Conversation {
             cx.notify();
             return true;
         }
+        if self.paseo_controls()
+            && self.attachments.iter().any(|path| {
+                !monocode_core::remote::attachments::is_attachment_source(&path.to_string_lossy())
+                    && monocode_core::composer::image_mime(path).is_none()
+            })
+        {
+            self.status = "Paseo 目前仅支持图片附件（PNG、JPEG、WebP、GIF）。".into();
+            cx.notify();
+            return true;
+        }
         if self.settings.plan && !self.remote_state.capabilities.contains("sessions.plan") {
             self.status = "Update MonoCode Host in Connections settings to use Plan mode.".into();
             cx.notify();

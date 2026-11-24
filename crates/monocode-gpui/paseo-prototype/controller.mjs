@@ -166,10 +166,12 @@ export class Controller {
         if(found.agent.pendingPermissions?.length)return {deferred:true};
       }else if(isBusy(found.agent))throw Error('Agent is busy or awaiting permission; draft retained.');
       if(!c.acknowledgeRace)throw Error('Paseo has no atomic idle-only send; explicit concurrent-send risk acknowledgement required.');
-      if(!c.text?.trim() || c.text.length>65536)throw Error('Empty or oversized message');
+      const images=c.images??[];
+      if(!Array.isArray(images))throw Error('Invalid image attachments');
+      if((!c.text?.trim() && images.length===0) || (c.text?.length??0)>65536)throw Error('Empty or oversized message');
       if(this.seen.has(c.messageId))throw Error('Send attempt already used; inspect history before explicitly trying a new message.');
       this.seen.add(c.messageId);if(this.seen.size>1000)this.seen.delete(this.seen.values().next().value);
-      try {await this.client.sendAgentMessage(c.agentId,c.text,{messageId:c.messageId,activeTurnBehavior:behavior});}
+      try {await this.client.sendAgentMessage(c.agentId,c.text??'',{messageId:c.messageId,activeTurnBehavior:behavior,...(images.length?{images}:{})});}
       catch {throw Error('Send outcome unknown. No automatic retry. Inspect canonical history in either client before a new send.');}
       this.invalidate();return {accepted:true,messageId:c.messageId};
     }
