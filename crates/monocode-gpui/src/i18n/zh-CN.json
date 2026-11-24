@@ -2194,5 +2194,16 @@
   "Clear notes": "清空批注",
   "Remove note": "移除批注",
   "Expand review notes": "展开评审批注",
-  "Collapse review notes": "收起评审批注"
+  "Collapse review notes": "收起评审批注",
+  "Rewind to here": "回退到这里",
+  "Rewind to this message": "回退到这条消息",
+  "Paseo will revert this conversation from the selected prompt onward. This cannot be undone.": "Paseo 将从所选消息开始回退后续记录（若选择回退文件，工作区文件改动也会一并还原），此操作无法撤销。",
+  "Rewind conversation only": "仅回退对话",
+  "Rewind files only": "仅回退文件",
+  "Rewind conversation & files": "回退对话与文件",
+  "Session is now busy; rewind is unavailable.": "会话已开始运行，无法执行回退",
+  "Paseo session is busy or state changed; rewind cancelled.": "Paseo 会话正在运行或状态已变化，已取消回退。",
+  "Rewinding…": "正在回退…",
+  "Wait for Paseo rewind to finish before sending a message.": "正在回退 Paseo 会话，请稍候再发送消息。",
+  "(Image message)": "（图片消息）"
 }

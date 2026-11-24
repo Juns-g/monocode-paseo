@@ -734,6 +734,7 @@ pub(crate) struct TranscriptView {
     anchor_prompts: bool,
     smooth_reveal: bool,
     preserve_prose: bool,
+    paseo_rewind_enabled: bool,
     /// Tool groups open only when clicked, even while running.
     collapse_groups: bool,
     /// Finished replies fold their work under "worked for".
@@ -1343,6 +1344,15 @@ impl TranscriptView {
         let copied = self.copied.is_some_and(|id| id == start as u64);
         let sent_at = self.source[start].sent_at;
         let base = self.base;
+        let rewind_text = text.clone();
+        let paseo_message_id = self
+            .turns
+            .get(&end)
+            .and_then(|info| info.paseo_message_id.clone());
+        let has_attachments = self.source.get(end).is_some_and(|r| {
+            r.role == monocode_core::transcript::attachments::ROLE
+                && !matches!(r.text.trim(), "" | "[]" | "null")
+        });
         let stamp_anchor = self
             .action_anchors
             .entry((start, "sent-at"))
@@ -1380,10 +1390,42 @@ impl TranscriptView {
                     cx.notify();
                 })),
             )
+            .when_some(
+                paseo_message_id.filter(|_| {
+                    self.paseo_rewind_enabled
+                        && !self.streaming
+                        && !self.mono
+                        && !self.side_question
+                        && (!rewind_text.trim().is_empty() || has_attachments)
+                }),
+                |d, message_id| {
+                    let turn = start.saturating_sub(base);
+                    let text = rewind_text.clone();
+                    d.child(
+                        response_actions::button(
+                            start,
+                            "paseo-rewind",
+                            crate::i18n::t("Rewind to here"),
+                            "rotate-ccw",
+                            false,
+                        )
+                        .debug_selector(move || format!("paseo-rewind-{start}"))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ResponseRequest::PaseoRewind {
+                                turn,
+                                message_id: message_id.clone(),
+                                text: text.clone(),
+                            })
+                        })),
+                    )
+                },
+            )
             .when(
                 !self.mono
                     && !self.side_question
                     && !self.streaming
+                    && !self.preserve_prose
+                    && !self.paseo_rewind_enabled
                     && monocode_core::provider::supports_rewind(
                         monocode_core::provider::Kind::from_id(&self.provider),
                     )
@@ -1402,6 +1444,7 @@ impl TranscriptView {
                             "pencil",
                             false,
                         )
+                        .debug_selector(move || format!("edit-last-message-{start}"))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(ResponseRequest::EditLastTurn { turn: start - base })
                         })),
@@ -2590,6 +2633,7 @@ impl TranscriptView {
             anchor_prompts: true,
             smooth_reveal: true,
             preserve_prose: false,
+            paseo_rewind_enabled: false,
             collapse_groups: false,
             fold_work: true,
             search_match: None,
@@ -2668,6 +2712,21 @@ impl TranscriptView {
     /// Paseo assistant entries are all public replies, including background continuations.
     pub(crate) fn paseo_mode(&mut self) {
         self.preserve_prose = true;
+    }
+    pub(crate) fn set_paseo_rewind_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.paseo_rewind_enabled != enabled {
+            self.paseo_rewind_enabled = enabled;
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn set_hovered_prompt_for_test(
+        &mut self,
+        start: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.hovered_prompt = start;
+        cx.notify();
     }
     pub(crate) fn remote_duration(&mut self, turn: usize, ms: u64) {
         self.elapsed

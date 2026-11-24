@@ -15,7 +15,7 @@ export function boundedEntries(entries) {
     const text=raw.slice(0,32000)+'\n[原型截断；完整内容请在 Paseo 查看]';
     return {...entry,prototypeTruncated:true,item:item.type==='tool_call'
       ?{type:item.type,name:item.name,status:item.status,detail:{type:'plain_text',text}}
-      :{type:item.type,text:item.text?item.text.slice(0,32000)+'\n[原型截断；完整内容请在 Paseo 查看]':text,message:item.message?.slice(0,32000),pluginId:item.pluginId}};
+      :{type:item.type,text:item.text?item.text.slice(0,32000)+'\n[原型截断；完整内容请在 Paseo 查看]':text,message:item.message?.slice(0,32000),pluginId:item.pluginId,...(item.messageId?{messageId:item.messageId}:{}),...(item.clientMessageId?{clientMessageId:item.clientMessageId}:{})}};
   });
 }
 export function joinEntries(older, tail) {
