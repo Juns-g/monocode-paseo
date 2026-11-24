@@ -159,3 +159,23 @@ test('renameAgent updates only the exact agent title; empty, mismatched and fore
  await assert.rejects(f.c.dispatch({op:'renameAgent',serverId:'s',workspaceId:'w',title:'x'}),/Exact agent/);
  assert.equal(writes.length,1);f.c.close();
 });
+
+test('send forwards images, allows image-only text, still rejects empty sends and never replays an unknown image send',async()=>{
+ const f=fixture(),options=[];
+ f.client.sendAgentMessage=async(id,text,o)=>options.push({id,text,...o});
+ const base={op:'send',serverId:'s',agentId:'a',acknowledgeRace:true};
+ const images=[{data:'AQID',mimeType:'image/png'}];
+ await f.c.dispatch({...base,text:'look',messageId:'with-text',images});
+ await f.c.dispatch({...base,text:'',messageId:'image-only',images});
+ await f.c.dispatch({...base,text:'plain',messageId:'plain'});
+ assert.deepEqual(options,[
+  {id:'a',text:'look',messageId:'with-text',activeTurnBehavior:'interrupt',images},
+  {id:'a',text:'',messageId:'image-only',activeTurnBehavior:'interrupt',images},
+  {id:'a',text:'plain',messageId:'plain',activeTurnBehavior:'interrupt'}]);
+ await assert.rejects(f.c.dispatch({...base,text:'  ',messageId:'empty'}),/Empty or oversized/);
+ await assert.rejects(f.c.dispatch({...base,text:'',messageId:'empty2',images:[]}),/Empty or oversized/);
+ await assert.rejects(f.c.dispatch({...base,text:'x',messageId:'bad',images:'nope'}),/Invalid image attachments/);
+ f.client.sendAgentMessage=async()=>{throw Error('lost reply');};
+ await assert.rejects(f.c.dispatch({...base,text:'',messageId:'lost',images}),/outcome unknown/);
+ await assert.rejects(f.c.dispatch({...base,text:'',messageId:'lost',images}),/already used/);f.c.close();
+});

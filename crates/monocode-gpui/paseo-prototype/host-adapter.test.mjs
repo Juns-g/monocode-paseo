@@ -940,3 +940,50 @@ test('the sync window stays bounded, reports its cursor, has no history notice a
     assert.equal(page.blocks.at(-1).id,`e:${value.session.historyWindow.before-1}`);assert.equal(h.entries[0].seqStart,value.session.historyWindow.before);
   }finally{f.close();}
 });
+
+// F1: image attachments
+{
+const ATT='33333333-3333-4333-8333-333333333333';
+const PNG=Buffer.from([0x89,0x50,0x4e,0x47,1,2,3,4,5]);
+const upload=(host,id=ATT,bytes=PNG)=>host.request('attachments.upload',{id,offset:0,size:bytes.length,data:bytes.toString('base64')});
+const imageRef=(over={})=>({id:ATT,name:'shot.png',mimeType:'image/png',kind:'image',size:PNG.length,...over});
+test('environment.describe advertises attachment upload and read',async()=>{
+  const f=fixture();f.client.listAvailableProviders=async()=>({providers:[{provider:'hermes',available:true}]});
+  const {result}=await f.host.request('environment.describe',{});
+  assert.ok(result.capabilities.includes('attachments.upload'));assert.ok(result.capabilities.includes('attachments.read'));f.close();
+});
+test('uploaded image reaches the daemon once, retries return the receipt, and the transcript keeps a readable attachment',async()=>{
+  const f=fixture(),sent=[];await f.host.directory();
+  f.client.sendAgentMessage=async(id,text,options)=>{f.events.sends++;sent.push({id,text,...options});};
+  f.client.fetchAgentTimeline=async()=>({agent:f.a,epoch:'e',hasOlder:false,entries:[
+    {seqStart:1,seqEnd:1,timestamp:'2026-10-25T00:00:00Z',item:{type:'user_message',text:'',clientMessageId:'img-1'}},
+    {seqStart:2,seqEnd:2,timestamp:'2026-10-25T00:00:01Z',item:{type:'user_message',text:'plain',clientMessageId:'other'}}]});
+  assert.deepEqual((await upload(f.host)).result,{offset:PNG.length});
+  const command={type:'send',sessionId:'a',commandId:'img-1',text:'',attachments:[imageRef()]};
+  const receipt=await f.host.command(command);
+  assert.deepEqual(sent,[{id:'a',text:'',messageId:'img-1',activeTurnBehavior:'interrupt',images:[{data:PNG.toString('base64'),mimeType:'image/png'}]}]);
+  assert.deepEqual(await f.host.command(command),receipt);assert.equal(f.events.sends,1);
+  const blocks=(await f.host.history('a')).snapshot.session.blocks;
+  assert.deepEqual(blocks[0].attachments,[imageRef()]);assert.equal(blocks[1].attachments,undefined);
+  const chunk=(await f.host.request('attachments.read',{sessionId:'a',id:ATT,offset:0})).result;
+  assert.deepEqual({...chunk,data:Buffer.from(chunk.data,'base64')},{data:PNG,offset:PNG.length,size:PNG.length});
+  await assert.rejects(f.host.request('attachments.read',{sessionId:'b',id:ATT,offset:0}),/not found/);
+  // The binding survives an adapter restart.
+  const again=new PaseoHost(f.client,f.directory);
+  assert.deepEqual(again.attachments.forMessage('a','img-1'),[imageRef()]);again.close();
+  f.close();
+});
+test('non-image, incomplete, unsupported and steer attachments never reach the daemon',async()=>{
+  const f=fixture();await f.host.directory();await upload(f.host);
+  const send=over=>f.host.command({type:'send',sessionId:'a',commandId:`c-${Math.random()}`,text:'x',...over});
+  await assert.rejects(send({attachments:[imageRef({kind:'file',mimeType:'application/pdf'})]}),/仅支持图片/);
+  await assert.rejects(send({attachments:[imageRef({mimeType:'image/svg+xml'})]}),/仅支持图片/);
+  await assert.rejects(send({attachments:[imageRef({size:PNG.length+1})]}),/incomplete/);
+  await assert.rejects(send({attachments:[imageRef()],intent:'plan'}),/计划或草稿/);
+  await assert.rejects(send({attachments:[imageRef()],draftBlockId:'d'}),/计划或草稿/);
+  await assert.rejects(send({attachments:[imageRef()],planBlockId:'p'}),/计划或草稿/);
+  f.a.activeTurn={turnId:'t'};f.a.status='running';
+  await assert.rejects(send({attachments:[imageRef()],activeTurnBehavior:'steer',runId:'t'}),/仅支持纯文本/);
+  assert.equal(f.events.sends,0);f.close();
+});
+}
