@@ -46,9 +46,19 @@ export function harness(provider='') {
   return provider==='claude-code'?'claude':provider;
 }
 const mode=agent=>['dont_ask','bypassPermissions','full-access','full'].includes(agent.currentModeId)?'full-access':'supervised';
+const UUID_TITLE_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function readableAgentTitle(a) {
+  const raw=typeof a?.title==='string'?a.title.trim():'';
+  if(raw && !UUID_TITLE_RE.test(raw))return raw;
+  for(const candidate of [a?.runtimeInfo?.extra?.title,a?.persistence?.metadata?.title]){
+    const text=typeof candidate==='string'?candidate.trim():'';
+    if(text && !UUID_TITLE_RE.test(text))return text;
+  }
+  return raw;
+}
 export function summary(entry,projectId) {
-  const a=entry.agent,provider=harness(a.provider),cwd=a.cwd||entry.project.checkout.cwd;
-  return {id:a.id,projectId,title:((a.labels?.['paseo.parent-agent-id']||(entry.paseoWorkspaceAnchorId&&entry.paseoWorkspaceAnchorId!==a.id))&&a.title)||entry.workspace?.title||entry.project.workspaceName||a.title||'Paseo agent',harness:provider,cwd,
+  const a=entry.agent,provider=harness(a.provider),cwd=a.cwd||entry.project.checkout.cwd,agentTitle=readableAgentTitle(a);
+  return {id:a.id,projectId,title:((a.labels?.['paseo.parent-agent-id']||(entry.paseoWorkspaceAnchorId&&entry.paseoWorkspaceAnchorId!==a.id))&&agentTitle)||entry.workspace?.title||entry.project.workspaceName||agentTitle||'Paseo agent',harness:provider,cwd,
     model:`${provider}:${a.model||''}`,runtimeMode:mode(a),createdAt:stamp(a.createdAt),updatedAt:stamp(a.updatedAt),
     status:a.activeTurn||a.status==='running'||a.pendingPermissions?.length?'running':'idle',
     needsInput:!!a.pendingPermissions?.length,pinned:!!entry.workspace?.pinnedAt&&!a.archivedAt&&entry.paseoWorkspaceAnchorId===a.id,archived:!!a.archivedAt,
@@ -215,9 +225,9 @@ export class PaseoHost {
         const foreignParent=labels['paseo.parent-server-id']&&labels['paseo.parent-server-id']!==this.serverId;
         const labeledParent=labels['parent_agent']&&entries.has(labels['parent_agent'])&&!entries.get(labels['parent_agent']).agent.archivedAt
           ?labels['parent_agent']:null;
-        const workspaceSubagentFallback=labels['paseo.parent-server-id']===this.serverId&&e.paseoWorkspaceAnchorId&&e.paseoWorkspaceAnchorId!==e.agent.id
+        const sameWorkspaceAnchor=e.agent.workspaceId&&e.paseoWorkspaceAnchorId&&e.paseoWorkspaceAnchorId!==e.agent.id
           ?e.paseoWorkspaceAnchorId:null;
-        const resolvedParent=foreignParent?null:(labels['paseo.parent-agent-id']||labeledParent||workspaceSubagentFallback||null);
+        const resolvedParent=foreignParent?null:(labels['paseo.parent-agent-id']||labeledParent||sameWorkspaceAnchor||null);
         e.paseoParentAgentId=resolvedParent&&resolvedParent!==e.agent.id?resolvedParent:null;
       }
       // Linked Git checkouts share navigation, never their execution cwd or agent identity.

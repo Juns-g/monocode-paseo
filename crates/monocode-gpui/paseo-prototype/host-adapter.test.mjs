@@ -100,24 +100,28 @@ test('workspace pin belongs to one root and parent identities survive without fl
     assert.equal(reordered.length,3);
   }finally{f.close();}
 });
-test('detached same-server subagents nest under labeled parent_agent or workspace anchor without affecting ordinary siblings',async()=>{
+test('same-workspace siblings and detached subagents nest under workspace anchor while distinct workspaces and foreign parents stay top-level',async()=>{
   const f=fixture();
   try{
+    const parentUuid='f63a33fc-958c-4433-a14a-0a79582c133a';
     f.client.fetchAgentHistory=async()=>({entries:[
       {...f.e,agent:{...f.a,id:'detached-ws',title:'Detached subagent',createdAt:1000,labels:{'paseo.parent-server-id':SERVER}}},
       {...f.e,agent:{...f.a,id:'root',title:'Root',createdAt:2000,labels:{}}},
-      {...f.e,agent:{...f.a,id:'leader',title:'Leader',createdAt:3000,labels:{}}},
-      {...f.e,agent:{...f.a,id:'detached-labeled',title:'Labeled subagent',createdAt:4000,labels:{'paseo.parent-server-id':SERVER,parent_agent:'leader'}}},
-      {...f.e,agent:{...f.a,id:'foreign',title:'Foreign subagent',createdAt:5000,labels:{'paseo.parent-server-id':'other-server',parent_agent:'leader'}}},
+      {...f.e,agent:{...f.a,id:'sibling',title:parentUuid,runtimeInfo:{extra:{title:'Optimize Conversation Document and Webpage'}},createdAt:3000,labels:{}}},
+      {...f.e,agent:{...f.a,id:'detached-labeled',title:'Labeled subagent',createdAt:4000,labels:{'paseo.parent-server-id':SERVER,parent_agent:'sibling'}}},
+      {...f.e,agent:{...f.a,id:'foreign',title:'Foreign subagent',createdAt:5000,labels:{'paseo.parent-server-id':'other-server',parent_agent:'sibling'}}},
+      {...f.e,agent:{...f.a,id:'other-ws',workspaceId:'w2',title:'Independent workspace',createdAt:6000,labels:{}}},
     ],pageInfo:{}});
     await f.host.directory();
     const rows=(await f.host.request('sessions.list',{projectId:'paseo:/fixture'})).result;
     assert.equal(rows.find(r=>r.id==='root').paseoWorkspaceAnchor,true);
     assert.equal(rows.find(r=>r.id==='root').paseoParentAgentId,null);
-    assert.equal(rows.find(r=>r.id==='leader').paseoParentAgentId,null);
+    assert.equal(rows.find(r=>r.id==='sibling').paseoParentAgentId,'root');
+    assert.equal(rows.find(r=>r.id==='sibling').title,'Optimize Conversation Document and Webpage');
     assert.equal(rows.find(r=>r.id==='detached-ws').paseoParentAgentId,'root');
-    assert.equal(rows.find(r=>r.id==='detached-labeled').paseoParentAgentId,'leader');
+    assert.equal(rows.find(r=>r.id==='detached-labeled').paseoParentAgentId,'sibling');
     assert.equal(rows.find(r=>r.id==='foreign').paseoParentAgentId,null);
+    assert.equal(rows.find(r=>r.id==='other-ws').paseoParentAgentId,null);
   }finally{f.close();}
 });
 test('actual native Blocks retain all prose, tool state, stable ids, user timestamps and completed duration',()=>{
