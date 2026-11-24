@@ -177,7 +177,8 @@ export class PaseoHost {
       // Workspace-owned controls appear once; preserve real agent identities underneath.
       const anchors=new Map();
       const ordered=[...entries.values()].sort((a,b)=>Number(!!a.agent.archivedAt)-Number(!!b.agent.archivedAt)
-        ||Number(!!a.agent.labels?.['paseo.parent-agent-id'])-Number(!!b.agent.labels?.['paseo.parent-agent-id'])
+        ||Number(!!(a.agent.labels?.['paseo.parent-agent-id']||a.agent.labels?.['paseo.parent-server-id']||a.agent.labels?.['parent_agent']))
+          -Number(!!(b.agent.labels?.['paseo.parent-agent-id']||b.agent.labels?.['paseo.parent-server-id']||b.agent.labels?.['parent_agent']))
         ||stamp(a.agent.createdAt)-stamp(b.agent.createdAt)||a.agent.id.localeCompare(b.agent.id));
       for(const e of ordered){
         const key=e.agent.workspaceId??e.agent.id;
@@ -186,8 +187,13 @@ export class PaseoHost {
       for(const e of entries.values()){
         e.paseoWorkspaceAnchorId=anchors.get(e.agent.workspaceId??e.agent.id);
         const labels=e.agent.labels??{};
-        e.paseoParentAgentId=labels['paseo.parent-server-id']&&labels['paseo.parent-server-id']!==this.serverId
-          ?null:labels['paseo.parent-agent-id']||null;
+        const foreignParent=labels['paseo.parent-server-id']&&labels['paseo.parent-server-id']!==this.serverId;
+        const labeledParent=labels['parent_agent']&&entries.has(labels['parent_agent'])&&!entries.get(labels['parent_agent']).agent.archivedAt
+          ?labels['parent_agent']:null;
+        const workspaceSubagentFallback=labels['paseo.parent-server-id']===this.serverId&&e.paseoWorkspaceAnchorId&&e.paseoWorkspaceAnchorId!==e.agent.id
+          ?e.paseoWorkspaceAnchorId:null;
+        const resolvedParent=foreignParent?null:(labels['paseo.parent-agent-id']||labeledParent||workspaceSubagentFallback||null);
+        e.paseoParentAgentId=resolvedParent&&resolvedParent!==e.agent.id?resolvedParent:null;
       }
       // Linked Git checkouts share navigation, never their execution cwd or agent identity.
       const canonicalProjects=new Map(),aliases=new Map(),repositoryRoots=new Map();

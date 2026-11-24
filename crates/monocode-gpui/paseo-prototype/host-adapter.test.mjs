@@ -100,6 +100,26 @@ test('workspace pin belongs to one root and parent identities survive without fl
     assert.equal(reordered.length,3);
   }finally{f.close();}
 });
+test('detached same-server subagents nest under labeled parent_agent or workspace anchor without affecting ordinary siblings',async()=>{
+  const f=fixture();
+  try{
+    f.client.fetchAgentHistory=async()=>({entries:[
+      {...f.e,agent:{...f.a,id:'detached-ws',title:'Detached subagent',createdAt:1000,labels:{'paseo.parent-server-id':SERVER}}},
+      {...f.e,agent:{...f.a,id:'root',title:'Root',createdAt:2000,labels:{}}},
+      {...f.e,agent:{...f.a,id:'leader',title:'Leader',createdAt:3000,labels:{}}},
+      {...f.e,agent:{...f.a,id:'detached-labeled',title:'Labeled subagent',createdAt:4000,labels:{'paseo.parent-server-id':SERVER,parent_agent:'leader'}}},
+      {...f.e,agent:{...f.a,id:'foreign',title:'Foreign subagent',createdAt:5000,labels:{'paseo.parent-server-id':'other-server',parent_agent:'leader'}}},
+    ],pageInfo:{}});
+    await f.host.directory();
+    const rows=(await f.host.request('sessions.list',{projectId:'paseo:/fixture'})).result;
+    assert.equal(rows.find(r=>r.id==='root').paseoWorkspaceAnchor,true);
+    assert.equal(rows.find(r=>r.id==='root').paseoParentAgentId,null);
+    assert.equal(rows.find(r=>r.id==='leader').paseoParentAgentId,null);
+    assert.equal(rows.find(r=>r.id==='detached-ws').paseoParentAgentId,'root');
+    assert.equal(rows.find(r=>r.id==='detached-labeled').paseoParentAgentId,'leader');
+    assert.equal(rows.find(r=>r.id==='foreign').paseoParentAgentId,null);
+  }finally{f.close();}
+});
 test('actual native Blocks retain all prose, tool state, stable ids, user timestamps and completed duration',()=>{
   const page={epoch:'e',agent:{status:'idle'},entries:[
     {seqStart:1,timestamp:1000,item:{type:'user_message',text:'question'}},
