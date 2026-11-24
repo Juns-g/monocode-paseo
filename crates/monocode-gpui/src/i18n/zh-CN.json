@@ -2179,5 +2179,18 @@
   "A remote command needs confirmation before steering.": "请先确认上一条远程命令的结果，再引导当前对话。",
   "Steer queued message": "立即引导当前对话",
   "Resume queue": "继续队列",
-  "Retry queue": "重试队列"
+  "Retry queue": "重试队列",
+  "1 line selected": "已选 1 行",
+  "{count} lines selected": "已选 {count} 行",
+  "Annotate…": "添加批注…",
+  "Quote to chat": "引用到对话",
+  "Clear selection": "清除选择",
+  "Save note": "加入待发",
+  "1 review note": "1 条评审批注",
+  "{count} review notes": "{count} 条评审批注",
+  "Send to chat": "插入到对话",
+  "Clear notes": "清空批注",
+  "Remove note": "移除批注",
+  "Expand review notes": "展开评审批注",
+  "Collapse review notes": "收起评审批注"
 }

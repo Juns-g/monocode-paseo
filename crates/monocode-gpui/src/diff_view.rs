@@ -34,12 +34,19 @@ const NOTICE: f32 = 44.;
 const CODE_SIZE: f32 = 12.5;
 const MAX_HIGHLIGHT_CHARS: usize = 250_000;
 
-actions!(diff_review, [PreviousHunk, NextHunk]);
+actions!(diff_review, [PreviousHunk, NextHunk, ClearSelection]);
 
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("alt-up", PreviousHunk, Some("DiffReview")),
         KeyBinding::new("alt-down", NextHunk, Some("DiffReview")),
+        // Only while there is a selection or note box to clear, so Escape
+        // keeps reaching the shell the rest of the time.
+        KeyBinding::new(
+            "escape",
+            ClearSelection,
+            Some("DiffReview && DiffSelection"),
+        ),
     ]);
 }
 
@@ -268,12 +275,60 @@ fn highlight_file(path: &str, blocks: &[Block]) -> Option<Vec<Vec<Vec<HighlightS
     Some(out)
 }
 
-struct Comment {
+/// A run of lines in one file, inclusive, as `(block, line)` coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LineSelection {
+    file_id: SharedString,
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
+impl LineSelection {
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+    fn contains(&self, file_id: &SharedString, pos: (usize, usize)) -> bool {
+        let (start, end) = self.ordered();
+        &self.file_id == file_id && start <= pos && pos <= end
+    }
+}
+
+/// A note queued for the composer, owning a snapshot of what it quotes so
+/// folds and refreshes never lose it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DraftAnnotation {
+    id: u64,
+    file_id: SharedString,
     path: String,
-    line: Line,
+    lines: Vec<Line>,
+    first_pos: Option<(usize, usize)>,
+    positions: HashSet<(usize, usize)>,
+    note: String,
+}
+
+struct Comment {
+    file_id: SharedString,
+    path: String,
+    lines: Vec<Line>,
+    first_pos: Option<(usize, usize)>,
+    positions: HashSet<(usize, usize)>,
     anchor: AnchorSlot,
+    side: Side,
     input: gpui::Entity<Input>,
     _events: Vec<Subscription>,
+}
+
+/// The path a note quotes: the file's label without its staging suffix.
+fn display_path(file: &DiffFile) -> String {
+    let label = file
+        .label
+        .strip_suffix(" (Staged)")
+        .or_else(|| file.label.strip_suffix(" (Unstaged)"))
+        .unwrap_or(&file.label);
+    if label.is_empty() {
+        file.path.clone()
+    } else {
+        label.to_owned()
+    }
 }
 
 pub(crate) struct DiffView {
@@ -310,6 +365,12 @@ pub(crate) struct DiffView {
     wheel_axis: Option<(bool, std::time::Instant)>,
     comment: Option<Comment>,
     action_slots: HashMap<usize, AnchorSlot>,
+    selection: Option<LineSelection>,
+    selecting: bool,
+    selection_annotate_anchor: AnchorSlot,
+    draft_annotations: Vec<DraftAnnotation>,
+    next_annotation_id: u64,
+    drafts_expanded: bool,
     focus: FocusHandle,
 }
 impl EventEmitter<DiffEvent> for DiffView {}
@@ -362,6 +423,12 @@ impl DiffView {
             wheel_axis: None,
             comment: None,
             action_slots: HashMap::new(),
+            selection: None,
+            selecting: false,
+            selection_annotate_anchor: AnchorSlot::default(),
+            draft_annotations: Vec::new(),
+            next_annotation_id: 0,
+            drafts_expanded: true,
             focus: cx.focus_handle(),
         }
     }
@@ -483,6 +550,7 @@ impl DiffView {
         self.max_columns = columns;
         self.number_width = (digits as f32 * 8. + 12.).max(36.);
         self.hovered = None;
+        self.validate_selection();
         self.list.reset(self.rows.len());
         if self.pending.is_some() {
             self.apply_pending(cx);
@@ -792,16 +860,95 @@ impl DiffView {
         tokens.as_ref()?.get(block)?.get(line).map(Vec::as_slice)
     }
 
-    fn open_comment(
+    /// Drops a selection whose file folded away or whose lines are gone.
+    fn validate_selection(&mut self) {
+        let Some(sel) = &self.selection else {
+            return;
+        };
+        let real = |file: &DiffFile, (b, l): (usize, usize)| {
+            matches!(
+                file.blocks.get(b),
+                Some(Block::Hunk { lines, .. })
+                    if lines.get(l).is_some_and(|line| line.kind != LineKind::Hunk)
+            )
+        };
+        let valid = self.by_id.get(&sel.file_id).is_some_and(|&ix| {
+            let file = &self.files[ix];
+            self.open.contains(&file.id) && real(file, sel.anchor) && real(file, sel.head)
+        });
+        if !valid {
+            self.selection = None;
+            self.selecting = false;
+        }
+    }
+    /// The file index and the lines (with their coordinates) a selection covers.
+    fn selected_lines(&self, sel: &LineSelection) -> Option<(usize, Vec<((usize, usize), Line)>)> {
+        let &file = self.by_id.get(&sel.file_id)?;
+        let (start, end) = sel.ordered();
+        let mut picked = Vec::new();
+        for (b, block) in self.files[file].blocks.iter().enumerate() {
+            let Block::Hunk { lines, .. } = block else {
+                continue;
+            };
+            for (i, line) in lines.iter().enumerate() {
+                let pos = (b, i);
+                if pos >= start && pos <= end && line.kind != LineKind::Hunk {
+                    picked.push((pos, line.clone()));
+                }
+            }
+        }
+        Some((file, picked))
+    }
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.take().is_some() {
+            self.selecting = false;
+            cx.notify();
+        }
+    }
+    /// A line's comment button: the whole selection when the line is in it,
+    /// otherwise just that line.
+    fn comment_on_line(
         &mut self,
         file: usize,
-        line: Line,
+        pos: (usize, usize),
         row: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path = self.files[file].path.clone();
+        let id = self.files[file].id.clone();
+        let from_selection = self
+            .selection
+            .as_ref()
+            .filter(|s| s.contains(&id, pos))
+            .and_then(|s| self.selected_lines(s))
+            .map(|(_, picked)| picked)
+            .filter(|picked| !picked.is_empty());
+        let picked = from_selection.or_else(|| {
+            let line = self.files[file].blocks.get(pos.0)?.lines().get(pos.1)?;
+            Some(vec![(pos, line.clone())])
+        });
+        let Some(picked) = picked else {
+            return;
+        };
         let anchor = self.action_slots.get(&row).cloned().unwrap_or_default();
+        self.open_comment(file, picked, anchor, Side::Right, window, cx);
+    }
+    fn open_comment(
+        &mut self,
+        file: usize,
+        picked: Vec<((usize, usize), Line)>,
+        anchor: AnchorSlot,
+        side: Side,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if picked.is_empty() {
+            return;
+        }
+        let (file_id, path) = {
+            let f = &self.files[file];
+            (f.id.clone(), display_path(f))
+        };
         let input = cx.new(|cx| {
             let mut input = Input::commit_message(cx);
             input.set_placeholder("Leave a comment…", cx);
@@ -818,27 +965,62 @@ impl DiffView {
             ),
         ];
         self.comment = Some(Comment {
+            file_id,
             path,
-            line,
+            first_pos: picked.first().map(|(pos, _)| *pos),
+            positions: picked.iter().map(|(pos, _)| *pos).collect(),
+            lines: picked.into_iter().map(|(_, line)| line).collect(),
             anchor,
+            side,
             input,
             _events: events,
         });
         cx.notify();
     }
-    fn add_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(comment) = &self.comment else {
+    /// The note box's text, when it has any.
+    fn comment_note(&self, cx: &App) -> Option<String> {
+        let comment = self.comment.as_ref()?;
+        let note = comment.input.read(cx).content.trim().to_owned();
+        (!note.is_empty()).then_some(note)
+    }
+    /// Queues the note for a later batch; nothing reaches the composer yet.
+    fn save_draft_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note) = self.comment_note(cx) else {
             return;
         };
-        let text = diff::format_comment(
-            &comment.path,
-            &comment.line,
-            &comment.input.read(cx).content,
-        );
+        let Some(comment) = self.comment.take() else {
+            return;
+        };
+        let id = self.next_annotation_id;
+        self.next_annotation_id += 1;
+        self.draft_annotations.push(DraftAnnotation {
+            id,
+            file_id: comment.file_id.clone(),
+            path: comment.path.clone(),
+            lines: comment.lines.clone(),
+            first_pos: comment.first_pos,
+            positions: comment.positions.clone(),
+            note,
+        });
+        self.selection = None;
+        self.selecting = false;
+        self.drafts_expanded = true;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+    fn add_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note) = self.comment_note(cx) else {
+            return;
+        };
+        let Some(comment) = self.comment.take() else {
+            return;
+        };
+        let text = diff::format_annotation(&comment.path, &comment.lines, &note);
         if text.is_empty() {
             return;
         }
-        self.comment = None;
+        self.selection = None;
+        self.selecting = false;
         window.focus(&self.focus, cx);
         cx.emit(DiffEvent::Comment(text));
         cx.notify();
@@ -848,6 +1030,380 @@ impl DiffView {
             window.focus(&self.focus, cx);
             cx.notify();
         }
+    }
+    /// The selected lines, quoted without a note, for the composer.
+    fn quote_selection_to_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(sel) = self.selection.clone() else {
+            return;
+        };
+        let Some((file, picked)) = self.selected_lines(&sel) else {
+            return;
+        };
+        let lines: Vec<Line> = picked.into_iter().map(|(_, line)| line).collect();
+        let text = diff::format_annotation(&display_path(&self.files[file]), &lines, "");
+        self.selection = None;
+        self.selecting = false;
+        cx.notify();
+        if !text.is_empty() {
+            cx.emit(DiffEvent::Comment(text));
+        }
+    }
+    /// Every queued note as one composer insertion.
+    fn flush_drafts(&mut self, cx: &mut Context<Self>) {
+        let text = {
+            let notes: Vec<diff::ReviewNote<'_>> = self
+                .draft_annotations
+                .iter()
+                .map(|a| diff::ReviewNote {
+                    path: &a.path,
+                    lines: &a.lines,
+                    note: &a.note,
+                })
+                .collect();
+            diff::format_review_batch(&notes)
+        };
+        self.draft_annotations.clear();
+        self.selection = None;
+        self.selecting = false;
+        cx.notify();
+        if !text.is_empty() {
+            cx.emit(DiffEvent::Comment(text));
+        }
+    }
+    fn jump_to_draft(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(note) = self.draft_annotations.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let Some(&file) = self.by_id.get(&note.file_id) else {
+            return;
+        };
+        if self.open.insert(note.file_id.clone()) {
+            self.rebuild(cx);
+        }
+        let row = note.first_pos.and_then(|(block, line)| {
+            self.rows.iter().position(|r| {
+                r.file == file
+                    && matches!(r.kind, RowKind::Line { block: b, line: l, .. } if (b, l) == (block, line))
+            })
+        });
+        let target = row.map_or(self.file_rows[file], |r| r);
+        self.pending = None;
+        self.scroll_to_px(self.offsets[target] - FILE_HEADER - 8.);
+        cx.notify();
+    }
+
+    /// The bar that takes over the toolbar's strip while lines are selected.
+    /// It overlays instead of adding a row, so selecting never shifts the
+    /// lines under the pointer.
+    fn selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sel = self.selection.as_ref()?;
+        let (file, picked) = self.selected_lines(sel)?;
+        if picked.is_empty() {
+            return None;
+        }
+        let lines: Vec<Line> = picked.into_iter().map(|(_, line)| line).collect();
+        let location = diff::selection_location(&display_path(&self.files[file]), &lines);
+        let count = if lines.len() == 1 {
+            crate::i18n::t("1 line selected")
+        } else {
+            crate::i18n::t("{count} lines selected").replace("{count}", &lines.len().to_string())
+        };
+        let anchor = self.selection_annotate_anchor.clone();
+        let action = |id: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .role(Role::Button)
+                .h(px(24.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .px(px(8.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(content(0.8))
+                .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
+        Some(
+            div()
+                .id("diff-selection-bar")
+                .debug_selector(|| "diff-selection-bar".into())
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .occlude()
+                .h(px(32.))
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .border_b_1()
+                .border_color(stroke())
+                .bg(crate::theme::background_base())
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(accent_color().opacity(0.08)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(crate::fonts::mono())
+                        .text_size(px(11.))
+                        .text_color(content(0.7))
+                        .child(location),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(content(0.5))
+                        .child(count),
+                )
+                .child(
+                    div()
+                        .ml_auto()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            action("diff-selection-annotate")
+                                .child(anchor.probe())
+                                .child(icon("comment-add", 12.).text_color(content(0.8)))
+                                .child(crate::i18n::t("Annotate…"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let Some(sel) = this.selection.clone() else {
+                                        return;
+                                    };
+                                    let Some((file, picked)) = this.selected_lines(&sel) else {
+                                        return;
+                                    };
+                                    let anchor = this.selection_annotate_anchor.clone();
+                                    this.open_comment(
+                                        file,
+                                        picked,
+                                        anchor,
+                                        Side::Bottom,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            action("diff-selection-quote")
+                                .child(icon("chat", 12.).text_color(content(0.8)))
+                                .child(crate::i18n::t("Quote to chat"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.quote_selection_to_chat(cx)),
+                                ),
+                        )
+                        .child(
+                            tool_button("diff-selection-clear", "Clear selection", "x", true)
+                                .debug_selector(|| "diff-selection-clear".into())
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The docked list of notes waiting to go to the composer together.
+    fn draft_tray(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.draft_annotations.is_empty() {
+            return None;
+        }
+        let amber: Hsla = rgb(0xfbbf24).into();
+        let total = self.draft_annotations.len();
+        let heading = if total == 1 {
+            crate::i18n::t("1 review note")
+        } else {
+            crate::i18n::t("{count} review notes").replace("{count}", &total.to_string())
+        };
+        let expanded = self.drafts_expanded;
+        let items: Vec<AnyElement> = self
+            .draft_annotations
+            .iter()
+            .map(|ann| {
+                let id = ann.id;
+                let location = diff::selection_location(&ann.path, &ann.lines);
+                let preview = ann.note.lines().next().unwrap_or_default().to_owned();
+                div()
+                    .id(("diff-draft-item", id as usize))
+                    .debug_selector(move || format!("diff-draft-item-{id}"))
+                    .h(px(24.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .hover(|s| s.bg(content(0.06)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.jump_to_draft(id, cx)))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(crate::fonts::mono())
+                            .text_size(px(11.))
+                            .text_color(accent_color())
+                            .child(location),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(content(0.8))
+                            .child(preview),
+                    )
+                    .child(
+                        tool_button(("diff-draft-remove", id as usize), "Remove note", "x", true)
+                            .size(px(20.))
+                            .debug_selector(move || format!("diff-draft-remove-{id}"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.draft_annotations.retain(|a| a.id != id);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            div()
+                .id("diff-draft-tray")
+                .debug_selector(|| "diff-draft-tray".into())
+                .flex_shrink_0()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(stroke())
+                .bg(content(0.03))
+                .child(
+                    div()
+                        .h(px(32.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("diff-drafts-toggle")
+                                .debug_selector(|| "diff-drafts-toggle".into())
+                                .role(Role::Button)
+                                .aria_label(SharedString::from(crate::i18n::t(if expanded {
+                                    "Collapse review notes"
+                                } else {
+                                    "Expand review notes"
+                                })))
+                                .aria_expanded(expanded)
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .cursor_pointer()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(content(0.85))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.drafts_expanded = !this.drafts_expanded;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icon(
+                                        if expanded {
+                                            "chevron-down"
+                                        } else {
+                                            "chevron-right"
+                                        },
+                                        12.,
+                                    )
+                                    .text_color(content(0.4)),
+                                )
+                                .child(icon("comment-add", 12.).text_color(amber))
+                                .child(div().truncate().child(heading)),
+                        )
+                        .child(
+                            div()
+                                .ml_auto()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .id("diff-drafts-clear")
+                                        .debug_selector(|| "diff-drafts-clear".into())
+                                        .role(Role::Button)
+                                        .h(px(24.))
+                                        .flex()
+                                        .items_center()
+                                        .px(px(8.))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_size(px(12.))
+                                        .text_color(content(0.55))
+                                        .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                                        .child(crate::i18n::t("Clear notes"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.draft_annotations.clear();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("diff-drafts-flush")
+                                        .debug_selector(|| "diff-drafts-flush".into())
+                                        .role(Role::Button)
+                                        .h(px(24.))
+                                        .flex()
+                                        .items_center()
+                                        .px(px(10.))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(content(1.))
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(crate::theme::background_base())
+                                        .hover(|s| s.opacity(0.8))
+                                        .child(crate::i18n::t("Send to chat"))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.flush_drafts(cx)),
+                                        ),
+                                ),
+                        ),
+                )
+                .when(expanded, |d| {
+                    d.child(
+                        div()
+                            .id("diff-draft-list")
+                            .max_h(px(140.))
+                            .overflow_y_scroll()
+                            .px_3()
+                            .pb_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(items),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1138,8 +1694,17 @@ impl DiffView {
                     })
                     .collect();
                 let number = if removed { l.old_number } else { l.new_number };
-                let comment_line = l.clone();
                 let file_ix = row.file;
+                let selected = self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|s| s.contains(&file.id, (block, line)));
+                let annotated = self
+                    .draft_annotations
+                    .iter()
+                    .any(|a| a.file_id == file.id && a.positions.contains(&(block, line)));
+                let hover_file = file.id.clone();
+                let down_file = file.id.clone();
                 let file_id = file.id.clone();
                 let slot = self.action_slots.entry(ix).or_default().clone();
                 let gutter_ink = ink.unwrap_or(content(0.4));
@@ -1158,12 +1723,48 @@ impl DiffView {
                 let _ = window;
                 div()
                     .id(("diff-line", ix))
+                    .debug_selector(move || format!("diff-line-{ix}"))
                     .h(px(LINE))
                     .w_full()
                     .flex()
                     .line_height(px(LINE))
                     .when_some(ink, |d, ink| d.bg(ink.opacity(0.06)))
+                    .when(selected, |d| d.bg(accent.opacity(0.14)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.comment.is_none() {
+                                window.focus(&this.focus, cx);
+                            }
+                            let extend = event.modifiers.shift
+                                && this
+                                    .selection
+                                    .as_ref()
+                                    .is_some_and(|s| s.file_id == down_file);
+                            if extend {
+                                if let Some(sel) = &mut this.selection {
+                                    sel.head = (block, line);
+                                }
+                            } else {
+                                this.selection = Some(LineSelection {
+                                    file_id: down_file.clone(),
+                                    anchor: (block, line),
+                                    head: (block, line),
+                                });
+                            }
+                            this.selecting = true;
+                            cx.notify();
+                        }),
+                    )
                     .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                        if *hovering && this.selecting {
+                            if let Some(sel) = &mut this.selection {
+                                if sel.file_id == hover_file && sel.head != (block, line) {
+                                    sel.head = (block, line);
+                                    cx.notify();
+                                }
+                            }
+                        }
                         let next = if *hovering {
                             Some(ix)
                         } else if this.hovered == Some(ix) {
@@ -1187,7 +1788,11 @@ impl DiffView {
                                 div()
                                     .w(px(3.))
                                     .flex_shrink_0()
-                                    .when_some(ink, |d, ink| d.bg(ink.opacity(0.55))),
+                                    .when_some(ink, |d, ink| d.bg(ink.opacity(0.55)))
+                                    .when(annotated, |d| {
+                                        d.bg(Hsla::from(rgb(0xfbbf24)).opacity(0.8))
+                                    })
+                                    .when(selected, |d| d.bg(accent.opacity(0.85))),
                             )
                             .child(numbers(l.old_number, hovered))
                             .child(numbers(l.new_number, false))
@@ -1227,10 +1832,13 @@ impl DiffView {
                                         .hover(|s| s.bg(content(0.12)))
                                         .child(slot.probe())
                                         .child(icon("comment-add", 12.).text_color(content(1.)))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.open_comment(
+                                            this.comment_on_line(
                                                 file_ix,
-                                                comment_line.clone(),
+                                                (block, line),
                                                 ix,
                                                 window,
                                                 cx,
@@ -1255,6 +1863,9 @@ impl DiffView {
                                             .when(busy, |d| d.opacity(0.35))
                                             .when(!busy, |d| d.hover(|s| s.bg(content(0.12))))
                                             .child(icon("check", 12.).text_color(content(1.)))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
                                             .when(!busy, |d| {
                                                 d.on_click(cx.listener(move |_, _, _, cx| {
                                                     cx.emit(DiffEvent::StageHunk(
@@ -1488,13 +2099,14 @@ impl Render for DiffView {
         let weak = cx.weak_entity();
         let sticky = self.sticky_header(cx);
         let comment = self.comment.as_ref().map(|c| {
-            let location = diff::comment_location(&c.path, &c.line);
+            let location = diff::selection_location(&c.path, &c.lines);
+            let count = c.lines.len();
             let can_add = !c.input.read(cx).content.trim().is_empty();
             popover(
                 "diff-comment",
                 crate::popover::Anchor::Slot(c.anchor.clone()),
             )
-            .side(Side::Right)
+            .side(c.side)
             .gap(6.)
             .width(320.)
             .padding(8.)
@@ -1525,6 +2137,21 @@ impl Render for DiffView {
                                     .text_color(content(0.55))
                                     .child(location),
                             )
+                            .when(count > 1, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px(px(6.))
+                                        .rounded_full()
+                                        .bg(content(0.08))
+                                        .text_size(px(10.))
+                                        .text_color(content(0.55))
+                                        .child(
+                                            crate::i18n::t("{count} lines selected")
+                                                .replace("{count}", &count.to_string()),
+                                        ),
+                                )
+                            })
                             .child(
                                 tool_button("cancel-comment", "Cancel comment", "x", true)
                                     .size(px(20.))
@@ -1562,38 +2189,79 @@ impl Render for DiffView {
                             ))
                             .child(
                                 div()
-                                    .id("add-comment")
-                                    .role(Role::Button)
-                                    .aria_label("Add to chat")
-                                    .h(px(28.))
+                                    .flex_shrink_0()
                                     .flex()
                                     .items_center()
-                                    .gap(px(6.))
-                                    .px(px(10.))
-                                    .rounded_md()
-                                    .bg(content(1.))
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(crate::theme::background_base())
-                                    .when(!can_add, |d| d.opacity(0.4))
-                                    .when(can_add, |d| d.hover(|s| s.opacity(0.8)))
+                                    .gap_1p5()
                                     .child(
-                                        icon("comment-add", 14.)
-                                            .text_color(crate::theme::background_base()),
+                                        div()
+                                            .id("diff-save-note")
+                                            .debug_selector(|| "diff-save-note".into())
+                                            .role(Role::Button)
+                                            .aria_label(SharedString::from(crate::i18n::t(
+                                                "Save note",
+                                            )))
+                                            .h(px(28.))
+                                            .flex()
+                                            .items_center()
+                                            .px(px(10.))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(content(0.16))
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(content(0.85))
+                                            .when(!can_add, |d| d.opacity(0.4))
+                                            .when(can_add, |d| d.hover(|s| s.bg(content(0.08))))
+                                            .child(crate::i18n::t("Save note"))
+                                            .when(can_add, |d| {
+                                                d.on_click(cx.listener(|this, _, window, cx| {
+                                                    this.save_draft_comment(window, cx)
+                                                }))
+                                            }),
                                     )
-                                    .child("Add to chat")
-                                    .when(can_add, |d| {
-                                        d.on_click(cx.listener(|this, _, window, cx| {
-                                            this.add_comment(window, cx)
-                                        }))
-                                    }),
+                                    .child(
+                                        div()
+                                            .id("add-comment")
+                                            .debug_selector(|| "diff-add-comment".into())
+                                            .role(Role::Button)
+                                            .aria_label(SharedString::from(crate::i18n::t(
+                                                "Add to chat",
+                                            )))
+                                            .h(px(28.))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .px(px(10.))
+                                            .rounded_md()
+                                            .bg(content(1.))
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(crate::theme::background_base())
+                                            .when(!can_add, |d| d.opacity(0.4))
+                                            .when(can_add, |d| d.hover(|s| s.opacity(0.8)))
+                                            .child(
+                                                icon("comment-add", 14.)
+                                                    .text_color(crate::theme::background_base()),
+                                            )
+                                            .child(crate::i18n::t("Add to chat"))
+                                            .when(can_add, |d| {
+                                                d.on_click(cx.listener(|this, _, window, cx| {
+                                                    this.add_comment(window, cx)
+                                                }))
+                                            }),
+                                    ),
                             ),
                     ),
             )
         });
         div()
             .id("diff-review")
-            .key_context("DiffReview")
+            .key_context(if self.selection.is_some() || self.comment.is_some() {
+                "DiffReview DiffSelection"
+            } else {
+                "DiffReview"
+            })
             .track_focus(&self.focus)
             .size_full()
             .min_h_0()
@@ -1603,6 +2271,14 @@ impl Render for DiffView {
             .overflow_hidden()
             .on_action(cx.listener(|this, _: &PreviousHunk, _, cx| this.navigate(-1, cx)))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| this.navigate(1, cx)))
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                // The note box closes first and keeps the selection it quotes.
+                if this.comment.is_some() {
+                    this.dismiss_comment(window, cx);
+                } else {
+                    this.clear_selection(cx);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -1639,6 +2315,9 @@ impl Render for DiffView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if std::mem::take(&mut this.selecting) {
+                        cx.notify();
+                    }
                     if this.overview_drag.take().is_some() {
                         cx.notify();
                     }
@@ -1650,12 +2329,23 @@ impl Render for DiffView {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.overview_drag.take().is_some() | this.thumb_drag.take().is_some() {
+                    let selecting = std::mem::take(&mut this.selecting);
+                    if this.overview_drag.take().is_some()
+                        | this.thumb_drag.take().is_some()
+                        | selecting
+                    {
                         cx.notify();
                     }
                 }),
             )
-            .child(self.toolbar(cx))
+            .child(
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .child(self.toolbar(cx))
+                    .children(self.selection_bar(cx)),
+            )
             .child(
                 div()
                     .id("unified-diff")
@@ -1707,6 +2397,7 @@ impl Render for DiffView {
                     .children(sticky)
                     .child(self.overview(cx)),
             )
+            .children(self.draft_tray(cx))
             .child(self.horizontal_bar(cx))
             .children(comment)
             .into_any_element()
@@ -1945,5 +2636,186 @@ mod tests {
             RowKind::Notice(t) if t.as_ref() == "Binary file changed")
         );
         assert_eq!(expand_tabs("\tab\tc"), "    ab  c");
+    }
+
+    type Events = Rc<std::cell::RefCell<Vec<String>>>;
+    fn review_window(
+        cx: &mut gpui::TestAppContext,
+        files: Vec<DiffFile>,
+    ) -> (
+        gpui::WindowHandle<DiffView>,
+        gpui::VisualTestContext,
+        Events,
+    ) {
+        cx.update(bind);
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(DiffView::new))
+                .unwrap()
+        });
+        let events: Events = Rc::default();
+        let log = events.clone();
+        window
+            .update(cx, |view, _, cx| {
+                cx.subscribe(&cx.entity(), move |_, _, event: &DiffEvent, _| {
+                    log.borrow_mut().push(match event {
+                        DiffEvent::StageFile(_) => "stage-file".to_owned(),
+                        DiffEvent::DiscardFile(_) => "discard-file".to_owned(),
+                        DiffEvent::StageHunk(..) => "stage-hunk".to_owned(),
+                        DiffEvent::Comment(text) => format!("comment:{text}"),
+                    });
+                })
+                .detach();
+                view.set_files(files, cx);
+            })
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        (window, visual, events)
+    }
+    fn click(visual: &mut gpui::VisualTestContext, selector: &'static str, shift: bool) {
+        let at = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"))
+            .center();
+        let modifiers = if shift {
+            gpui::Modifiers::shift()
+        } else {
+            Default::default()
+        };
+        visual.simulate_click(at, modifiers);
+        visual.run_until_parked();
+    }
+    fn first_line_row(view: &DiffView, file: usize) -> usize {
+        view.rows
+            .iter()
+            .position(|r| r.file == file && matches!(r.kind, RowKind::Line { .. }))
+            .unwrap()
+    }
+    fn selected_len(view: &DiffView) -> usize {
+        let sel = view.selection.as_ref().unwrap();
+        view.selected_lines(sel).unwrap().1.len()
+    }
+
+    #[gpui::test]
+    fn line_selection_quotes_range_to_chat_and_clears_on_escape(cx: &mut gpui::TestAppContext) {
+        let original: String = (1..=10).map(|n| format!("l{n}\n")).collect();
+        let current = original
+            .replace("l3\n", "L3\n")
+            .replace("l4\n", "L4\n")
+            .replace("l5\n", "L5\n");
+        let (window, mut visual, events) =
+            review_window(cx, vec![file("a.rs", &original, &current)]);
+        assert!(visual.debug_bounds("diff-selection-bar").is_none());
+        click(&mut visual, "diff-line-2", false);
+        click(&mut visual, "diff-line-4", true);
+        assert!(visual.debug_bounds("diff-selection-bar").is_some());
+        window
+            .update(&mut visual, |view, _, _| {
+                assert_eq!(selected_len(view), 3, "{:?}", view.selection)
+            })
+            .unwrap();
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("diff-selection-bar").is_none());
+        window
+            .update(&mut visual, |view, _, _| assert!(view.selection.is_none()))
+            .unwrap();
+
+        click(&mut visual, "diff-line-2", false);
+        click(&mut visual, "diff-line-4", true);
+        click(&mut visual, "diff-selection-quote", false);
+        window
+            .update(&mut visual, |view, _, _| {
+                assert!(view.selection.is_none());
+                assert!(view.draft_annotations.is_empty());
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("diff-selection-bar").is_none());
+        let events = events.borrow();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let text = events[0].strip_prefix("comment:").unwrap();
+        assert!(text.starts_with("`a.rs:L"), "{text}");
+        assert!(text.contains("```diff\n l1\n l2\n-l3\n```"), "{text}");
+    }
+
+    #[gpui::test]
+    fn multi_note_inline_annotations_queue_across_files_and_flush_in_one_click(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, mut visual, events) = review_window(
+            cx,
+            vec![
+                file("a.rs", "x1\nx2\nx3\n", "x1\nX2\nx3\n"),
+                file("b.rs", "y1\ny2\ny3\n", "y1\nY2\ny3\n"),
+            ],
+        );
+        let note = |window: gpui::WindowHandle<DiffView>,
+                    visual: &mut gpui::VisualTestContext,
+                    text: &'static str| {
+            window
+                .update(visual, |view, _, cx| {
+                    let input = view.comment.as_ref().unwrap().input.clone();
+                    input.update(cx, |input, cx| input.set_text(text.into(), cx));
+                })
+                .unwrap();
+            visual.run_until_parked();
+        };
+
+        click(&mut visual, "diff-line-4", false);
+        click(&mut visual, "diff-selection-annotate", false);
+        note(window, &mut visual, "Check nil case");
+        click(&mut visual, "diff-save-note", false);
+        assert!(events.borrow().is_empty());
+        assert!(visual.debug_bounds("diff-draft-tray").is_some());
+        window
+            .update(&mut visual, |view, _, _| {
+                assert_eq!(view.draft_annotations.len(), 1);
+                assert!(view.comment.is_none() && view.selection.is_none());
+            })
+            .unwrap();
+
+        let b_line = window
+            .update(&mut visual, |view, _, _| {
+                let ix = first_line_row(view, 1) + 2;
+                Box::leak(format!("diff-line-{ix}").into_boxed_str()) as &'static str
+            })
+            .unwrap();
+        click(&mut visual, b_line, false);
+        click(&mut visual, "diff-selection-annotate", false);
+        note(window, &mut visual, "Rename helper");
+        click(&mut visual, "diff-save-note", false);
+        window
+            .update(&mut visual, |view, _, cx| {
+                assert_eq!(view.draft_annotations.len(), 2);
+                view.toggle(0, cx);
+                assert_eq!(view.draft_annotations.len(), 2);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(events.borrow().is_empty());
+
+        click(&mut visual, "diff-drafts-flush", false);
+        {
+            let events = events.borrow();
+            assert_eq!(events.len(), 1, "{events:?}");
+            let text = &events[0];
+            assert!(text.contains("Review comments (2):"), "{text}");
+            for part in [
+                "a.rs:L",
+                "b.rs:L",
+                "+X2",
+                "+Y2",
+                "Check nil case",
+                "Rename helper",
+            ] {
+                assert!(text.contains(part), "{part} missing from {text}");
+            }
+        }
+        window
+            .update(&mut visual, |view, _, _| {
+                assert!(view.draft_annotations.is_empty())
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("diff-draft-tray").is_none());
     }
 }
