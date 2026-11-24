@@ -22,6 +22,77 @@ pub(crate) struct Rails {
     pub(super) children: HashSet<i64>,
     frames: Option<gpui::Task<()>>,
 }
+/// Counts of a collapsed parent's children by status bucket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ChildRailSummary {
+    pub total: usize,
+    pub needs_input: usize,
+    pub failed: usize,
+    pub attention: usize,
+    pub working: usize,
+    pub done: usize,
+}
+impl ChildRailSummary {
+    pub(super) fn record(&mut self, bucket: crate::paseo_host::StatusBucket) {
+        use crate::paseo_host::StatusBucket;
+        self.total += 1;
+        match bucket {
+            StatusBucket::NeedsInput => self.needs_input += 1,
+            StatusBucket::Failed => self.failed += 1,
+            StatusBucket::Attention => self.attention += 1,
+            StatusBucket::Working => self.working += 1,
+            StatusBucket::Done => self.done += 1,
+        }
+    }
+    fn count(&self, bucket: crate::paseo_host::StatusBucket) -> usize {
+        use crate::paseo_host::StatusBucket;
+        match bucket {
+            StatusBucket::NeedsInput => self.needs_input,
+            StatusBucket::Failed => self.failed,
+            StatusBucket::Attention => self.attention,
+            StatusBucket::Working => self.working,
+            StatusBucket::Done => self.done,
+        }
+    }
+    /// The most urgent bucket any child is in.
+    pub(super) fn highest_priority(&self) -> crate::paseo_host::StatusBucket {
+        crate::paseo_host::StatusBucket::ALL
+            .into_iter()
+            .find(|b| self.count(*b) > 0)
+            .unwrap_or(crate::paseo_host::StatusBucket::Done)
+    }
+    pub(super) fn top_count(&self) -> usize {
+        self.count(self.highest_priority())
+    }
+    /// `total` when all children share the top bucket or are done, else
+    /// `top/total`.
+    pub(super) fn compact_text(&self) -> String {
+        let top = self.top_count();
+        if self.highest_priority() == crate::paseo_host::StatusBucket::Done || top == self.total {
+            self.total.to_string()
+        } else {
+            format!("{top}/{}", self.total)
+        }
+    }
+    pub(super) fn aria_summary(&self) -> String {
+        let parts: Vec<String> = crate::paseo_host::StatusBucket::ALL
+            .into_iter()
+            .filter(|b| self.count(*b) > 0)
+            .map(|b| format!("{} {}", self.count(b), crate::i18n::t(b.label())))
+            .collect();
+        let header = if self.total == 1 {
+            crate::i18n::t("1 child conversation")
+        } else {
+            crate::i18n::t("{count} child conversations")
+                .replace("{count}", &self.total.to_string())
+        };
+        if parts.is_empty() {
+            header
+        } else {
+            format!("{header}: {}", parts.join(", "))
+        }
+    }
+}
 #[derive(Clone, Copy)]
 struct Motion {
     open: bool,
@@ -133,16 +204,51 @@ impl Shell {
         }
     }
 
+    /// The bucket a child shows in the parent's collapsed badge. A child that
+    /// finished while unseen counts as needing attention, as its own row does.
+    fn child_status_bucket(&self, id: i64, cx: &App) -> crate::paseo_host::StatusBucket {
+        use crate::paseo_host::StatusBucket;
+        let m = self.session_metadata(id, cx);
+        let details = self
+            .remote_details
+            .get(&id)
+            .unwrap_or(&serde_json::Value::Null);
+        let bucket = StatusBucket::from_details(details, m.busy, m.needs_approval());
+        if bucket == StatusBucket::Done && self.unseen_finished.contains(&id) {
+            StatusBucket::Attention
+        } else {
+            bucket
+        }
+    }
+    pub(super) fn child_rail_summary(&self, children: &[i64], cx: &App) -> ChildRailSummary {
+        let mut summary = ChildRailSummary::default();
+        for &child in children {
+            if !self.session_summaries.contains_key(&child) && !self.sessions.contains_key(&child) {
+                continue;
+            }
+            summary.record(self.child_status_bucket(child, cx));
+        }
+        summary
+    }
+    fn toggle_paseo_child_rail(&mut self, id: i64, open: bool, cx: &mut Context<Self>) {
+        self.rails.paseo_disclosures.insert(id, !open);
+        if open && let Some(children) = self.rails.started.get(&id) {
+            self.selected_sessions
+                .retain(|child| !children.contains(child));
+        }
+        self.notify_sidebar(cx);
+    }
+
     pub(super) fn paseo_child_rail_button(
         &self,
         id: i64,
         rail: Option<(&Rail, bool)>,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let (Rail::Started(_), open) = rail? else {
+        let (Rail::Started(children), open) = rail? else {
             return None;
         };
-        if !crate::paseo_host::project_ui(&self.workspace.preferences) {
+        if !crate::paseo_host::project_ui(&self.workspace.preferences) || children.is_empty() {
             return None;
         }
         let (glyph, label) = if open {
@@ -150,34 +256,102 @@ impl Shell {
         } else {
             ("chevron-right", "Expand child conversations")
         };
+        let toggle = div()
+            .id(("sidebar-rail-toggle", id as usize))
+            .debug_selector(move || format!("sidebar-rail-toggle-{id}"))
+            .role(Role::Button)
+            .aria_label(crate::i18n::t(label))
+            .aria_expanded(open)
+            .cursor_pointer()
+            .size(px(20.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .hover(|s| s.bg(content(0.1)))
+            .child(icon(glyph, 14.).text_color(content(0.65)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_paseo_child_rail(id, open, cx);
+            }));
+        if open {
+            return Some(toggle.into_any_element());
+        }
+        let summary = self.child_rail_summary(children, cx);
         Some(
             div()
-                .id(("sidebar-rail-toggle", id as usize))
-                .debug_selector(move || format!("sidebar-rail-toggle-{id}"))
-                .role(Role::Button)
-                .aria_label(crate::i18n::t(label))
-                .aria_expanded(open)
-                .cursor_pointer()
-                .size(px(20.))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
-                .justify_center()
-                .rounded_md()
-                .hover(|s| s.bg(content(0.1)))
-                .child(icon(glyph, 14.).text_color(content(0.65)))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.rails.paseo_disclosures.insert(id, !open);
-                    if open && let Some(children) = this.rails.started.get(&id) {
-                        this.selected_sessions
-                            .retain(|child| !children.contains(child));
-                    }
-                    this.notify_sidebar(cx);
-                }))
+                .gap(px(2.))
+                .child(Self::child_rail_badge(id, &summary, cx))
+                .child(toggle)
                 .into_any_element(),
         )
+    }
+    /// The collapsed parent's pill: its children's most urgent state and how
+    /// many share it. Static, so the sidebar never needs a frame timer.
+    fn child_rail_badge(id: i64, summary: &ChildRailSummary, cx: &Context<Self>) -> AnyElement {
+        use crate::paseo_host::StatusBucket;
+        let bucket = summary.highest_priority();
+        let tint = |c: gpui::Hsla, fill: f32, edge: f32| (c, c.opacity(fill), c.opacity(edge));
+        let amber: gpui::Hsla = rgb(0xfbbf24).into();
+        let red: gpui::Hsla = rgb(0xf87171).into();
+        let teal: gpui::Hsla = rgb(0x2dd4bf).into();
+        let accent = accent_color();
+        let (fg, fill, edge) = match bucket {
+            StatusBucket::NeedsInput => tint(amber, 0.16, 0.32),
+            StatusBucket::Failed => tint(red, 0.16, 0.32),
+            StatusBucket::Attention => tint(teal, 0.14, 0.28),
+            StatusBucket::Working => tint(accent, 0.15, 0.28),
+            StatusBucket::Done => (content(0.55), content(0.08), content(0.12)),
+        };
+        let indicator = match bucket {
+            StatusBucket::NeedsInput | StatusBucket::Failed => {
+                Some(icon("circle-alert", 10.).text_color(fg).into_any_element())
+            }
+            StatusBucket::Attention => Some(
+                icon("check-circle-2", 10.)
+                    .text_color(fg)
+                    .into_any_element(),
+            ),
+            StatusBucket::Working => {
+                Some(div().size(px(6.)).rounded_full().bg(fg).into_any_element())
+            }
+            StatusBucket::Done => None,
+        };
+        div()
+            .id(("sidebar-rail-badge", id as usize))
+            .debug_selector(move || format!("sidebar-rail-badge-{id}"))
+            .role(Role::Button)
+            .aria_label(summary.aria_summary())
+            .cursor_pointer()
+            .h(px(18.))
+            .px(px(5.))
+            .rounded_full()
+            .border_1()
+            .border_color(edge)
+            .bg(fill)
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .text_size(px(10.))
+            .line_height(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .font_features(crate::right_panel::tabular())
+            .text_color(fg)
+            .hover(move |s| s.bg(fg.opacity(0.24)))
+            .children(indicator)
+            .child(summary.compact_text())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_paseo_child_rail(id, false, cx);
+            }))
+            .into_any_element()
     }
 
     /// Moves each rail toward its open state. A rail the sidebar first shows
@@ -1091,6 +1265,62 @@ mod tests {
                 .unwrap();
             cx.run_until_parked();
         }
+    }
+
+    #[test]
+    fn child_rail_summary_orders_priority_and_formats_compact_labels() {
+        use crate::paseo_host::StatusBucket::*;
+        let of = |buckets: &[crate::paseo_host::StatusBucket]| {
+            let mut s = ChildRailSummary::default();
+            for b in buckets {
+                s.record(*b);
+            }
+            s
+        };
+        assert_eq!(of(&[]).highest_priority(), Done);
+        assert_eq!(of(&[Done, Working]).highest_priority(), Working);
+        assert_eq!(of(&[Working, Attention]).highest_priority(), Attention);
+        assert_eq!(of(&[Attention, Failed]).highest_priority(), Failed);
+        assert_eq!(
+            of(&[Done, Working, Failed, NeedsInput, Attention]).highest_priority(),
+            NeedsInput
+        );
+        assert_eq!(of(&[Done, Done, Done]).compact_text(), "3");
+        assert_eq!(of(&[Working]).compact_text(), "1");
+        assert_eq!(of(&[Working, Working]).compact_text(), "2");
+        assert_eq!(of(&[NeedsInput, Working, Working]).compact_text(), "1/3");
+        assert_eq!(of(&[Failed, Failed, Attention]).compact_text(), "2/3");
+        let mixed = of(&[NeedsInput, Working, Working]);
+        let mut prefs = crate::settings::Preferences {
+            native_locale: Some("en".into()),
+            ..Default::default()
+        };
+        prefs.extra.insert(
+            crate::paseo_host::PROJECT_SELECTION.into(),
+            serde_json::json!({}),
+        );
+        crate::i18n::configure(&prefs);
+        assert_eq!(
+            mixed.aria_summary(),
+            "3 child conversations: 1 Needs input, 2 Working"
+        );
+        assert_eq!(of(&[Done]).aria_summary(), "1 child conversation: 1 Done");
+        prefs.native_locale = Some("zh-CN".into());
+        crate::i18n::configure(&prefs);
+        assert_eq!(
+            mixed.aria_summary(),
+            format!(
+                "3 个子对话: 1 {}, 2 {}",
+                crate::i18n::t("Needs input"),
+                crate::i18n::t("Working")
+            )
+        );
+        assert_eq!(
+            of(&[Done]).aria_summary(),
+            "1 个子对话: 1 已完成".replace("已完成", &crate::i18n::t("Done"))
+        );
+        prefs.native_locale = Some("en".into());
+        crate::i18n::configure(&prefs);
     }
 
     #[gpui::test]

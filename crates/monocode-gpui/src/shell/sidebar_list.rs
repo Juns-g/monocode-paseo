@@ -2003,4 +2003,225 @@ mod tests {
         // A local calendar day remains Yesterday across daylight-saving changes.
         assert_eq!(age_label(ms(25, 0, 1), ms(26, 0, 5)), "Yesterday");
     }
+
+    #[gpui::test]
+    fn paseo_collapsed_parent_shows_child_status_badge_in_every_layout(cx: &mut TestAppContext) {
+        use crate::paseo_host::StatusBucket;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let project = store
+            .remember_remote_project(
+                "paseo-badges",
+                &serde_json::json!({"id":"p","cwd":"/fixture"}),
+            )
+            .unwrap();
+        let rows = [
+            serde_json::json!({"id":"c1","title":"Child one","harness":"codex","paseoParentAgentId":"root"}),
+            serde_json::json!({"id":"c2","title":"Child two","harness":"codex","paseoParentAgentId":"root"}),
+            serde_json::json!({"id":"c3","title":"Child three","harness":"codex","paseoParentAgentId":"root"}),
+            serde_json::json!({"id":"root","title":"Workspace","harness":"codex","pinned":false}),
+        ];
+        let registered = store.sync_remote_summaries(&project, &rows).unwrap();
+        let kids = [
+            registered[0].summary.id,
+            registered[1].summary.id,
+            registered[2].summary.id,
+        ];
+        let root = registered[3].summary.id;
+        let summaries = store.sessions().unwrap();
+        let mut state = Workspace::default();
+        state.add_project(&project.key);
+        state.open(root);
+        state.preferences.extra.insert(
+            crate::paseo_host::PROJECT_SELECTION.into(),
+            serde_json::json!({}),
+        );
+        crate::paseo_host::restrict_workspace(&mut state);
+        let saved = serde_json::to_string(&state).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let window =
+            cx.add_window(move |_, cx| Shell::new(store, summaries, project.key, Some(saved), cx));
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        let badge_selector = leak(format!("sidebar-rail-badge-{root}"));
+        let toggle_selector = leak(format!("sidebar-rail-toggle-{root}"));
+        let title_selector = leak(format!("session-title-{root}"));
+        let child_selector = leak(format!("sidebar-session-{}", kids[0]));
+        // (classic, status grouping, compact, parent inside a folder)
+        for (classic, status, compact, folder) in [
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (false, false, false, true),
+            (true, false, false, true),
+        ] {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.workspace.classic_layout = classic;
+                    shell.workspace.compact_session_cards = compact;
+                    shell.workspace.preferences.extra.insert(
+                        "paseo_group".into(),
+                        serde_json::json!(if status { "status" } else { "project" }),
+                    );
+                    shell.groups.remove(&shell.workspace.project);
+                    if folder {
+                        shell.groups.insert(
+                            shell.workspace.project.clone(),
+                            monocode_core::session_groups::Groups {
+                                folders: vec![monocode_core::session_groups::Folder {
+                                    id: "badge-folder".into(),
+                                    name: "Folder".into(),
+                                    session_ids: vec![root],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    shell.rails.paseo_disclosures.clear();
+                    for kid in kids {
+                        shell
+                            .remote_details
+                            .insert(kid, serde_json::json!({"bucket":"done"}));
+                    }
+                    shell.invalidate_chrome(cx);
+                    shell.refresh_sidebar_structure(cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            let layout =
+                format!("classic={classic} status={status} compact={compact} folder={folder}");
+            assert!(
+                visual.debug_bounds(badge_selector).is_none(),
+                "expanded parent shows no badge: {layout}"
+            );
+            let toggle = visual
+                .debug_bounds(toggle_selector)
+                .unwrap_or_else(|| panic!("toggle present: {layout}"));
+            visual.simulate_click(toggle.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(visual.debug_bounds(child_selector).is_none(), "{layout}");
+            let badge = visual
+                .debug_bounds(badge_selector)
+                .unwrap_or_else(|| panic!("badge shown when collapsed: {layout}"));
+            let toggle = visual
+                .debug_bounds(toggle_selector)
+                .unwrap_or_else(|| panic!("toggle still present: {layout}"));
+            let title = visual
+                .debug_bounds(title_selector)
+                .unwrap_or_else(|| panic!("title still present: {layout}"));
+            assert!(badge.right() <= toggle.left(), "{layout}");
+            assert!(title.size.width > px(20.), "{layout}");
+            // The chevron stays pinned when hover swaps the row's suffix.
+            visual.simulate_mouse_move(toggle.center(), None, Default::default());
+            visual.refresh().unwrap();
+            assert_eq!(
+                visual.debug_bounds(toggle_selector),
+                Some(toggle),
+                "{layout}"
+            );
+            visual.simulate_mouse_move(gpui::point(px(900.), px(900.)), None, Default::default());
+            visual.refresh().unwrap();
+
+            let amber: gpui::Hsla = rgb(0xfbbf24).into();
+            let red: gpui::Hsla = rgb(0xf87171).into();
+            let teal: gpui::Hsla = rgb(0x2dd4bf).into();
+            let accent = crate::theme::accent_color();
+            let steps: [(&str, usize, &str, StatusBucket, gpui::Hsla, &str); 5] = [
+                ("done", 0, "done", StatusBucket::Done, content(0.08), "3"),
+                (
+                    "running",
+                    0,
+                    "running",
+                    StatusBucket::Working,
+                    accent.opacity(0.15),
+                    "1/3",
+                ),
+                (
+                    "attention",
+                    1,
+                    "attention",
+                    StatusBucket::Attention,
+                    teal.opacity(0.14),
+                    "1/3",
+                ),
+                (
+                    "failed",
+                    2,
+                    "failed",
+                    StatusBucket::Failed,
+                    red.opacity(0.16),
+                    "1/3",
+                ),
+                (
+                    "needs_input",
+                    0,
+                    "needs_input",
+                    StatusBucket::NeedsInput,
+                    amber.opacity(0.16),
+                    "1/3",
+                ),
+            ];
+            for (_, kid, value, expected, fill, text) in steps {
+                window
+                    .update(visual, |shell, _, cx| {
+                        shell
+                            .remote_details
+                            .insert(kids[kid], serde_json::json!({"bucket":value}));
+                        shell.invalidate_chrome(cx);
+                        shell.refresh_sidebar_structure(cx);
+                    })
+                    .unwrap();
+                visual.run_until_parked();
+                visual.refresh().unwrap();
+                let badge = visual.debug_bounds(badge_selector).expect("badge repaints");
+                window
+                    .update(visual, |shell, window, cx| {
+                        let summary = shell.child_rail_summary(&kids, cx);
+                        assert_eq!(summary.total, 3, "{layout}");
+                        assert_eq!(summary.highest_priority(), expected, "{layout} {value}");
+                        assert_eq!(summary.compact_text(), text, "{layout} {value}");
+                        let scale = window.scale_factor();
+                        assert!(
+                            window.painted_quads().iter().any(|quad| {
+                                quad.background.as_solid() == Some(fill)
+                                    && (quad.bounds.origin.x.0 / scale - f32::from(badge.origin.x))
+                                        .abs()
+                                        < 1.5
+                                    && (quad.bounds.size.width.0 / scale
+                                        - f32::from(badge.size.width))
+                                    .abs()
+                                        < 1.5
+                            }),
+                            "badge paints the {value} tint: {layout}"
+                        );
+                    })
+                    .unwrap();
+            }
+            let active = window
+                .read_with(visual, |shell, _| shell.workspace.active)
+                .unwrap();
+            let badge = visual.debug_bounds(badge_selector).unwrap();
+            visual.simulate_click(badge.center(), Default::default());
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(
+                visual.debug_bounds(child_selector).is_some(),
+                "badge click expands children: {layout}"
+            );
+            assert!(visual.debug_bounds(badge_selector).is_none(), "{layout}");
+            assert_eq!(
+                window
+                    .read_with(visual, |shell, _| shell.workspace.active)
+                    .unwrap(),
+                active,
+                "{layout}"
+            );
+        }
+    }
 }

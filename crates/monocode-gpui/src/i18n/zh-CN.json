@@ -2179,5 +2179,7 @@
   "A remote command needs confirmation before steering.": "请先确认上一条远程命令的结果，再引导当前对话。",
   "Steer queued message": "立即引导当前对话",
   "Resume queue": "继续队列",
-  "Retry queue": "重试队列"
+  "Retry queue": "重试队列",
+  "1 child conversation": "1 个子对话",
+  "{count} child conversations": "{count} 个子对话"
 }
