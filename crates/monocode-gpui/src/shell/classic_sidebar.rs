@@ -269,7 +269,7 @@ impl gpui::RenderOnce for ChangeStats {
 impl Shell {
     pub(super) fn classic_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.refresh_sidebar_structure(cx);
-        let (slide_x, slide_opacity) = self.sidebar_slide_transform(cx);
+        let (slide_x, neighbor_page) = self.sidebar_carousel_layout(cx);
         if self
             .classic_worktree_picker
             .as_ref()
@@ -362,21 +362,38 @@ impl Shell {
                 |d| d.child(self.classic_conversation_search(cx)),
             )
             .child(
-                div().flex_1().min_h_0().overflow_hidden().child(
-                    div()
-                        .relative()
-                        .size_full()
-                        .left(px(slide_x))
-                        .opacity(slide_opacity)
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .child(if sessions {
-                            self.virtual_sidebar(cx)
-                        } else {
-                            self.classic_tool_pane(cx)
-                        }),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .relative()
+                            .size_full()
+                            .left(px(slide_x))
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(if sessions {
+                                self.virtual_sidebar(cx)
+                            } else {
+                                self.classic_tool_pane(cx)
+                            }),
+                    )
+                    .when_some(neighbor_page, |d, (neighbor_path, neighbor_x)| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(px(neighbor_x))
+                                .w_full()
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .child(self.sidebar_project_preview(&neighbor_path, cx)),
+                        )
+                    }),
             )
             .children(live_agents)
             .when(!self.workspace.project_rail_open, |d| {

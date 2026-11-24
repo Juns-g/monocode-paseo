@@ -171,7 +171,16 @@ impl Render for Chrome {
         self.owner
             .update(cx, |shell, cx| match kind {
                 ChromeKind::Sidebar => {
+                    let pending_commit = shell.tick_sidebar_carousel(cx);
                     let sidebar = shell.sidebar(cx);
+                    if let Some(target) = pending_commit {
+                        let owner = self.owner.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = owner.update(cx, |shell, cx| {
+                                shell.commit_sidebar_carousel_project(target, window, cx);
+                            });
+                        });
+                    }
                     if shell.spaces_nudge.is_some()
                         || shell.classic_tabs.animating()
                         || shell.sidebar_slide_animating()
@@ -365,12 +374,37 @@ fn adjacent<T: PartialEq + Clone>(items: &[T], current: Option<&T>, step: isize)
     }
 }
 
-#[derive(Clone, Copy)]
+/// Analytical critically damped spring for 120Hz dual-page sidebar carousel
+/// (preserves initial finger flick velocity `v0` with zero overshoot).
+#[derive(Clone)]
 struct SidebarSlide {
-    from_x: f32,
-    from_opacity: f32,
-    duration_secs: f32,
+    start_x: f32,
+    target_x: f32,
+    v0: f32,
+    omega: f32,
     start: std::time::Instant,
+    /// Adjacent project shown beside the live sidebar during the glide: `(path, side)`
+    /// where `side = +1.` places it to the right (`offset + width`) and `-1.` to the left.
+    neighbor: Option<(String, f32)>,
+    /// Deferred project commit executed on the exact frame the spring lands at `target_x`.
+    commit_target: Option<String>,
+}
+
+impl SidebarSlide {
+    fn sample(&self, now: std::time::Instant) -> (f32, f32, bool) {
+        let t = now.saturating_duration_since(self.start).as_secs_f32();
+        let dx0 = self.start_x - self.target_x;
+        let w = self.omega;
+        let exp = (-w * t).exp();
+        let dx = (dx0 + (self.v0 + w * dx0) * t) * exp;
+        let v = (self.v0 - w * (self.v0 + w * dx0) * t) * exp;
+        let settled = (dx.abs() < 0.6 && v.abs() < 12.) || t >= 0.55;
+        if settled {
+            (self.target_x, 0., true)
+        } else {
+            (self.target_x + dx, v, false)
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -382,26 +416,41 @@ enum SwipeAxis {
 
 struct SidebarProjectSwipe {
     last_event: Option<std::time::Instant>,
-    x: f32,
-    y: f32,
+    raw_x: f32,
+    raw_y: f32,
     axis: SwipeAxis,
-    consumed: bool,
+    /// Visual offset (px) during live 1:1 finger tracking. Positive shifts right
+    /// (revealing previous project on left); negative shifts left (revealing next on right).
     drag_offset: f32,
-    in_swipe_switch: bool,
+    /// Smoothed horizontal finger velocity (px/s) in the same sign as `drag_offset`.
+    velocity_x: f32,
+    /// True after `TouchPhase::Ended` so macOS post-lift momentum `Moved` events
+    /// do not interfere with our spring glide.
+    ignoring_momentum: bool,
+    /// Suppresses starting a second click-slide when committing a completed swipe spring.
+    skip_click_slide: bool,
 }
 
 impl Default for SidebarProjectSwipe {
     fn default() -> Self {
         Self {
             last_event: None,
-            x: 0.,
-            y: 0.,
+            raw_x: 0.,
+            raw_y: 0.,
             axis: SwipeAxis::Pending,
-            consumed: false,
             drag_offset: 0.,
-            in_swipe_switch: false,
+            velocity_x: 0.,
+            ignoring_momentum: false,
+            skip_click_slide: false,
         }
     }
+}
+
+/// Apple UIScrollView rubber-band curve for over-scrolling past the first/last project.
+fn rubber_band(distance: f32, dimension: f32) -> f32 {
+    let dim = dimension.max(1.);
+    let c = 0.55;
+    (distance * c * dim) / (dim + c * distance.abs())
 }
 
 #[derive(Clone, PartialEq)]
@@ -4675,25 +4724,23 @@ impl Shell {
             monos.update(cx, |m, cx| m.close(cx));
         }
         let previous_project = self.workspace.project.clone();
-        if previous_project != path && !cx.reduce_motion() {
+        if previous_project != path && !self.sidebar_swipe.skip_click_slide && !cx.reduce_motion() {
             let order = self.workspace.visible_project_order();
             if let (Some(old_ix), Some(new_ix)) = (
                 order.iter().position(|p| p == &previous_project),
                 order.iter().position(|p| p == &path),
             ) {
                 let direction = if new_ix > old_ix { 1. } else { -1. };
-                let from_swipe = self.sidebar_swipe.in_swipe_switch;
-                let width = self.workspace.sidebar_width;
-                let (distance, from_opacity, duration_secs) = if from_swipe {
-                    ((width * 0.42).clamp(80., 130.), 0.15, 0.22)
-                } else {
-                    ((width * 0.28).clamp(56., 92.), 0.25, 0.24)
-                };
+                let width = self.workspace.sidebar_width.max(160.);
+                self.sidebar_swipe.drag_offset = 0.;
                 self.project_slide = Some(SidebarSlide {
-                    from_x: direction * distance,
-                    from_opacity,
-                    duration_secs,
+                    start_x: direction * width,
+                    target_x: 0.,
+                    v0: 0.,
+                    omega: 21.,
                     start: std::time::Instant::now(),
+                    neighbor: Some((previous_project, -direction)),
+                    commit_target: None,
                 });
             }
         }
@@ -7501,78 +7548,364 @@ impl Shell {
         }
     }
     pub(super) fn sidebar_slide_animating(&self) -> bool {
-        self.project_slide.is_some() || self.sidebar_swipe.drag_offset.abs() > 0.1
+        self.project_slide.is_some()
+            || self.sidebar_swipe.axis == SwipeAxis::Horizontal
+            || self.sidebar_swipe.drag_offset.abs() > 0.1
     }
-    /// Evaluates the current sidebar horizontal slide/drag transform `(offset_x, opacity)`
-    /// and clears or springs back once settled.
-    pub(super) fn sidebar_slide_transform(&mut self, cx: &App) -> (f32, f32) {
-        if cx.reduce_motion() {
-            self.project_slide = None;
-            self.sidebar_swipe.drag_offset = 0.;
-            return (0., 1.);
+    /// Resolves the adjacent project in `direction` (`+1` = right/next, `-1` = left/prev).
+    fn adjacent_project_for_carousel(&self, direction: isize) -> Option<String> {
+        let projects = self.workspace.visible_project_order();
+        let ix = projects
+            .iter()
+            .position(|path| path == &self.workspace.project)?;
+        if direction > 0 {
+            ix.checked_add(1).and_then(|i| projects.get(i)).cloned()
+        } else {
+            ix.checked_sub(1).and_then(|i| projects.get(i)).cloned()
         }
-        // If a partial drag stalled without receiving TouchPhase::Ended, spring back cleanly.
-        if self.sidebar_swipe.drag_offset.abs() > 0.1
+    }
+    /// The project highlighted in the bottom spaces bar (updates live as a swipe
+    /// passes halfway or commits to a neighbor).
+    fn carousel_active_project(&self) -> &str {
+        if let Some(slide) = &self.project_slide
+            && let Some(target) = &slide.commit_target
+        {
+            return target.as_str();
+        }
+        if self.sidebar_swipe.axis == SwipeAxis::Horizontal {
+            let width = self.workspace.sidebar_width.max(160.);
+            let off = self.sidebar_swipe.drag_offset;
+            if off.abs() >= width * 0.45 {
+                let dir = if off < 0. { 1 } else { -1 };
+                let projects = self.workspace.visible_project_order();
+                if let Some(ix) = projects
+                    .iter()
+                    .position(|path| path == &self.workspace.project)
+                {
+                    let candidate = if dir > 0 {
+                        ix.checked_add(1).and_then(|i| projects.get(i))
+                    } else {
+                        ix.checked_sub(1).and_then(|i| projects.get(i))
+                    };
+                    if let Some(target) = candidate {
+                        return self
+                            .workspace
+                            .projects
+                            .iter()
+                            .find(|p| p.as_str() == target.as_str())
+                            .map(String::as_str)
+                            .unwrap_or(&self.workspace.project);
+                    }
+                }
+            }
+        }
+        &self.workspace.project
+    }
+    /// Starts the release spring from the current drag offset and flick velocity.
+    fn release_sidebar_swipe(&mut self, notify_frame: bool, cx: &mut Context<Self>) {
+        let width = self.workspace.sidebar_width.max(160.);
+        let offset = self.sidebar_swipe.drag_offset;
+        let vel = self.sidebar_swipe.velocity_x.clamp(-2000., 2000.);
+        self.sidebar_swipe.drag_offset = 0.;
+        self.sidebar_swipe.raw_x = 0.;
+        self.sidebar_swipe.raw_y = 0.;
+        self.sidebar_swipe.velocity_x = 0.;
+        self.sidebar_swipe.axis = SwipeAxis::Pending;
+
+        if offset.abs() < 0.5 && vel.abs() < 120. {
+            self.project_slide = None;
+            return;
+        }
+        let dir = if offset < 0. || (offset == 0. && vel < 0.) {
+            1isize
+        } else {
+            -1isize
+        };
+        let neighbor = self.adjacent_project_for_carousel(dir);
+        let commit_by_distance = offset.abs() >= width * 0.25;
+        let commit_by_flick =
+            vel.abs() >= 280. && offset.abs() >= 12. && offset.signum() == vel.signum();
+        if let Some(target) = neighbor.clone()
+            && (commit_by_distance || commit_by_flick)
+        {
+            let target_x = if dir > 0 { -width } else { width };
+            let side = if dir > 0 { 1. } else { -1. };
+            self.project_slide = Some(SidebarSlide {
+                start_x: offset,
+                target_x,
+                v0: vel,
+                omega: 24.,
+                start: std::time::Instant::now(),
+                neighbor: Some((target.clone(), side)),
+                commit_target: Some(target),
+            });
+        } else {
+            let side = if dir > 0 { 1. } else { -1. };
+            self.project_slide = Some(SidebarSlide {
+                start_x: offset,
+                target_x: 0.,
+                v0: vel,
+                omega: 26.,
+                start: std::time::Instant::now(),
+                neighbor: neighbor.map(|p| (p, side)),
+                commit_target: None,
+            });
+        }
+        if notify_frame {
+            self.sidebar_frame.update(cx, |_, cx| cx.notify());
+        }
+    }
+    /// Commits a settled swipe target outside `Chrome::render` (zero re-entrant borrow).
+    pub(super) fn commit_sidebar_carousel_project(
+        &mut self,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target != self.workspace.project {
+            self.sidebar_swipe.skip_click_slide = true;
+            self.select_project(target, window, cx);
+            self.sidebar_swipe.skip_click_slide = false;
+        }
+    }
+    /// Advances the sidebar carousel before rendering a frame, returning any
+    /// settled swipe target to commit via `window.defer` outside `Chrome::render`.
+    pub(super) fn tick_sidebar_carousel(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if cx.reduce_motion() {
+            let commit = self
+                .project_slide
+                .take()
+                .and_then(|slide| slide.commit_target);
+            self.sidebar_swipe.drag_offset = 0.;
+            return commit;
+        }
+        // Fallback for non-trackpad horizontal wheels that never emit TouchPhase::Ended.
+        if self.sidebar_swipe.axis == SwipeAxis::Horizontal
+            && !self.sidebar_swipe.ignoring_momentum
             && self
                 .sidebar_swipe
                 .last_event
                 .is_some_and(|at| at.elapsed() > std::time::Duration::from_millis(120))
         {
-            let from_x = std::mem::replace(&mut self.sidebar_swipe.drag_offset, 0.);
-            self.project_slide = Some(SidebarSlide {
-                from_x,
-                from_opacity: 1.,
-                duration_secs: 0.16,
-                start: std::time::Instant::now(),
-            });
+            self.release_sidebar_swipe(false, cx);
         }
-        if self.sidebar_swipe.drag_offset.abs() > 0.1 {
-            return (self.sidebar_swipe.drag_offset, 1.);
-        }
-        match self.project_slide {
-            Some(slide) => {
-                let t = slide.start.elapsed().as_secs_f32() / slide.duration_secs.max(0.01);
-                if t >= 1. {
-                    self.project_slide = None;
-                    (0., 1.)
-                } else {
-                    // Expo-out cubic-bezier(0.16, 1, 0.3, 1), matching Sidebar.tsx's space slide.
-                    let eased = crate::reveal::bezier(t, 0.16, 1., 0.3, 1.);
-                    let x = slide.from_x * (1. - eased);
-                    let opacity = slide.from_opacity + (1. - slide.from_opacity) * eased;
-                    (x, opacity)
-                }
+        let now = std::time::Instant::now();
+        if let Some(slide) = &self.project_slide {
+            let (_, _, settled) = slide.sample(now);
+            if settled {
+                return self.project_slide.take().and_then(|s| s.commit_target);
             }
-            None => (0., 1.),
         }
+        None
     }
-    /// Port of React's `useProjectSwipe`: a horizontal trackpad swipe over the
-    /// left sidebar tracks fingers live (with edge rubber-banding) and glides
-    /// smoothly into the adjacent project in the bottom spaces bar once per gesture.
+    /// Returns `(current_offset_x, optional_neighbor_preview_and_x)` for the
+    /// dual-page sidebar carousel.
+    pub(super) fn sidebar_carousel_layout(&self, cx: &App) -> (f32, Option<(String, f32)>) {
+        if cx.reduce_motion() {
+            return (0., None);
+        }
+        let width = self.workspace.sidebar_width.max(160.);
+        if self.sidebar_swipe.axis == SwipeAxis::Horizontal
+            && self.sidebar_swipe.drag_offset.abs() > 0.1
+        {
+            let offset = self.sidebar_swipe.drag_offset;
+            let dir = if offset < 0. { 1isize } else { -1isize };
+            let side = if dir > 0 { 1. } else { -1. };
+            let neighbor = self
+                .adjacent_project_for_carousel(dir)
+                .map(|path| (path, offset + side * width));
+            return (offset, neighbor);
+        }
+        if let Some(slide) = &self.project_slide {
+            let (offset, _, settled) = slide.sample(std::time::Instant::now());
+            if settled {
+                return (0., None);
+            }
+            let neighbor = slide
+                .neighbor
+                .as_ref()
+                .map(|(path, side)| (path.clone(), offset + side * width));
+            return (offset, neighbor);
+        }
+        (0., None)
+    }
+    /// Lightweight, zero-I/O preview page for an adjacent project rendered
+    /// beside the active sidebar during a 120Hz dual-page carousel glide.
+    pub(super) fn sidebar_project_preview(&self, project: &str, _cx: &App) -> AnyElement {
+        let compact = self.workspace.compact_session_cards;
+        let paseo = crate::paseo_host::project_ui(&self.workspace.preferences);
+        let appearance = self.appearance(project);
+        let label = self.project_label(project);
+        let mut items: Vec<_> = self
+            .session_summaries
+            .values()
+            .filter(|s| {
+                !s.archived
+                    && s.cwd == project
+                    && !self.sidebar_hidden_sessions.contains(&s.id)
+                    && !self.started_by.contains_key(&s.id)
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        items.truncate(18);
+        let row_h = if compact { 32. } else { 42. };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_r_1()
+            .border_color(content(0.06))
+            .child(
+                div()
+                    .h(px(39.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .pb_px()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(28.))
+                            .px_1p5()
+                            .ml(px(-4.))
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(crate::project_settings::header_project_icon(
+                                &appearance,
+                                project,
+                            ))
+                            .child(div().min_w_0().truncate().child(label))
+                            .child(icon("chevron-down", 14.)),
+                    )
+                    .when(paseo, |d| {
+                        d.child(
+                            div()
+                                .h(px(28.))
+                                .px_2()
+                                .gap_1()
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .text_size(px(12.))
+                                .text_color(content(1.))
+                                .bg(content(0.1))
+                                .child(icon("plus", 14.))
+                                .child(crate::i18n::t("New chat")),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .px_2()
+                    .pt_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(items.into_iter().map(|s| {
+                        let title = if s.title.trim().is_empty() {
+                            crate::i18n::t("New chat")
+                        } else {
+                            s.title.clone()
+                        };
+                        div()
+                            .h(px(row_h))
+                            .flex_shrink_0()
+                            .px_2()
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(13.))
+                            .text_color(content(0.85))
+                            .child(provider_icon(&s.provider, 14.))
+                            .child(div().flex_1().min_w_0().truncate().child(title))
+                            .when(s.pinned, |d| {
+                                d.child(icon("pin", 11.).text_color(content(0.35)))
+                            })
+                    })),
+            )
+            .into_any_element()
+    }
+    /// Ardia / Arc-style 1:1 finger-locked horizontal trackpad swipe over the
+    /// left sidebar with velocity-preserving critically damped spring release.
     pub(super) fn handle_sidebar_project_swipe(
         &mut self,
         event: &gpui::ScrollWheelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        const GESTURE_IDLE: std::time::Duration = std::time::Duration::from_millis(220);
-        const CONSUMED_IDLE: std::time::Duration = std::time::Duration::from_millis(450);
-        const SWIPE_DISTANCE: f32 = 30.;
+        const MOMENTUM_RESET: std::time::Duration = std::time::Duration::from_millis(320);
 
         let now = std::time::Instant::now();
-        let idle = if self.sidebar_swipe.consumed {
-            CONSUMED_IDLE
-        } else {
-            GESTURE_IDLE
-        };
-        let fresh = matches!(event.touch_phase, gpui::TouchPhase::Started)
-            || self
+        if matches!(event.touch_phase, gpui::TouchPhase::Started) {
+            // If an earlier swipe was mid-commit, finish committing it immediately
+            // so rapid back-to-back flicks chain smoothly without dropping a step;
+            // otherwise catch an in-flight bounce/click spring mid-air.
+            let caught = match self.project_slide.take() {
+                Some(slide) => {
+                    let (pos, _, settled) = slide.sample(now);
+                    if let Some(target) = slide.commit_target {
+                        if target != self.workspace.project {
+                            self.sidebar_swipe.skip_click_slide = true;
+                            self.select_project(target, window, cx);
+                            self.sidebar_swipe.skip_click_slide = false;
+                        }
+                        0.
+                    } else if settled {
+                        0.
+                    } else {
+                        pos
+                    }
+                }
+                None => 0.,
+            };
+            self.sidebar_swipe = SidebarProjectSwipe {
+                last_event: Some(now),
+                raw_x: caught,
+                raw_y: 0.,
+                axis: if caught.abs() > 1. {
+                    SwipeAxis::Horizontal
+                } else {
+                    SwipeAxis::Pending
+                },
+                drag_offset: caught,
+                velocity_x: 0.,
+                ignoring_momentum: false,
+                skip_click_slide: false,
+            };
+        } else if self.sidebar_swipe.ignoring_momentum {
+            if self
                 .sidebar_swipe
                 .last_event
-                .is_none_or(|at| now.duration_since(at) > idle);
-        if fresh {
-            self.sidebar_swipe = SidebarProjectSwipe::default();
+                .is_some_and(|at| now.duration_since(at) > MOMENTUM_RESET)
+            {
+                self.sidebar_swipe.ignoring_momentum = false;
+                self.sidebar_swipe.axis = SwipeAxis::Pending;
+                self.sidebar_swipe.raw_x = 0.;
+                self.sidebar_swipe.raw_y = 0.;
+            } else {
+                self.sidebar_swipe.last_event = Some(now);
+                // Swallow macOS post-lift momentum so the vertical list never jitters.
+                return true;
+            }
         }
+
+        let prev_time = self.sidebar_swipe.last_event;
         self.sidebar_swipe.last_event = Some(now);
 
         if event.modifiers.control
@@ -7594,18 +7927,19 @@ impl Shell {
         }
 
         let delta = event.delta.pixel_delta(px(16.));
-        // GPUI exposes macOS NSEvent scrollingDeltaX/Y directly (opposite sign to DOM WheelEvent).
-        // Two-finger swipe left (content shifts left -> next project on the right) gives delta.x < 0.
-        self.sidebar_swipe.x += -delta.x.as_f32();
-        self.sidebar_swipe.y += -delta.y.as_f32();
+        // macOS scrollingDeltaX < 0 when fingers swipe left (content moves left, revealing right page).
+        let dx = delta.x.as_f32();
+        let dy = delta.y.as_f32();
+        self.sidebar_swipe.raw_x += dx;
+        self.sidebar_swipe.raw_y += dy;
 
         if self.sidebar_swipe.axis == SwipeAxis::Pending {
-            let ax = self.sidebar_swipe.x.abs();
-            let ay = self.sidebar_swipe.y.abs();
-            if ax.max(ay) < 10. {
+            let ax = self.sidebar_swipe.raw_x.abs();
+            let ay = self.sidebar_swipe.raw_y.abs();
+            if ax.max(ay) < 4. {
                 return false;
             }
-            self.sidebar_swipe.axis = if ax > ay * 1.5 {
+            self.sidebar_swipe.axis = if ax > ay * 1.4 {
                 SwipeAxis::Horizontal
             } else {
                 SwipeAxis::Reserved
@@ -7615,61 +7949,56 @@ impl Shell {
             }
         }
 
-        let index = projects
-            .iter()
-            .position(|path| path == &self.workspace.project);
-        let target = index.and_then(|ix| {
-            if self.sidebar_swipe.x > 0. {
-                ix.checked_add(1).and_then(|i| projects.get(i))
-            } else {
-                ix.checked_sub(1).and_then(|i| projects.get(i))
-            }
-        });
-
-        if !self.sidebar_swipe.consumed {
-            if matches!(event.touch_phase, gpui::TouchPhase::Ended) {
-                let from_x = std::mem::replace(&mut self.sidebar_swipe.drag_offset, 0.);
-                if from_x.abs() > 0.5 && !cx.reduce_motion() {
-                    self.project_slide = Some(SidebarSlide {
-                        from_x,
-                        from_opacity: 1.,
-                        duration_secs: 0.16,
-                        start: std::time::Instant::now(),
-                    });
-                    self.sidebar_frame.update(cx, |_, cx| cx.notify());
-                }
-            } else if self.sidebar_swipe.x.abs() >= SWIPE_DISTANCE {
-                if let Some(next) = target.cloned()
-                    && next != self.workspace.project
-                {
-                    self.sidebar_swipe.consumed = true;
-                    self.sidebar_swipe.drag_offset = 0.;
-                    self.sidebar_swipe.in_swipe_switch = true;
-                    self.select_project(next, window, cx);
-                    self.sidebar_swipe.in_swipe_switch = false;
-                    // Refresh timestamp after project switch completes so its work
-                    // never expires the momentum guard for trailing inertia events.
-                    self.sidebar_swipe.last_event = Some(std::time::Instant::now());
-                } else if !cx.reduce_motion() {
-                    // At the first/last project boundary: soft rubber-band resistance.
-                    let mag = self.sidebar_swipe.x.abs();
-                    self.sidebar_swipe.drag_offset =
-                        -self.sidebar_swipe.x.signum() * (1. - (-mag / 36.).exp()) * 16.;
-                    self.project_slide = None;
-                    self.sidebar_frame.update(cx, |_, cx| cx.notify());
-                }
-            } else if !cx.reduce_motion() {
-                // Live follow-finger lead-in before crossing the switch threshold.
-                self.sidebar_swipe.drag_offset = if target.is_some() {
-                    (-self.sidebar_swipe.x * 0.55).clamp(-24., 24.)
+        let width = self.workspace.sidebar_width.max(160.);
+        if matches!(event.touch_phase, gpui::TouchPhase::Ended) {
+            self.sidebar_swipe.ignoring_momentum = true;
+            if cx.reduce_motion() {
+                let offset = self.sidebar_swipe.drag_offset;
+                let vel = self.sidebar_swipe.velocity_x;
+                self.sidebar_swipe.drag_offset = 0.;
+                self.sidebar_swipe.axis = SwipeAxis::Pending;
+                let dir = if offset < 0. || (offset == 0. && vel < 0.) {
+                    1isize
                 } else {
-                    let mag = self.sidebar_swipe.x.abs();
-                    -self.sidebar_swipe.x.signum() * (1. - (-mag / 36.).exp()) * 16.
+                    -1isize
                 };
-                self.project_slide = None;
-                self.sidebar_frame.update(cx, |_, cx| cx.notify());
+                if (offset.abs() >= width * 0.25 || (vel.abs() >= 280. && offset.abs() >= 12.))
+                    && let Some(target) = self.adjacent_project_for_carousel(dir)
+                    && target != self.workspace.project
+                {
+                    self.select_project(target, window, cx);
+                }
+            } else {
+                self.release_sidebar_swipe(true, cx);
+            }
+            return true;
+        }
+
+        // Update exponential-moving-average finger velocity (px/s).
+        if let Some(prev) = prev_time {
+            let dt = now.duration_since(prev).as_secs_f32();
+            if dt > 0.0005 && dt < 0.12 {
+                let instant_v = dx / dt;
+                self.sidebar_swipe.velocity_x =
+                    self.sidebar_swipe.velocity_x * 0.45 + instant_v * 0.55;
+            } else if dt >= 0.12 {
+                self.sidebar_swipe.velocity_x = 0.;
             }
         }
+
+        // True 1:1 tracking when an adjacent project exists, Apple rubber-band at edges.
+        let dir = if self.sidebar_swipe.raw_x < 0. {
+            1isize
+        } else {
+            -1isize
+        };
+        let has_neighbor = self.adjacent_project_for_carousel(dir).is_some();
+        self.sidebar_swipe.drag_offset = if has_neighbor {
+            self.sidebar_swipe.raw_x.clamp(-width, width)
+        } else {
+            rubber_band(self.sidebar_swipe.raw_x, width)
+        };
+        self.sidebar_frame.update(cx, |_, cx| cx.notify());
         true
     }
     pub(super) fn sidebar_project_swipe_capture(&self, cx: &Context<Self>) -> AnyElement {
@@ -7741,7 +8070,7 @@ impl Shell {
             return self.classic_sidebar(cx);
         }
         self.refresh_sidebar_structure(cx);
-        let (slide_x, slide_opacity) = self.sidebar_slide_transform(cx);
+        let (slide_x, neighbor_page) = self.sidebar_carousel_layout(cx);
         let live_agents = self.live_agents_preview(cx);
         div()
             .id("monocode-sidebar")
@@ -7766,188 +8095,209 @@ impl Shell {
             .flex_col()
             .child(self.sidebar_project_swipe_capture(cx))
             .child(
-                div().flex_1().min_h_0().overflow_hidden().child(
-                    div()
-                        .relative()
-                        .size_full()
-                        .left(px(slide_x))
-                        .opacity(slide_opacity)
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(39.))
-                                .flex_shrink_0()
-                                .px_3()
-                                .pb_px()
-                                .relative()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div().flex_1().min_w_0().flex().items_center().child(
-                                        div()
-                                            .id("workspace-project")
-                                            .when(
-                                                crate::paseo_host::project_ui(
-                                                    &self.workspace.preferences,
-                                                ),
-                                                |d| d.flex_1(),
-                                            )
-                                            .debug_selector(|| "sidebar-project-button".into())
-                                            .relative()
-                                            .role(Role::Button)
-                                            .aria_label(format!(
-                                                "Switch project, {}",
-                                                self.project_label(&self.workspace.project)
-                                            ))
-                                            .aria_description(self.workspace.project.clone())
-                                            .aria_expanded(self.menu_open(&MenuTarget::Header))
-                                            .cursor_pointer()
-                                            .h(px(28.))
-                                            // The whole picker shares Search's left edge.
-                                            .px_1p5()
-                                            .ml(px(-4.))
-                                            .rounded_md()
-                                            .max_w_full()
-                                            .hover(|s| s.bg(content(0.08)))
-                                            .when(self.menu_open(&MenuTarget::Header), |d| {
-                                                d.bg(content(0.08))
-                                            })
-                                            .min_w_0()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(crate::project_settings::header_project_icon(
-                                                &self.appearance(&self.workspace.project),
-                                                &self.workspace.project,
-                                            ))
-                                            .child(
-                                                div().min_w_0().truncate().child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .relative()
+                            .size_full()
+                            .left(px(slide_x))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .h(px(39.))
+                                    .flex_shrink_0()
+                                    .px_3()
+                                    .pb_px()
+                                    .relative()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div().flex_1().min_w_0().flex().items_center().child(
+                                            div()
+                                                .id("workspace-project")
+                                                .when(
+                                                    crate::paseo_host::project_ui(
+                                                        &self.workspace.preferences,
+                                                    ),
+                                                    |d| d.flex_1(),
+                                                )
+                                                .debug_selector(|| "sidebar-project-button".into())
+                                                .relative()
+                                                .role(Role::Button)
+                                                .aria_label(format!(
+                                                    "Switch project, {}",
+                                                    self.project_label(&self.workspace.project)
+                                                ))
+                                                .aria_description(self.workspace.project.clone())
+                                                .aria_expanded(self.menu_open(&MenuTarget::Header))
+                                                .cursor_pointer()
+                                                .h(px(28.))
+                                                // The whole picker shares Search's left edge.
+                                                .px_1p5()
+                                                .ml(px(-4.))
+                                                .rounded_md()
+                                                .max_w_full()
+                                                .hover(|s| s.bg(content(0.08)))
+                                                .when(self.menu_open(&MenuTarget::Header), |d| {
+                                                    d.bg(content(0.08))
+                                                })
+                                                .min_w_0()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(
+                                                    crate::project_settings::header_project_icon(
+                                                        &self.appearance(&self.workspace.project),
+                                                        &self.workspace.project,
+                                                    ),
+                                                )
+                                                .child(div().min_w_0().truncate().child(
                                                     self.project_label(&self.workspace.project),
-                                                ),
+                                                ))
+                                                .when_some(
+                                                    self.worktree_focus
+                                                        .get(&self.workspace.project),
+                                                    |d, focus| {
+                                                        d.child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .font_weight(FontWeight::NORMAL)
+                                                                .text_color(content(0.45))
+                                                                .child(
+                                                                    focus
+                                                                        .branch
+                                                                        .clone()
+                                                                        .unwrap_or_else(|| {
+                                                                            "detached".into()
+                                                                        }),
+                                                                ),
+                                                        )
+                                                    },
+                                                )
+                                                .child(icon("chevron-down", 14.))
+                                                .child(self.project_anchor.probe())
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if this.menu_open(&MenuTarget::Header) {
+                                                        this.close_menu(cx);
+                                                    } else {
+                                                        let anchor = Anchor::Slot(
+                                                            this.project_anchor.clone(),
+                                                        );
+                                                        this.open_menu(
+                                                            MenuTarget::Header,
+                                                            anchor,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                })),
+                                        ),
+                                    )
+                                    .when(
+                                        crate::paseo_host::project_ui(&self.workspace.preferences),
+                                        |d| {
+                                            d.child(
+                                                div()
+                                                    .id("sidebar-new-chat")
+                                                    .debug_selector(|| "sidebar-new-chat".into())
+                                                    .role(Role::Button)
+                                                    .aria_label("New chat")
+                                                    .cursor(CursorStyle::Arrow)
+                                                    .h(px(28.))
+                                                    .px_2()
+                                                    .gap_1()
+                                                    .rounded_md()
+                                                    .flex()
+                                                    .items_center()
+                                                    .text_size(px(12.))
+                                                    .text_color(content(1.))
+                                                    .bg(content(0.1))
+                                                    .hover(|s| s.bg(content(0.18)))
+                                                    .child(icon("plus", 14.))
+                                                    .child(crate::i18n::t("New chat"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.new_chat(cx)
+                                                    })),
                                             )
-                                            .when_some(
-                                                self.worktree_focus.get(&self.workspace.project),
-                                                |d, focus| {
-                                                    d.child(
-                                                        div()
-                                                            .min_w_0()
-                                                            .truncate()
-                                                            .font_weight(FontWeight::NORMAL)
-                                                            .text_color(content(0.45))
-                                                            .child(
-                                                                focus
-                                                                    .branch
-                                                                    .clone()
-                                                                    .unwrap_or_else(|| {
-                                                                        "detached".into()
-                                                                    }),
-                                                            ),
-                                                    )
-                                                },
-                                            )
-                                            .child(icon("chevron-down", 14.))
-                                            .child(self.project_anchor.probe())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if this.menu_open(&MenuTarget::Header) {
+                                        },
+                                    )
+                                    .when(self.workspace.sidebar_search_visible, |d| {
+                                        d.child(
+                                            icon_button("sidebar-search", "Search", "search")
+                                                .debug_selector(|| "sidebar-search-button".into())
+                                                .when(self.app_search.is_some(), |d| {
+                                                    d.bg(content(0.1))
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if this.app_search.is_some() {
+                                                        this.close_app_search(window, cx)
+                                                    } else {
+                                                        this.focus_search(window, cx)
+                                                    }
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        icon_button(
+                                            "sidebar-options",
+                                            "Sidebar options",
+                                            "more-horizontal",
+                                        )
+                                        .debug_selector(|| "sidebar-options".into())
+                                        .aria_expanded(self.menu_open(&MenuTarget::SidebarOptions))
+                                        .relative()
+                                        .child(self.sidebar_options_anchor.probe())
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                if this.menu_open(&MenuTarget::SidebarOptions) {
                                                     this.close_menu(cx);
                                                 } else {
-                                                    let anchor =
-                                                        Anchor::Slot(this.project_anchor.clone());
                                                     this.open_menu(
-                                                        MenuTarget::Header,
-                                                        anchor,
+                                                        MenuTarget::SidebarOptions,
+                                                        Anchor::Slot(
+                                                            this.sidebar_options_anchor.clone(),
+                                                        ),
                                                         window,
                                                         cx,
                                                     );
                                                 }
-                                            })),
+                                            }),
+                                        ),
                                     ),
-                                )
-                                .when(
-                                    crate::paseo_host::project_ui(&self.workspace.preferences),
-                                    |d| {
-                                        d.child(
-                                            div()
-                                                .id("sidebar-new-chat")
-                                                .debug_selector(|| "sidebar-new-chat".into())
-                                                .role(Role::Button)
-                                                .aria_label("New chat")
-                                                .cursor(CursorStyle::Arrow)
-                                                .h(px(28.))
-                                                .px_2()
-                                                .gap_1()
-                                                .rounded_md()
-                                                .flex()
-                                                .items_center()
-                                                .text_size(px(12.))
-                                                .text_color(content(1.))
-                                                .bg(content(0.1))
-                                                .hover(|s| s.bg(content(0.18)))
-                                                .child(icon("plus", 14.))
-                                                .child(crate::i18n::t("New chat"))
-                                                .on_click(
-                                                    cx.listener(|this, _, _, cx| this.new_chat(cx)),
-                                                ),
-                                        )
-                                    },
-                                )
-                                .when(self.workspace.sidebar_search_visible, |d| {
-                                    d.child(
-                                        icon_button("sidebar-search", "Search", "search")
-                                            .debug_selector(|| "sidebar-search-button".into())
-                                            .when(self.app_search.is_some(), |d| d.bg(content(0.1)))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if this.app_search.is_some() {
-                                                    this.close_app_search(window, cx)
-                                                } else {
-                                                    this.focus_search(window, cx)
-                                                }
-                                            })),
-                                    )
-                                })
-                                .child(
-                                    icon_button(
-                                        "sidebar-options",
-                                        "Sidebar options",
-                                        "more-horizontal",
-                                    )
-                                    .debug_selector(|| "sidebar-options".into())
-                                    .aria_expanded(self.menu_open(&MenuTarget::SidebarOptions))
-                                    .relative()
-                                    .child(self.sidebar_options_anchor.probe())
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| {
-                                            if this.menu_open(&MenuTarget::SidebarOptions) {
-                                                this.close_menu(cx);
-                                            } else {
-                                                this.open_menu(
-                                                    MenuTarget::SidebarOptions,
-                                                    Anchor::Slot(
-                                                        this.sidebar_options_anchor.clone(),
-                                                    ),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        },
-                                    )),
-                                ),
-                        )
-                        .child(self.virtual_sidebar(cx))
-                        .children(live_agents)
-                        .child(self.app_update_footer(cx))
-                        // The Focused layout has no project rail footer to hold it.
-                        .when(!self.workspace.classic_layout, |d| {
-                            d.children(
-                                self.github_star_prompt(cx)
-                                    .map(|prompt| div().mx_2().my_2().child(prompt)),
                             )
-                        }),
-                ),
+                            .child(self.virtual_sidebar(cx))
+                            .children(live_agents)
+                            .child(self.app_update_footer(cx))
+                            // The Focused layout has no project rail footer to hold it.
+                            .when(!self.workspace.classic_layout, |d| {
+                                d.children(
+                                    self.github_star_prompt(cx)
+                                        .map(|prompt| div().mx_2().my_2().child(prompt)),
+                                )
+                            }),
+                    )
+                    .when_some(neighbor_page, |d, (neighbor_path, neighbor_x)| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(px(neighbor_x))
+                                .w_full()
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .child(self.sidebar_project_preview(&neighbor_path, cx)),
+                        )
+                    }),
             )
             .when(!self.workspace.classic_layout, |d| {
                 d.child(self.project_spaces(cx))
@@ -8104,7 +8454,7 @@ impl Shell {
                     .gap_1()
                     .child(self.space_reorder.strip.probe())
                     .children(projects.into_iter().map(|(ix, path)| {
-                        let active = path == self.workspace.project;
+                        let active = path == self.carousel_active_project();
                         let hovered = self.hovered_space.as_ref() == Some(&path);
                         let dragging = self.space_reorder.dragging(&path);
                         let offset = self.space_reorder.offset(&path, ix, first);

@@ -2314,22 +2314,50 @@ mod tests {
             "/work/proj-a"
         );
 
-        // Swipe left (dx < 0) switches proj-a -> proj-b once, triggers right-to-left slide-in,
-        // and ignores long momentum tail.
+        // 1. Live 1:1 finger tracking left reveals proj-b right beside proj-a without committing yet.
         wheel(visual, TouchPhase::Started, -16., 0.);
-        wheel(visual, TouchPhase::Moved, -20., 1.);
+        wheel(visual, TouchPhase::Moved, -70., 0.);
         window
-            .read_with(visual, |s, _| {
-                assert_eq!(s.workspace.project, "/work/proj-b");
+            .read_with(visual, |s, cx| {
+                assert_eq!(s.workspace.project, "/work/proj-a");
+                let (offset, neighbor) = s.sidebar_carousel_layout(cx);
                 assert!(
-                    s.project_slide.is_some_and(|slide| slide.from_x > 0.),
-                    "swiping to next project should start slide-in from the right"
+                    (offset - (-86.)).abs() < 1.,
+                    "live 1:1 finger tracking offset={offset}"
                 );
+                let (path, nx) = neighbor.expect("adjacent project preview rendered beside active");
+                assert_eq!(path, "/work/proj-b");
+                assert!(nx > 0.);
             })
             .unwrap();
-        wheel(visual, TouchPhase::Moved, -45., 0.);
-        wheel(visual, TouchPhase::Ended, -30., 0.);
-        wheel(visual, TouchPhase::Moved, -40., 0.);
+
+        // 2. Lifting fingers past 25% starts critically damped commit spring to proj-b,
+        //    highlighting proj-b immediately and ignoring post-lift macOS momentum tail.
+        wheel(visual, TouchPhase::Ended, 0., 0.);
+        wheel(visual, TouchPhase::Moved, -90., 0.);
+        wheel(visual, TouchPhase::Moved, -80., 0.);
+        window
+            .read_with(visual, |s, _| {
+                assert_eq!(
+                    s.project_slide
+                        .as_ref()
+                        .and_then(|sl| sl.commit_target.as_deref()),
+                    Some("/work/proj-b")
+                );
+                assert_eq!(s.carousel_active_project(), "/work/proj-b");
+            })
+            .unwrap();
+        // Fast-forward spring start and tick frame -> lands seamlessly on proj-b (never proj-c!).
+        window
+            .update(visual, |s, w, cx| {
+                if let Some(sl) = &mut s.project_slide {
+                    sl.start = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                }
+                if let Some(target) = s.tick_sidebar_carousel(cx) {
+                    s.commit_sidebar_carousel_project(target, w, cx);
+                }
+            })
+            .unwrap();
         assert_eq!(
             window
                 .read_with(visual, |s, _| s.workspace.project.clone())
@@ -2337,26 +2365,37 @@ mod tests {
             "/work/proj-b"
         );
 
-        // New gesture swiping right (dx > 0) switches back proj-b -> proj-a with left slide-in,
-        // and at boundary applies bounded rubber-band offset without wrapping.
+        // 3. New gesture dragging right >25% commits back proj-b -> proj-a.
         wheel(visual, TouchPhase::Started, 20., 0.);
-        wheel(visual, TouchPhase::Moved, 20., 0.);
+        wheel(visual, TouchPhase::Moved, 70., 0.);
+        wheel(visual, TouchPhase::Ended, 0., 0.);
         window
-            .read_with(visual, |s, _| {
-                assert_eq!(s.workspace.project, "/work/proj-a");
-                assert!(
-                    s.project_slide.is_some_and(|slide| slide.from_x < 0.),
-                    "swiping to previous project should start slide-in from the left"
-                );
+            .update(visual, |s, w, cx| {
+                if let Some(sl) = &mut s.project_slide {
+                    sl.start = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                }
+                if let Some(target) = s.tick_sidebar_carousel(cx) {
+                    s.commit_sidebar_carousel_project(target, w, cx);
+                }
             })
             .unwrap();
-        wheel(visual, TouchPhase::Started, 40., 0.);
+        assert_eq!(
+            window
+                .read_with(visual, |s, _| s.workspace.project.clone())
+                .unwrap(),
+            "/work/proj-a"
+        );
+
+        // 4. Over-scrolling past the leftmost boundary applies Apple rubber-band resistance
+        //    and springs back cleanly on release without switching.
+        wheel(visual, TouchPhase::Started, 80., 0.);
         window
             .read_with(visual, |s, _| {
                 assert_eq!(s.workspace.project, "/work/proj-a");
                 assert!(
-                    s.sidebar_swipe.drag_offset > 0. && s.sidebar_swipe.drag_offset <= 16.,
-                    "boundary swipe should show soft rubber-band feedback"
+                    s.sidebar_swipe.drag_offset > 0. && s.sidebar_swipe.drag_offset < 80.,
+                    "boundary swipe should apply rubber-band damping: {}",
+                    s.sidebar_swipe.drag_offset
                 );
             })
             .unwrap();
@@ -2364,7 +2403,11 @@ mod tests {
         window
             .read_with(visual, |s, _| {
                 assert_eq!(s.sidebar_swipe.drag_offset, 0.);
-                assert!(s.project_slide.is_some());
+                assert!(
+                    s.project_slide
+                        .as_ref()
+                        .is_some_and(|sl| sl.commit_target.is_none())
+                );
             })
             .unwrap();
     }
