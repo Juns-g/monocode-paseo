@@ -71,7 +71,25 @@ pub(crate) fn bind(cx: &mut App) {
 }
 #[derive(Clone, Debug, PartialEq, gpui::Action)]
 #[action(namespace = file_editor, no_json)]
-pub(crate) struct OpenPath(pub String);
+pub(crate) struct OpenPath {
+    pub path: String,
+    /// Trusted source conversation/project cwd that initiated the link click.
+    pub source_cwd: Option<String>,
+}
+impl OpenPath {
+    pub(crate) fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            source_cwd: None,
+        }
+    }
+    pub(crate) fn scoped(path: impl Into<String>, source_cwd: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            source_cwd: Some(source_cwd.into()),
+        }
+    }
+}
 
 /// File links may include a one-based line and column (`:12:4` or `#L12`).
 pub(crate) fn file_location(raw: &str, cwd: &str) -> (String, Option<(usize, usize)>) {

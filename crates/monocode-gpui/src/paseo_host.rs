@@ -82,6 +82,56 @@ pub(crate) fn local_file(
         .then_some(remote.host_path)
 }
 
+/// Resolution outcome for opening a file path from a trusted source conversation/project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpenFileResolution {
+    /// Convert a local Paseo `remote://<mac>/...` path to a local Mac filesystem path.
+    LocalMac(String),
+    /// Keep the path as-is (relative to the current project or same-host remote path).
+    Keep,
+    /// Refuse cross-host/local-Mac file access initiated from a remote Devbox session.
+    Blocked(&'static str),
+}
+
+/// Enforces host isolation on file links: a remote Devbox session may NEVER
+/// resolve a link onto this Mac's local filesystem (even if the link itself
+/// declares the local Mac `serverId`, `file://`, or a bare absolute `/path`).
+pub(crate) fn resolve_open_file(
+    enabled: bool,
+    expected: &str,
+    endpoint: &str,
+    source_cwd: &str,
+    raw: &str,
+) -> OpenFileResolution {
+    let source_remote = monocode_core::remote::parse_remote_path(source_cwd);
+    let source_is_foreign_remote = source_remote.as_ref().is_some_and(|src| {
+        !(enabled && !expected.is_empty() && src.environment_id == expected && loopback(endpoint))
+    });
+    if source_is_foreign_remote {
+        let src_env = source_remote
+            .as_ref()
+            .map(|r| r.environment_id.as_str())
+            .unwrap_or("");
+        if let Some(target_remote) = monocode_core::remote::parse_remote_path(raw) {
+            if target_remote.environment_id != src_env {
+                return OpenFileResolution::Blocked(
+                    "Remote sessions cannot open files from another host.",
+                );
+            }
+            return OpenFileResolution::Keep;
+        }
+        let stripped = raw.strip_prefix("file://").unwrap_or(raw);
+        if raw.starts_with("file://") || stripped.starts_with('/') {
+            return OpenFileResolution::Blocked("Remote sessions cannot open local Mac files.");
+        }
+        return OpenFileResolution::Keep;
+    }
+    if let Some(local) = local_file(enabled, expected, endpoint, raw) {
+        return OpenFileResolution::LocalMac(local);
+    }
+    OpenFileResolution::Keep
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum StatusBucket {
     NeedsInput,

@@ -189,6 +189,20 @@ fn compact(text: String) -> String {
     text.replace(' ', "")
 }
 
+#[derive(Clone, Default)]
+struct PaseoHostUsageCache {
+    sources: Vec<PaseoUsageSource>,
+    updated_at: Option<i64>,
+    attempted: Option<Instant>,
+    error: Option<String>,
+}
+
+fn paseo_host_key(project: &str) -> String {
+    monocode_core::remote::parse_remote_path(project)
+        .map(|p| p.environment_id)
+        .unwrap_or_default()
+}
+
 #[derive(Default)]
 pub(super) struct PaseoUsageState {
     pub(super) sources: Vec<PaseoUsageSource>,
@@ -196,6 +210,9 @@ pub(super) struct PaseoUsageState {
     pub(super) fetching: bool,
     pub(super) attempted: Option<Instant>,
     pub(super) error: Option<String>,
+    active_host: Option<String>,
+    by_host: std::collections::HashMap<String, PaseoHostUsageCache>,
+    request_gen: u64,
     #[cfg(test)]
     pub(super) test_client: Option<(std::sync::Arc<monocode_core::remote::Connections>, String)>,
 }
@@ -240,6 +257,42 @@ impl UsageFooter {
             .map(|u| u.clamp(0., 100.))
     }
 
+    /// Swap cached Paseo usage state when switching between Paseo hosts (`serverId`).
+    /// Bumps `request_gen` so any slow in-flight fetch from the previous host is discarded.
+    pub(super) fn switch_paseo_host(&mut self, project: &str, cx: &mut Context<Self>) {
+        let next = paseo_host_key(project);
+        let state = &mut self.paseo;
+        if state.active_host.as_deref() == Some(next.as_str()) {
+            return;
+        }
+        if let Some(prev) = state.active_host.take() {
+            state.by_host.insert(
+                prev,
+                PaseoHostUsageCache {
+                    sources: std::mem::take(&mut state.sources),
+                    updated_at: state.updated_at.take(),
+                    attempted: state.attempted.take(),
+                    error: state.error.take(),
+                },
+            );
+        } else {
+            state.sources.clear();
+            state.updated_at = None;
+            state.attempted = None;
+            state.error = None;
+        }
+        if let Some(cached) = state.by_host.remove(&next) {
+            state.sources = cached.sources;
+            state.updated_at = cached.updated_at;
+            state.attempted = cached.attempted;
+            state.error = cached.error;
+        }
+        state.active_host = Some(next);
+        state.fetching = false;
+        state.request_gen = state.request_gen.wrapping_add(1);
+        cx.notify();
+    }
+
     pub(super) fn refresh_paseo(&mut self, force: bool, cx: &mut Context<Self>) {
         #[cfg(test)]
         let injected = self.paseo.test_client.clone();
@@ -247,6 +300,10 @@ impl UsageFooter {
         let injected: Option<(std::sync::Arc<monocode_core::remote::Connections>, String)> = None;
         if cfg!(test) && injected.is_none() {
             return;
+        }
+        let host_key = paseo_host_key(&self.project);
+        if self.paseo.active_host.as_deref() != Some(host_key.as_str()) {
+            self.switch_paseo_host(&self.project.clone(), cx);
         }
         let now = usage::now_ms();
         let state = &mut self.paseo;
@@ -272,12 +329,17 @@ impl UsageFooter {
         let (client, machine) = match resolved {
             Ok(value) => value,
             Err(error) => {
+                state.sources.clear();
+                state.updated_at = None;
                 state.error = Some(error);
                 cx.notify();
                 return;
             }
         };
         state.fetching = true;
+        state.request_gen = state.request_gen.wrapping_add(1);
+        let expected_gen = state.request_gen;
+        let expected_host = host_key;
         let work = cx.background_executor().spawn(async move {
             client
                 .request(&machine, "paseo.usage", json!({"forceRefresh": force}))
@@ -287,6 +349,11 @@ impl UsageFooter {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 let state = &mut this.paseo;
+                if state.request_gen != expected_gen
+                    || state.active_host.as_deref() != Some(expected_host.as_str())
+                {
+                    return;
+                }
                 state.fetching = false;
                 match result {
                     Ok(sources) => {
@@ -877,14 +944,25 @@ fn resolve(
     project: &str,
 ) -> Result<(std::sync::Arc<monocode_core::remote::Connections>, String), String> {
     let connections = monocode_core::remote::default_connections()?;
-    let environment = monocode_core::remote::parse_remote_path(project).map(|p| p.environment_id);
-    let machine = match environment {
-        Some(environment) => connections.machine_for_environment(&environment).ok(),
-        None => None,
+    resolve_with(&connections, project).map(|machine| (connections, machine))
+}
+
+fn resolve_with(
+    connections: &monocode_core::remote::Connections,
+    project: &str,
+) -> Result<String, String> {
+    if let Some(remote) = monocode_core::remote::parse_remote_path(project) {
+        return connections
+            .machine_for_environment(&remote.environment_id)
+            .map(|machine| machine.id)
+            .map_err(|_| format!("Paseo host {} is not connected", remote.environment_id));
     }
-    .or_else(|| connections.list().ok().and_then(|m| m.into_iter().next()))
-    .ok_or_else(|| "No Paseo host is connected".to_owned())?;
-    Ok((connections, machine.id))
+    connections
+        .list()
+        .ok()
+        .and_then(|m| m.into_iter().next())
+        .map(|machine| machine.id)
+        .ok_or_else(|| "No Paseo host is connected".to_owned())
 }
 
 #[cfg(test)]
@@ -1132,5 +1210,51 @@ mod tests {
             })
             .unwrap();
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn resolve_with_never_falls_back_to_another_host_when_remote_env_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "paseo-usage-resolve-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let connections = monocode_core::remote::Connections::new(&dir);
+        let err = resolve_with(&connections, "remote://devbox-boe/home/me/app").unwrap_err();
+        assert!(err.contains("devbox-boe"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn switching_paseo_host_isolates_snapshots_and_throttle_state(cx: &mut gpui::TestAppContext) {
+        let footer = cx.new(|cx| {
+            let mut f = UsageFooter::new(Kind::Codex, cx);
+            f.paseo_mode = true;
+            f
+        });
+        footer.update(cx, |f, cx| {
+            f.switch_paseo_host("remote://mac-local/Users/me/repo", cx);
+            f.paseo.sources = vec![PaseoUsageSource {
+                id: "mac-cx".into(),
+                source_id: "codex".into(),
+                source_label: "Codex".into(),
+                status: "available".into(),
+                ..Default::default()
+            }];
+            f.paseo.attempted = Some(Instant::now());
+            f.paseo.updated_at = Some(T0);
+
+            // Switch to devbox-boe: Mac's snapshot and throttle must NOT carry over.
+            f.switch_paseo_host("remote://devbox-boe/home/me/repo", cx);
+            assert!(f.paseo.sources.is_empty());
+            assert!(f.paseo.attempted.is_none());
+            assert!(f.paseo.updated_at.is_none());
+            assert_eq!(f.paseo.active_host.as_deref(), Some("devbox-boe"));
+
+            // Switch back to mac-local: Mac's cached snapshot returns intact.
+            f.switch_paseo_host("remote://mac-local/Users/me/repo", cx);
+            assert_eq!(f.paseo.sources.len(), 1);
+            assert_eq!(f.paseo.sources[0].id, "mac-cx");
+        });
     }
 }

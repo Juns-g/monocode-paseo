@@ -188,6 +188,9 @@ pub struct TurnInfo {
     /// Paseo canonical user message ID for native rewind (`agent.rewind.request`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paseo_message_id: Option<String>,
+    /// True when the Paseo adapter truncated this user prompt at the 32 KB display cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paseo_truncated: bool,
     pub provider_turn_id: Option<String>,
     pub provider: String,
     pub model: String,

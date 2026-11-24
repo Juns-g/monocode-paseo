@@ -584,6 +584,10 @@ export function readFilePreview(
 export type FileMtime = {
   path: string;
   mtimeMs: number | null;
+  mtimeNs?: string | null;
+  ctimeNs?: string | null;
+  size?: number | null;
+  ino?: string | null;
 };
 
 export function statFiles(paths: string[]): Promise<FileMtime[]> {

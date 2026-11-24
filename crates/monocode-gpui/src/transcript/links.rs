@@ -137,7 +137,13 @@ impl TranscriptView {
                     || path.clone(),
                     |(line, column)| format!("{path}:{line}:{column}"),
                 );
-                window.dispatch_action(Box::new(crate::file_editor::OpenPath(target)), cx);
+                window.dispatch_action(
+                    Box::new(crate::file_editor::OpenPath {
+                        path: target,
+                        source_cwd: self.file_link_base.clone(),
+                    }),
+                    cx,
+                );
             }
             ("copy-path", Target::File { path, .. }) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(path.clone()))
@@ -146,6 +152,12 @@ impl TranscriptView {
                 ClipboardItem::new_string(files::display_path(path, base.as_deref())),
             ),
             ("open-default" | "reveal", Target::File { path, .. }) => {
+                if let Some(base) = self.file_link_base.as_deref()
+                    && base.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX)
+                    && !path.starts_with(base)
+                {
+                    return;
+                }
                 let path = path.clone();
                 let external = action == "open-default";
                 let work = cx.background_executor().spawn(async move {

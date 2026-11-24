@@ -7,6 +7,9 @@ use std::collections::HashMap;
 pub(super) struct PendingRewind {
     pub(super) message_id: String,
     pub(super) text: String,
+    /// False when the original prompt has image attachments or was truncated at 32 KB;
+    /// destructive modes ("conversation" / "both") are disabled to prevent content loss.
+    pub(super) can_restore_prompt: bool,
     pub(super) focus: gpui::FocusHandle,
 }
 
@@ -1060,6 +1063,16 @@ impl Conversation {
     pub(super) fn release_remote_snapshot(&mut self) {
         self.remote_state.snapshot = None;
     }
+    pub(super) fn has_pending_follow_ups(&self) -> bool {
+        !self.follow_ups.state.messages.is_empty()
+            || self.follow_ups.sending.is_some()
+            || self.follow_ups.resuming
+    }
+    pub(super) fn sync_paseo_rewind_enabled(&mut self, cx: &mut Context<Self>) {
+        let can_rewind = self.can_paseo_rewind();
+        self.transcript
+            .update(cx, |v, cx| v.set_paseo_rewind_enabled(can_rewind, cx));
+    }
     pub(super) fn can_paseo_rewind(&self) -> bool {
         self.paseo_controls()
             && self.remote_state.capabilities.contains("paseo.rewind")
@@ -1070,6 +1083,7 @@ impl Conversation {
             && !self.stopping
             && self.remote_state.online
             && !self.remote_state.pending
+            && !self.has_pending_follow_ups()
             && !self.needs_approval()
             && self.questions.is_empty()
     }
@@ -1077,6 +1091,7 @@ impl Conversation {
         &mut self,
         message_id: String,
         text: String,
+        can_restore_prompt: bool,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
@@ -1084,7 +1099,14 @@ impl Conversation {
             return;
         }
         if !self.can_paseo_rewind() {
-            if self.busy || self.stopping || self.needs_approval() || !self.questions.is_empty() {
+            if self.has_pending_follow_ups() {
+                self.status = crate::i18n::t("Clear or send queued messages before rewinding.");
+                cx.notify();
+            } else if self.busy
+                || self.stopping
+                || self.needs_approval()
+                || !self.questions.is_empty()
+            {
                 self.status =
                     crate::i18n::t("Paseo session is busy or state changed; rewind cancelled.");
                 cx.notify();
@@ -1101,6 +1123,7 @@ impl Conversation {
         self.remote_state.rewind_confirm = Some(PendingRewind {
             message_id,
             text,
+            can_restore_prompt,
             focus,
         });
         cx.notify();
@@ -1129,11 +1152,24 @@ impl Conversation {
     pub(super) fn execute_paseo_rewind(&mut self, mode: &'static str, cx: &mut Context<Self>) {
         if !self.can_paseo_rewind() || !self.remote_state.rewind_modes.iter().any(|m| m == mode) {
             self.remote_state.rewind_confirm = None;
-            self.status =
-                crate::i18n::t("Paseo session is busy or state changed; rewind cancelled.");
-            let can_rewind = self.can_paseo_rewind();
-            self.transcript
-                .update(cx, |v, cx| v.set_paseo_rewind_enabled(can_rewind, cx));
+            self.status = if self.has_pending_follow_ups() {
+                crate::i18n::t("Clear or send queued messages before rewinding.")
+            } else {
+                crate::i18n::t("Paseo session is busy or state changed; rewind cancelled.")
+            };
+            self.sync_paseo_rewind_enabled(cx);
+            cx.notify();
+            return;
+        }
+        let can_restore_prompt = self
+            .remote_state
+            .rewind_confirm
+            .as_ref()
+            .is_some_and(|p| p.can_restore_prompt);
+        if !can_restore_prompt && matches!(mode, "conversation" | "both") {
+            self.status = crate::i18n::t(
+                "This message contains images or truncated text; rewind files only or rewind in Paseo.",
+            );
             cx.notify();
             return;
         }
@@ -2117,6 +2153,7 @@ mod rewind_tests {
                 view.open_paseo_rewind_confirm(
                     "pm-2".into(),
                     "Prompt 2 to rewind".into(),
+                    true,
                     None,
                     cx,
                 );
@@ -2151,7 +2188,7 @@ mod rewind_tests {
             view.update(cx, |view, cx| {
                 view.input
                     .update(cx, |input, cx| input.set_text(String::new(), cx));
-                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), None, cx);
+                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), true, None, cx);
                 view.execute_paseo_rewind("files", cx);
             });
         });
@@ -2160,13 +2197,50 @@ mod rewind_tests {
             assert_eq!(view.read(cx).input.read(cx).content, "");
         });
 
+        // 2b. Unrestorable prompt (images / truncated >32KB): refuses "conversation" & "both"
+        //     with zero RPC mutations, while still allowing "files" only!
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), false, None, cx);
+                assert!(view.remote_state.rewind_confirm.is_some());
+                view.execute_paseo_rewind("conversation", cx);
+                assert!(view.remote_state.rewind_confirm.is_some());
+                view.execute_paseo_rewind("both", cx);
+                assert!(view.remote_state.rewind_confirm.is_some());
+                view.close_paseo_rewind_confirm(cx);
+            });
+        });
+        assert_eq!(rewinds.lock().unwrap().len(), 2);
+
+        // 2c. Pending/paused local follow-up queue blocks opening and executing rewind!
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.follow_ups
+                    .state
+                    .messages
+                    .push(monocode_core::follow_up::Message {
+                        id: "q-1".into(),
+                        text: "Queued follow-up".into(),
+                        ..Default::default()
+                    });
+                view.follow_ups.state.paused = true;
+                assert!(!view.can_paseo_rewind());
+                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), true, None, cx);
+                assert!(view.remote_state.rewind_confirm.is_none());
+                view.follow_ups.state.messages.clear();
+                view.follow_ups.state.paused = false;
+                assert!(view.can_paseo_rewind());
+            });
+        });
+        assert_eq!(rewinds.lock().unwrap().len(), 2);
+
         // 3. Rewind "conversation" with non-empty composer -> preserves existing draft!
         cx.update(|cx| {
             view.update(cx, |view, cx| {
                 view.input.update(cx, |input, cx| {
                     input.set_text("Keep my typed draft".into(), cx)
                 });
-                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), None, cx);
+                view.open_paseo_rewind_confirm("pm-1".into(), "Prompt 1".into(), true, None, cx);
                 view.execute_paseo_rewind("conversation", cx);
             });
         });

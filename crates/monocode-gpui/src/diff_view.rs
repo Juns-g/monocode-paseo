@@ -373,6 +373,19 @@ pub(crate) struct DiffView {
     drafts_expanded: bool,
     focus: FocusHandle,
 }
+/// Session-scoped interactive diff review draft state, detached from shared
+/// diff data caches so annotations never bleed across sessions on the same repo.
+#[derive(Clone, Default)]
+pub(crate) struct ReviewDraftState {
+    draft_annotations: Vec<DraftAnnotation>,
+    next_annotation_id: u64,
+    drafts_expanded: bool,
+}
+impl ReviewDraftState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.draft_annotations.is_empty()
+    }
+}
 impl EventEmitter<DiffEvent> for DiffView {}
 impl Focusable for DiffView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -904,6 +917,54 @@ impl DiffView {
             self.selecting = false;
             cx.notify();
         }
+    }
+    /// Detach all interactive selection/composer/annotation drafts from this view
+    /// before placing it in a shared checkout cache or handing it to another session.
+    pub(crate) fn take_review_drafts(&mut self, cx: &mut Context<Self>) -> ReviewDraftState {
+        let state = ReviewDraftState {
+            draft_annotations: std::mem::take(&mut self.draft_annotations),
+            next_annotation_id: std::mem::replace(&mut self.next_annotation_id, 0),
+            drafts_expanded: std::mem::replace(&mut self.drafts_expanded, true),
+        };
+        let had_ephemeral = self.comment.take().is_some()
+            || self.selection.take().is_some()
+            || std::mem::replace(&mut self.selecting, false);
+        if !state.is_empty() || had_ephemeral {
+            cx.notify();
+        }
+        state
+    }
+    /// Restore previously detached review drafts for the owning session.
+    pub(crate) fn restore_review_drafts(
+        &mut self,
+        state: ReviewDraftState,
+        cx: &mut Context<Self>,
+    ) {
+        self.comment = None;
+        self.selection = None;
+        self.selecting = false;
+        self.draft_annotations = state.draft_annotations;
+        self.next_annotation_id = state.next_annotation_id;
+        self.drafts_expanded = state.drafts_expanded;
+        cx.notify();
+    }
+    #[cfg(test)]
+    pub(crate) fn draft_annotation_count(&self) -> usize {
+        self.draft_annotations.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn push_test_draft_annotation(&mut self, note: &str) {
+        let id = self.next_annotation_id;
+        self.next_annotation_id += 1;
+        self.draft_annotations.push(DraftAnnotation {
+            id,
+            file_id: "unstaged:a.rs".into(),
+            path: "a.rs".into(),
+            lines: Vec::new(),
+            first_pos: Some((0, 0)),
+            positions: HashSet::new(),
+            note: note.to_owned(),
+        });
     }
     /// A line's comment button: the whole selection when the line is in it,
     /// otherwise just that line.

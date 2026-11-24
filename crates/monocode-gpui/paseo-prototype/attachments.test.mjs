@@ -27,32 +27,51 @@ test('chunked upload appends, accepts exact retries and refuses tampered, out-of
   rmSync(dir,{recursive:true,force:true});
 });
 
+const PNG_BYTES=Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0,0,0,0]);
+const JPEG_BYTES=Buffer.from([0xff,0xd8,0xff,0xe0,0,0x10]);
+const WEBP_BYTES=Buffer.from('RIFF\x04\x00\x00\x00WEBP');
+const GIF_BYTES=Buffer.from('GIF89a\x01\x00');
+
 test('prepareSend returns raw base64 images for every supported type and refuses everything else',()=>{
-  const dir=tmp(),png=Buffer.from([1,2,3,4]),s=stored(dir,ID,png);
+  const dir=tmp(),s=new AttachmentStore(dir);
+  const samples=[
+    ['image/png',PNG_BYTES],
+    ['image/jpeg',JPEG_BYTES],
+    ['image/webp',WEBP_BYTES],
+    ['image/gif',GIF_BYTES],
+  ];
   assert.deepEqual(s.prepareSend(undefined),{refs:[],images:[]});
   assert.deepEqual(s.prepareSend([]),{refs:[],images:[]});
-  for(const mimeType of ['image/png','image/jpeg','image/webp','image/gif']){
-    const out=s.prepareSend([ref(ID,{mimeType})]);
-    assert.deepEqual(out,{refs:[ref(ID,{mimeType})],images:[{data:b64(png),mimeType}]});
+  for(const [mimeType,bytes] of samples){
+    const id=`11111111-1111-4111-8111-${String(samples.findIndex(x=>x[0]===mimeType)).padStart(12,'0')}`;
+    s.upload({id,offset:0,size:bytes.length,data:b64(bytes)});
+    const out=s.prepareSend([ref(id,{mimeType,size:bytes.length})]);
+    assert.deepEqual(out,{refs:[ref(id,{mimeType,size:bytes.length})],images:[{data:b64(bytes),mimeType}]});
     assert.ok(!out.images[0].data.startsWith('data:'));
   }
-  assert.throws(()=>s.prepareSend([ref(ID,{kind:'file'})]),/仅支持图片/);
-  assert.throws(()=>s.prepareSend([ref(ID,{kind:'audio',mimeType:'audio/wav'})]),/仅支持图片/);
-  assert.throws(()=>s.prepareSend([ref(ID,{mimeType:'application/pdf'})]),/仅支持图片/);
-  assert.throws(()=>s.prepareSend([ref(ID,{mimeType:'image/svg+xml'})]),/仅支持图片/);
+  s.upload({id:ID,offset:0,size:PNG_BYTES.length,data:b64(PNG_BYTES)});
+  assert.throws(()=>s.prepareSend([ref(ID,{mimeType:'image/jpeg',size:PNG_BYTES.length})]),/格式不匹配/);
+  const spoofId='44444444-4444-4444-8444-444444444444';
+  const spoof=Buffer.from('plain text masquerading as png');
+  s.upload({id:spoofId,offset:0,size:spoof.length,data:b64(spoof)});
+  assert.throws(()=>s.prepareSend([ref(spoofId,{mimeType:'image/png',size:spoof.length})]),/格式不匹配/);
+  assert.throws(()=>s.prepareSend([ref(ID,{kind:'file',size:PNG_BYTES.length})]),/仅支持图片/);
+  assert.throws(()=>s.prepareSend([ref(ID,{kind:'audio',mimeType:'audio/wav',size:PNG_BYTES.length})]),/仅支持图片/);
+  assert.throws(()=>s.prepareSend([ref(ID,{mimeType:'application/pdf',size:PNG_BYTES.length})]),/仅支持图片/);
+  assert.throws(()=>s.prepareSend([ref(ID,{mimeType:'image/svg+xml',size:PNG_BYTES.length})]),/仅支持图片/);
   assert.throws(()=>s.prepareSend([ref(ID,{size:0})]),/Invalid attachment/);
-  assert.throws(()=>s.prepareSend([ref(ID,{size:5})]),/incomplete/);
+  assert.throws(()=>s.prepareSend([ref(ID,{size:PNG_BYTES.length+1})]),/incomplete/);
   assert.throws(()=>s.prepareSend([ref(ID2)]),/incomplete/);
-  assert.throws(()=>s.prepareSend([ref(ID,{name:' '})]),/Invalid attachment/);
+  assert.throws(()=>s.prepareSend([ref(ID,{name:' ',size:PNG_BYTES.length})]),/Invalid attachment/);
   assert.throws(()=>s.prepareSend('x'),/Invalid attachments/);
-  assert.throws(()=>s.prepareSend(Array(21).fill(ref(ID))),/Invalid attachments/);
+  assert.throws(()=>s.prepareSend(Array(21).fill(ref(ID,{size:PNG_BYTES.length}))),/Invalid attachments/);
   rmSync(dir,{recursive:true,force:true});
 });
 
 test('prepareSend enforces the combined size cap',()=>{
   const dir=tmp(),s=new AttachmentStore(dir),half=MAX_ATTACHMENT_BYTES/2+1;
-  // Sparse files keep the test cheap while stat().size reports the declared size.
-  for(const id of [ID,ID2]){s.upload({id,offset:0,size:0,data:''});truncateSync(s.pathFor(id),half);}
+  // Sparse files keep the test cheap while stat().size reports the declared size and magic bytes pass.
+  for(const id of [ID,ID2]){s.upload({id,offset:0,size:PNG_BYTES.length,data:b64(PNG_BYTES)});truncateSync(s.pathFor(id),half);}
   assert.throws(()=>s.prepareSend([ref(ID,{size:half}),ref(ID2,{size:half})]),/20 MB/);
   assert.equal(s.prepareSend([ref(ID,{size:half})]).images.length,1);
   rmSync(dir,{recursive:true,force:true});
@@ -79,10 +98,10 @@ test('bound attachments survive restart, are read in 3-byte aligned chunks and n
   rmSync(dir,{recursive:true,force:true});
 });
 
-test('binding keeps only the most recent messages per session and tolerates a corrupt index',()=>{
+test('binding retains historical messages beyond 200 entries and tolerates a corrupt index',()=>{
   const dir=tmp(),s=new AttachmentStore(dir);
   for(let i=0;i<205;i++)s.bindToMessage('s',`m${i}`,[ref(ID)]);
-  assert.equal(s.forMessage('s','m0'),null);assert.ok(s.forMessage('s','m204'));assert.equal(Object.keys(s.index.s).length,200);
+  assert.deepEqual(s.forMessage('s','m0'),[ref(ID)]);assert.ok(s.forMessage('s','m204'));assert.equal(Object.keys(s.index.s).length,205);
   writeFileSync(s.indexPath,'{broken');
   assert.deepEqual(new AttachmentStore(dir).index,{});
   rmSync(dir,{recursive:true,force:true});

@@ -148,7 +148,7 @@ mod tests {
         window
             .update(visual, |_, w, cx| {
                 w.dispatch_action(
-                    Box::new(crate::file_editor::OpenPath(format!("{path}:2:3"))),
+                    Box::new(crate::file_editor::OpenPath::new(format!("{path}:2:3"))),
                     cx,
                 );
             })
@@ -205,7 +205,10 @@ mod tests {
                     "Keep my Mono draft"
                 );
                 assert!(restored.read(cx).input.focus_handle(cx).is_focused(w));
-                w.dispatch_action(Box::new(crate::file_editor::OpenPath(path.clone())), cx);
+                w.dispatch_action(
+                    Box::new(crate::file_editor::OpenPath::new(path.clone())),
+                    cx,
+                );
             })
             .unwrap();
         visual.run_until_parked();

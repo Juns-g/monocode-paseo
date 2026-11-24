@@ -959,7 +959,7 @@ test('paseo.usage is advertised and relays only Codex and Antigravity reports th
 // F1: image attachments
 {
 const ATT='33333333-3333-4333-8333-333333333333';
-const PNG=Buffer.from([0x89,0x50,0x4e,0x47,1,2,3,4,5]);
+const PNG=Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,1,2,3,4,5]);
 const upload=(host,id=ATT,bytes=PNG)=>host.request('attachments.upload',{id,offset:0,size:bytes.length,data:bytes.toString('base64')});
 const imageRef=(over={})=>({id:ATT,name:'shot.png',mimeType:'image/png',kind:'image',size:PNG.length,...over});
 test('environment.describe advertises attachment upload and read',async()=>{
@@ -983,6 +983,11 @@ test('uploaded image reaches the daemon once, retries return the receipt, and th
   const chunk=(await f.host.request('attachments.read',{sessionId:'a',id:ATT,offset:0})).result;
   assert.deepEqual({...chunk,data:Buffer.from(chunk.data,'base64')},{data:PNG,offset:PNG.length,size:PNG.length});
   await assert.rejects(f.host.request('attachments.read',{sessionId:'b',id:ATT,offset:0}),/not found/);
+  // Older history pages also preserve bound image attachments for the same session.
+  f.client.fetchAgentTimeline=async()=>({agent:f.a,epoch:'e',hasOlder:false,entries:[
+    {seqStart:1,seqEnd:1,timestamp:'2026-10-25T00:00:00Z',item:{type:'user_message',text:'',clientMessageId:'img-1'}}]});
+  const older=(await f.host.request('sessions.historyBefore',{sessionId:'a',epoch:'e',before:2,limit:10})).result;
+  assert.deepEqual(older.blocks[0].attachments,[imageRef()]);
   // The binding survives an adapter restart.
   const again=new PaseoHost(f.client,f.directory);
   assert.deepEqual(again.attachments.forMessage('a','img-1'),[imageRef()]);again.close();
@@ -1109,8 +1114,10 @@ test('projectBlocks emits paseoMessageId preferring providerMessageId and preser
     {seqStart:3,seqEnd:3,timestamp:3000,item:{type:'user_message',text:huge,messageId:'msg-huge',clientMessageId:'msg-huge'}},
     {seqStart:4,seqEnd:4,timestamp:4000,item:{type:'user_message',text:'legacy-no-id'}}]});
   assert.equal(blocks[0].paseoMessageId,'prov-1');
+  assert.equal(blocks[0].paseoTruncated,undefined);
   assert.equal(blocks[1].paseoMessageId,undefined);
   assert.equal(blocks[2].paseoMessageId,'msg-huge');
+  assert.equal(blocks[2].paseoTruncated,true);
   assert.equal(blocks[3].paseoMessageId,undefined);
 });
 

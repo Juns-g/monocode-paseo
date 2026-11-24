@@ -186,6 +186,29 @@ impl Source {
 #[derive(Default)]
 pub(crate) struct ReviewCache {
     sources: VecDeque<CachedSource>,
+    /// Session-scoped diff review annotations, kept completely separate from
+    /// shared checkout diff views so drafts never leak across sessions.
+    drafts: HashMap<(i64, ReviewCacheKey), crate::diff_view::ReviewDraftState>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ReviewCacheKey {
+    Changes { cwd: String, staged: Option<bool> },
+    Commit { cwd: String, sha: String },
+}
+impl ReviewCacheKey {
+    fn from_tab(tab: &ReviewTab) -> Option<Self> {
+        match tab {
+            ReviewTab::Changes { cwd, staged, .. } => Some(Self::Changes {
+                cwd: cwd.clone(),
+                staged: *staged,
+            }),
+            ReviewTab::Commit { cwd, sha, .. } => Some(Self::Commit {
+                cwd: cwd.clone(),
+                sha: sha.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 struct CachedSource {
     tab: ReviewTab,
@@ -213,14 +236,44 @@ impl ReviewCache {
             _ => false,
         }
     }
-    fn take(&mut self, tab: &ReviewTab) -> Option<CachedSource> {
-        let ix = self
+    fn take(
+        &mut self,
+        tab: &ReviewTab,
+        owner: Option<i64>,
+        cx: &mut gpui::App,
+    ) -> (
+        Option<CachedSource>,
+        Option<crate::diff_view::ReviewDraftState>,
+    ) {
+        let cached = self
             .sources
             .iter()
-            .position(|s| Self::matches(&s.tab, tab))?;
-        self.sources.remove(ix)
+            .position(|s| Self::matches(&s.tab, tab))
+            .and_then(|ix| self.sources.remove(ix));
+        if let Some(ref source) = cached {
+            source.view.update(cx, |v, cx| {
+                v.take_review_drafts(cx);
+            });
+        }
+        let drafts = owner
+            .zip(ReviewCacheKey::from_tab(tab))
+            .and_then(|key| self.drafts.remove(&key));
+        (cached, drafts)
     }
-    fn remember(&mut self, source: &Source) {
+    fn remember(&mut self, source: &Source, owner: Option<i64>, cx: &mut gpui::App) {
+        let drafts = source.view.update(cx, |v, cx| v.take_review_drafts(cx));
+        if let Some(key) = owner.zip(ReviewCacheKey::from_tab(&source.tab)) {
+            if drafts.is_empty() {
+                self.drafts.remove(&key);
+            } else {
+                if self.drafts.len() >= 32 && !self.drafts.contains_key(&key) {
+                    if let Some(oldest) = self.drafts.keys().next().cloned() {
+                        self.drafts.remove(&oldest);
+                    }
+                }
+                self.drafts.insert(key, drafts);
+            }
+        }
         if source.editor.is_some() || source.files.is_none() || source.error.is_some() {
             return;
         }
@@ -261,6 +314,7 @@ impl ReviewCache {
 
 pub(crate) struct ReviewPane {
     git: Entity<ProjectGit>,
+    owner: Option<i64>,
     focus: FocusHandle,
     /// Bodies replaced before the next paint may still own keyboard focus.
     retiring_focus: Vec<FocusHandle>,
@@ -355,6 +409,14 @@ fn session_file_diff(cwd: &str, session: i64, relative: &str) -> Result<FileDiff
 
 impl ReviewPane {
     pub(crate) fn new(git: Entity<ProjectGit>, state: ReviewState, cx: &mut Context<Self>) -> Self {
+        Self::new_for_session(git, state, None, cx)
+    }
+    pub(crate) fn new_for_session(
+        git: Entity<ProjectGit>,
+        state: ReviewState,
+        owner: Option<i64>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let subscriptions = vec![
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| {
                 this.refresh(cx);
@@ -381,6 +443,7 @@ impl ReviewPane {
         ];
         let mut this = Self {
             git,
+            owner,
             focus: cx.focus_handle(),
             retiring_focus: Vec::new(),
             state: ReviewState {
@@ -413,10 +476,16 @@ impl ReviewPane {
         this
     }
     fn source(&mut self, tab: ReviewTab, cx: &mut Context<Self>) -> Source {
-        let cached = self.git.update(cx, |git, _| git.review_cache.take(&tab));
+        let owner = self.owner;
+        let (cached, saved_drafts) = self
+            .git
+            .update(cx, |git, cx| git.review_cache.take(&tab, owner, cx));
         let view = cached
             .as_ref()
             .map_or_else(|| cx.new(DiffView::new), |s| s.view.clone());
+        if let Some(drafts) = saved_drafts {
+            view.update(cx, |v, cx| v.restore_review_drafts(drafts, cx));
+        }
         let events = cx.subscribe(&view, |this, view, event: &DiffEvent, cx| {
             let Some(ix) = this.sources.iter().position(|s| s.view == view) else {
                 return;
@@ -601,8 +670,9 @@ impl ReviewPane {
         }
         let mut removed = self.sources.remove(ix);
         removed.cancel();
+        let owner = self.owner;
         self.git
-            .update(cx, |git, _| git.review_cache.remember(&removed));
+            .update(cx, |git, cx| git.review_cache.remember(&removed, owner, cx));
         if self.state.active >= ix && self.state.active > 0 {
             self.state.active -= 1;
         }
@@ -631,10 +701,11 @@ impl ReviewPane {
             self.remember_body_focus(cx);
         }
         let source = self.sources.remove(keep);
+        let owner = self.owner;
         for mut removed in self.sources.drain(..) {
             removed.cancel();
             self.git
-                .update(cx, |git, _| git.review_cache.remember(&removed));
+                .update(cx, |git, cx| git.review_cache.remember(&removed, owner, cx));
         }
         self.sources.push(source);
         self.state.active = 0;
@@ -910,13 +981,14 @@ impl ReviewPane {
     pub(crate) fn cache_closed(&mut self, cx: &mut Context<Self>) {
         self.closed = true;
         self.visible = false;
+        let owner = self.owner;
         for source in &mut self.sources {
             source.cancel();
             if let Some(editor) = &source.editor {
                 editor.update(cx, |editor, cx| editor.set_visible(false, cx));
             }
             self.git
-                .update(cx, |git, _| git.review_cache.remember(source));
+                .update(cx, |git, cx| git.review_cache.remember(source, owner, cx));
         }
     }
     /// Focus and Git changes reread the working tree; commits never change.
@@ -2161,12 +2233,22 @@ mod tests {
             for i in 0..=MAX_CACHED_SOURCES {
                 let mut source = pane.source(tab(i.to_string()), cx);
                 source.files = Some(Vec::new());
-                git.update(cx, |git, _| git.review_cache.remember(&source));
+                git.update(cx, |git, cx| git.review_cache.remember(&source, None, cx));
             }
-            git.update(cx, |git, _| {
+            git.update(cx, |git, cx| {
                 assert_eq!(git.review_cache.sources.len(), MAX_CACHED_SOURCES);
-                assert!(git.review_cache.take(&tab("0".into())).is_none());
-                assert!(git.review_cache.take(&tab("1".into())).is_some());
+                assert!(
+                    git.review_cache
+                        .take(&tab("0".into()), None, cx)
+                        .0
+                        .is_none()
+                );
+                assert!(
+                    git.review_cache
+                        .take(&tab("1".into()), None, cx)
+                        .0
+                        .is_some()
+                );
                 assert!(!ReviewCache::matches(
                     &ReviewTab::Changes {
                         cwd: "/r".into(),
@@ -2205,9 +2287,9 @@ mod tests {
                     error: None,
                 }),
             );
-            git.update(cx, |git, _| {
-                git.review_cache.remember(&source);
-                assert!(git.review_cache.take(&source.tab).is_none());
+            git.update(cx, |git, cx| {
+                git.review_cache.remember(&source, None, cx);
+                assert!(git.review_cache.take(&source.tab, None, cx).0.is_none());
             });
         });
     }
@@ -2318,5 +2400,47 @@ mod tests {
             path: Some("a".into()),
             staged: None
         }));
+    }
+    #[gpui::test]
+    fn shared_review_cache_never_leaks_diff_drafts_across_sessions(cx: &mut gpui::TestAppContext) {
+        let git = cx.new(|cx| ProjectGit::new("/repo".into(), cx));
+        let tab = ReviewTab::Changes {
+            cwd: "/repo".into(),
+            path: None,
+            staged: Some(false),
+        };
+        let pane_a = cx
+            .new(|cx| ReviewPane::new_for_session(git.clone(), Default::default(), Some(101), cx));
+        pane_a.update(cx, |pane, cx| {
+            let mut source = pane.source(tab.clone(), cx);
+            source.files = Some(Vec::new());
+            source.view.update(cx, |v, _| {
+                v.push_test_draft_annotation("Session A private review note");
+            });
+            assert_eq!(source.view.read(cx).draft_annotation_count(), 1);
+            git.update(cx, |git, cx| {
+                git.review_cache.remember(&source, Some(101), cx)
+            });
+            // Shared cached DiffView itself must have 0 drafts after remember().
+            assert_eq!(source.view.read(cx).draft_annotation_count(), 0);
+        });
+        // Session B opens the exact same Changes tab and must receive 0 drafts from session A.
+        let pane_b = cx
+            .new(|cx| ReviewPane::new_for_session(git.clone(), Default::default(), Some(202), cx));
+        pane_b.update(cx, |pane, cx| {
+            let mut source = pane.source(tab.clone(), cx);
+            source.files = Some(Vec::new());
+            assert_eq!(source.view.read(cx).draft_annotation_count(), 0);
+            git.update(cx, |git, cx| {
+                git.review_cache.remember(&source, Some(202), cx)
+            });
+        });
+        // Session A reopens Changes and gets its own 1 draft back cleanly!
+        let pane_a_reopened = cx
+            .new(|cx| ReviewPane::new_for_session(git.clone(), Default::default(), Some(101), cx));
+        pane_a_reopened.update(cx, |pane, cx| {
+            let source = pane.source(tab, cx);
+            assert_eq!(source.view.read(cx).draft_annotation_count(), 1);
+        });
     }
 }

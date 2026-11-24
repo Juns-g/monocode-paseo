@@ -121,21 +121,29 @@ struct DiskVersion {
 /// Most paths one `stat_files` request carries.
 const MAX_STAT_FILES: usize = 64;
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RemoteMtime {
-    mtime_ms: Option<u64>,
+pub(super) struct RemoteStat {
+    #[serde(default)]
+    pub(super) mtime_ms: Option<u64>,
+    #[serde(default)]
+    pub(super) mtime_ns: Option<String>,
+    #[serde(default)]
+    pub(super) ctime_ns: Option<String>,
+    #[serde(default)]
+    pub(super) size: Option<u64>,
+    #[serde(default)]
+    pub(super) ino: Option<String>,
 }
 
 /// A remote file's version from the listing alone, or `None` when only its
-/// diff can tell (a host too old to send `indexOid`, or no stat available).
-/// `mtime` is `Some(None)` for a file the host could not stat as a regular
-/// file, and `None` when stat results are missing.
+/// diff can tell (a host too old to send `indexOid` or high-precision stat
+/// identity, or when stat is unavailable).
 pub(super) fn remote_fast_version(
     file: &ChangedFile,
     staged: bool,
     head: &Option<String>,
-    mtime: Option<Option<u64>>,
+    stat: Option<&RemoteStat>,
 ) -> Option<FileDiffVersion> {
     let tracked = file.index_oid.is_some();
     if staged {
@@ -152,15 +160,35 @@ pub(super) fn remote_fast_version(
     if !tracked && file.status != "untracked" {
         return None;
     }
-    let mtime = mtime?;
+    let stat = stat?;
+    // A missing/deleted file has no stat fields; an existing file requires
+    // kernel-updated ctime_ns + size (plus inode/mtime_ns) so mtime-preserving
+    // edits cannot reuse stale diffs. Older hosts without ctime_ns fall back
+    // to content fingerprinting.
+    let disk_token = if stat.mtime_ms.is_none()
+        && stat.mtime_ns.is_none()
+        && stat.ctime_ns.is_none()
+        && stat.size.is_none()
+    {
+        "missing".to_owned()
+    } else {
+        let ctime_ns = stat.ctime_ns.as_deref()?;
+        let size = stat.size?;
+        let ino = stat.ino.as_deref().unwrap_or("");
+        let mtime = stat
+            .mtime_ns
+            .as_deref()
+            .map(str::to_owned)
+            .or_else(|| stat.mtime_ms.map(|ms| ms.to_string()))?;
+        format!("{ino}:{size}:{mtime}:{ctime_ns}")
+    };
     Some(FileDiffVersion {
         index: format!(
-            "{}:{}:{}:{}:{:?}",
+            "{}:{}:{}:{}:{disk_token}",
             file.index_oid.as_deref().unwrap_or(""),
             file.status,
             file.additions,
             file.deletions,
-            mtime
         ),
         head: None,
         disk: None,
@@ -170,7 +198,7 @@ pub(super) fn remote_fast_version(
 /// Remote versions without a diff per file: index blob IDs from the listing
 /// plus one batched `stat_files` per 64 unstaged files. Files the listing
 /// cannot version fall back to fingerprinting their bounded diff contents so
-/// equal line counts cannot hide an external host edit.
+/// equal line counts or mtime-preserving edits cannot hide an external host edit.
 fn remote_file_diff_versions(
     cwd: &Path,
     snapshot: &DiffIndex,
@@ -181,20 +209,20 @@ fn remote_file_diff_versions(
         .iter()
         .filter(|file| file.unstaged && (file.index_oid.is_some() || file.status == "untracked"))
         .collect();
-    let mut mtimes: HashMap<String, Option<u64>> = HashMap::new();
+    let mut stats_by_path: HashMap<String, RemoteStat> = HashMap::new();
     for chunk in wanted.chunks(MAX_STAT_FILES) {
         let paths: Vec<&str> = chunk.iter().map(|file| file.path.as_str()).collect();
         // The host answers in request order. A failed or mismatched stat only
         // sends those files to the diff fallback.
         if let Ok(stats) =
-            remote_workspace::command::<Vec<RemoteMtime>>("stat_files", json!({ "paths": paths }))
+            remote_workspace::command::<Vec<RemoteStat>>("stat_files", json!({ "paths": paths }))
         {
             if stats.len() == chunk.len() {
-                mtimes.extend(
+                stats_by_path.extend(
                     chunk
                         .iter()
                         .zip(stats)
-                        .map(|(file, stat)| (file.path.clone(), stat.mtime_ms)),
+                        .map(|(file, stat)| (file.path.clone(), stat)),
                 );
             }
         }
@@ -205,8 +233,8 @@ fn remote_file_diff_versions(
             if if staged { !file.staged } else { !file.unstaged } {
                 continue;
             }
-            let mtime = mtimes.get(&file.path).copied();
-            let version = match remote_fast_version(file, staged, &snapshot.head, mtime) {
+            let stat = stats_by_path.get(&file.path);
+            let version = match remote_fast_version(file, staged, &snapshot.head, stat) {
                 Some(version) => version,
                 None => {
                     let diff = file_diff(cwd, &file.relative, staged)?;

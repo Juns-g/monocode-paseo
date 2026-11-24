@@ -1,5 +1,5 @@
 const MAX_BRANCH_SUGGESTIONS = 30;
-const BRANCH_RE = /^(?!\/)(?!.*\.\.)(?!.*[\s~^:?*\[\\])(?!.*\/$)(?!.*\.lock$).{1,128}$/;
+const BRANCH_RE = /^(?!\/)(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*@\{)(?!.*[\s~^:?*\[\\])(?!.*\/$)(?!.*\.$)(?!.*\.lock$).{1,128}$/;
 
 export function normalizePosixPath(value) {
   return String(value ?? '').replace(/\/+$/, '') || '/';

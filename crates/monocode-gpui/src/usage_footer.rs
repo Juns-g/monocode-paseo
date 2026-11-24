@@ -80,9 +80,11 @@ impl UsageFooter {
         self.project = project;
         self.session = session;
         if self.paseo_mode {
-            // Paseo quota is workspace-wide: tab switches keep the cache and popover.
+            // Paseo quota is host-scoped: switching between Mac and Devbox swaps
+            // snapshots and invalidates in-flight fetches; same-host tab switches keep cache.
             self.kind = kind;
             self.key = key;
+            self.switch_paseo_host(&self.project.clone(), cx);
             self.refresh(false, cx);
             return;
         }

@@ -1680,6 +1680,8 @@ impl Conversation {
     fn paseo_rewind_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let pending = self.remote_state.rewind_confirm.as_ref()?;
         let can_execute = self.can_paseo_rewind();
+        let can_restore_prompt = pending.can_restore_prompt;
+        let can_rewind_conversation = can_execute && can_restore_prompt;
         let has_conversation = self
             .remote_state
             .rewind_modes
@@ -1729,6 +1731,11 @@ impl Conversation {
                     )
                     .child(div().mt(px(10.)).child(crate::modal::body(warning)))
                     .when(!can_execute, |d| {
+                        let reason = if self.has_pending_follow_ups() {
+                            crate::i18n::t("Clear or send queued messages before rewinding.")
+                        } else {
+                            crate::i18n::t("Session is now busy; rewind is unavailable.")
+                        };
                         d.child(
                             div()
                                 .id("paseo-rewind-busy-warning")
@@ -1741,8 +1748,24 @@ impl Conversation {
                                 .text_size(px(12.))
                                 .line_height(px(16.))
                                 .text_color(gpui::rgb(0xf87171))
+                                .child(reason),
+                        )
+                    })
+                    .when(can_execute && !can_restore_prompt, |d| {
+                        d.child(
+                            div()
+                                .id("paseo-rewind-unrestorable-warning")
+                                .debug_selector(|| "paseo-rewind-unrestorable-warning".into())
+                                .mt(px(10.))
+                                .px(px(10.))
+                                .py(px(6.))
+                                .rounded(px(6.))
+                                .bg(content(0.06))
+                                .text_size(px(12.))
+                                .line_height(px(16.))
+                                .text_color(gpui::rgb(0xfbbf24))
                                 .child(crate::i18n::t(
-                                    "Session is now busy; rewind is unavailable.",
+                                    "This message contains images or truncated text; rewind files only or rewind in Paseo.",
                                 )),
                         )
                     })
@@ -1794,9 +1817,9 @@ impl Conversation {
                                     base.debug_selector(|| {
                                         "paseo-rewind-confirm-conversation".into()
                                     }),
-                                    !can_execute,
+                                    !can_rewind_conversation,
                                 );
-                                row.child(btn.when(can_execute, |b| {
+                                row.child(btn.when(can_rewind_conversation, |b| {
                                     b.on_click(cx.listener(|this, _, _, cx| {
                                         this.execute_paseo_rewind("conversation", cx);
                                     }))
@@ -1809,9 +1832,9 @@ impl Conversation {
                                         crate::i18n::t("Rewind conversation & files"),
                                     )
                                     .debug_selector(|| "paseo-rewind-confirm-both".into()),
-                                    !can_execute,
+                                    !can_rewind_conversation,
                                 );
-                                row.child(btn.when(can_execute, |b| {
+                                row.child(btn.when(can_rewind_conversation, |b| {
                                     b.on_click(cx.listener(|this, _, _, cx| {
                                         this.execute_paseo_rewind("both", cx);
                                     }))
@@ -1863,9 +1886,16 @@ impl Conversation {
                 turn,
                 message_id,
                 text,
+                can_restore_prompt,
             } => {
                 let _ = *turn;
-                self.open_paseo_rewind_confirm(message_id.clone(), text.clone(), Some(window), cx);
+                self.open_paseo_rewind_confirm(
+                    message_id.clone(),
+                    text.clone(),
+                    *can_restore_prompt,
+                    Some(window),
+                    cx,
+                );
             }
             ResponseRequest::Draft { send } => self.draft_action(*send, cx),
             ResponseRequest::SaveNote {
@@ -4221,6 +4251,21 @@ impl Render for Conversation {
         }
         self.attachment_drop_target("session-chat", cx)
             .relative()
+            .on_action(
+                cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
+                    if event.source_cwd.is_none() {
+                        window.dispatch_action(
+                            Box::new(crate::file_editor::OpenPath::scoped(
+                                event.path.clone(),
+                                this.summary.cwd.clone(),
+                            )),
+                            cx,
+                        );
+                        return;
+                    }
+                    cx.propagate();
+                }),
+            )
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.close_paseo_rewind_confirm(cx) {
                     cx.stop_propagation();

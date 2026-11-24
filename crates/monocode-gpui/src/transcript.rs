@@ -1345,14 +1345,14 @@ impl TranscriptView {
         let sent_at = self.source[start].sent_at;
         let base = self.base;
         let rewind_text = text.clone();
-        let paseo_message_id = self
-            .turns
-            .get(&end)
-            .and_then(|info| info.paseo_message_id.clone());
+        let turn_info = self.turns.get(&end);
+        let paseo_message_id = turn_info.and_then(|info| info.paseo_message_id.clone());
+        let paseo_truncated = turn_info.is_some_and(|info| info.paseo_truncated);
         let has_attachments = self.source.get(end).is_some_and(|r| {
             r.role == monocode_core::transcript::attachments::ROLE
                 && !matches!(r.text.trim(), "" | "[]" | "null")
         });
+        let can_restore_prompt = !has_attachments && !paseo_truncated;
         let stamp_anchor = self
             .action_anchors
             .entry((start, "sent-at"))
@@ -1415,6 +1415,7 @@ impl TranscriptView {
                                 turn,
                                 message_id: message_id.clone(),
                                 text: text.clone(),
+                                can_restore_prompt,
                             })
                         })),
                     )
@@ -4702,14 +4703,18 @@ impl TranscriptView {
                                     d.role(Role::Link)
                                         .cursor_pointer()
                                         .hover(|s| s.text_color(rgb(0x7dd3fc)))
-                                        .on_click(move |event, window, cx| {
-                                            if event.click_count() == 1 {
-                                                window.dispatch_action(
-                                                    Box::new(crate::file_editor::OpenPath(
-                                                        path.clone(),
-                                                    )),
-                                                    cx,
-                                                );
+                                        .on_click({
+                                            let source_cwd = self.file_link_base.clone();
+                                            move |event, window, cx| {
+                                                if event.click_count() == 1 {
+                                                    window.dispatch_action(
+                                                        Box::new(crate::file_editor::OpenPath {
+                                                            path: path.clone(),
+                                                            source_cwd: source_cwd.clone(),
+                                                        }),
+                                                        cx,
+                                                    );
+                                                }
                                             }
                                         })
                                         .on_mouse_down(

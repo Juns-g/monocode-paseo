@@ -141,6 +141,7 @@ mod tests {
             marker: None,
             gap: 0.,
             word_start: 0,
+            source_cwd: None,
         };
         mark_row(&mut row, "café", true);
         assert_eq!(row_text(&row), "Find café here");

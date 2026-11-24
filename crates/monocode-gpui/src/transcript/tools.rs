@@ -325,6 +325,7 @@ impl TranscriptView {
                             )
                         })
                         .when_some(target_path, |d, path| {
+                            let source_cwd = self.file_link_base.clone();
                             d.role(Role::Button)
                                 .aria_label(format!("Open {path}"))
                                 .cursor_pointer()
@@ -332,7 +333,10 @@ impl TranscriptView {
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     window.dispatch_action(
-                                        Box::new(crate::file_editor::OpenPath(path.clone())),
+                                        Box::new(crate::file_editor::OpenPath {
+                                            path: path.clone(),
+                                            source_cwd: source_cwd.clone(),
+                                        }),
                                         cx,
                                     );
                                 })
@@ -388,6 +392,7 @@ impl TranscriptView {
                                             })
                                             .child(div().min_w_0().truncate().child(label.clone()))
                                             .when_some(path, |d, path| {
+                                                let source_cwd = self.file_link_base.clone();
                                                 d.role(Role::Button)
                                                     .aria_label(format!("Open {path}"))
                                                     .cursor_pointer()
@@ -395,9 +400,12 @@ impl TranscriptView {
                                                     .on_click(move |_, window, cx| {
                                                         cx.stop_propagation();
                                                         window.dispatch_action(
-                                                            Box::new(crate::file_editor::OpenPath(
-                                                                path.clone(),
-                                                            )),
+                                                            Box::new(
+                                                                crate::file_editor::OpenPath {
+                                                                    path: path.clone(),
+                                                                    source_cwd: source_cwd.clone(),
+                                                                },
+                                                            ),
                                                             cx,
                                                         );
                                                     })
@@ -513,6 +521,7 @@ impl TranscriptView {
                                             .child(command),
                                     )
                                     .when_some(path, |d, path| {
+                                        let source_cwd = self.file_link_base.clone();
                                         d.role(Role::Button)
                                             .aria_label(format!("Open {path}"))
                                             .cursor_pointer()
@@ -520,9 +529,10 @@ impl TranscriptView {
                                             .on_click(move |_, window, cx| {
                                                 cx.stop_propagation();
                                                 window.dispatch_action(
-                                                    Box::new(crate::file_editor::OpenPath(
-                                                        path.clone(),
-                                                    )),
+                                                    Box::new(crate::file_editor::OpenPath {
+                                                        path: path.clone(),
+                                                        source_cwd: source_cwd.clone(),
+                                                    }),
                                                     cx,
                                                 );
                                             })

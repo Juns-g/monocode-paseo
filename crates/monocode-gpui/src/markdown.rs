@@ -180,6 +180,7 @@ pub(crate) struct MarkdownRow {
     pub marker: Option<String>,
     pub gap: f32,
     pub word_start: usize,
+    pub source_cwd: Option<String>,
 }
 
 pub(crate) fn rows(block: &Block) -> Vec<MarkdownRow> {
@@ -203,6 +204,7 @@ fn flatten(
             marker: None,
             gap,
             word_start: 0,
+            source_cwd: None,
         })
     };
     match block {
@@ -386,9 +388,12 @@ fn inline_selected(
     font_size: f32,
     selection: Option<TextSelection>,
     prepared: Option<&cache::PreparedInline>,
+    source_cwd: Option<&str>,
 ) -> AnyElement {
     if runs.iter().any(|r| r.style.code) {
-        return rich_inline(runs, id, tone, fade, now, word_base, font_size, selection);
+        return rich_inline(
+            runs, id, tone, fade, now, word_base, font_size, selection, source_cwd,
+        );
     }
     let uncached;
     let prepared = if let Some(prepared) = prepared {
@@ -450,6 +455,7 @@ fn inline_selected(
     let clicked_links = links.clone();
     let menu_links = links.clone();
     let clicked_urls = urls.clone();
+    let clicked_source = source_cwd.map(str::to_owned);
     let text_id: SharedString = format!("{id}-text").into();
     let child = div()
         .id(id)
@@ -471,7 +477,7 @@ fn inline_selected(
                         return;
                     }
                 }
-                open_link(&clicked_urls[ix], window, cx);
+                open_link(&clicked_urls[ix], clicked_source.as_deref(), window, cx);
             }
         })
         .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -499,6 +505,7 @@ fn rich_inline(
     mut word: usize,
     font_size: f32,
     selection: Option<TextSelection>,
+    source_cwd: Option<&str>,
 ) -> AnyElement {
     let mut children = Vec::new();
     let mut offset = 0;
@@ -545,11 +552,12 @@ fn rich_inline(
                     .when(file, |d| {
                         let path = style.link.clone().unwrap_or_else(|| text.clone());
                         let menu_path = path.clone();
+                        let chip_source = source_cwd.map(str::to_owned);
                         d.cursor(gpui::CursorStyle::PointingHand)
                             .hover(|s| s.bg(content(0.13)))
                             .on_click(move |event, window, cx| {
                                 if activate_link(event, clicked_selection.as_ref()) {
-                                    open_link(&path, window, cx)
+                                    open_link(&path, chip_source.as_deref(), window, cx)
                                 }
                             })
                             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -628,11 +636,14 @@ fn rich_inline(
                             d.cursor(gpui::CursorStyle::PointingHand)
                         })
                         .child(child)
-                        .on_click(move |event, window, cx| {
-                            if let Some(url) = &link
-                                && activate_link(event, clicked_selection.as_ref())
-                            {
-                                open_link(url, window, cx);
+                        .on_click({
+                            let link_source = source_cwd.map(str::to_owned);
+                            move |event, window, cx| {
+                                if let Some(url) = &link
+                                    && activate_link(event, clicked_selection.as_ref())
+                                {
+                                    open_link(url, link_source.as_deref(), window, cx);
+                                }
                             }
                         })
                         .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -691,6 +702,7 @@ pub(crate) fn resolve_file_links(row: &mut MarkdownRow, base: &str) {
             }
         }
     }
+    row.source_cwd = Some(base.to_owned());
     match &mut row.part {
         Part::Text { runs, .. } => resolve(runs, base),
         Part::Table { cells, .. } => {
@@ -702,7 +714,7 @@ pub(crate) fn resolve_file_links(row: &mut MarkdownRow, base: &str) {
     }
 }
 
-fn open_link(url: &str, window: &mut Window, cx: &mut App) {
+fn open_link(url: &str, source_cwd: Option<&str>, window: &mut Window, cx: &mut App) {
     // A remote conversation resolves file links against its `remote://` cwd.
     let file = !url.starts_with("mailto:")
         && (!url.contains("://")
@@ -711,7 +723,11 @@ fn open_link(url: &str, window: &mut Window, cx: &mut App) {
     if url.starts_with('#') {
         // An in-page anchor has nowhere to go in a transcript or a preview.
     } else if file {
-        window.dispatch_action(Box::new(crate::file_editor::OpenPath(url.into())), cx);
+        let action = match source_cwd {
+            Some(src) => crate::file_editor::OpenPath::scoped(url, src),
+            None => crate::file_editor::OpenPath::new(url),
+        };
+        window.dispatch_action(Box::new(action), cx);
     } else {
         // Web, mail and any other scheme (an app's deep link) are the system's.
         cx.open_url(url);
@@ -783,6 +799,7 @@ pub(crate) fn body_selected(
                 },
                 selection,
                 prepared.and_then(|prepared| prepared.inline.as_ref()),
+                row.source_cwd.as_deref(),
             ))
             .into_any_element()
         }
@@ -873,6 +890,7 @@ pub(crate) fn body_selected(
                                             selection.offset(table_offset(&row.part, ix, col))
                                         }),
                                         None,
+                                        row.source_cwd.as_deref(),
                                     ))
                             }))
                     })),
@@ -1150,6 +1168,7 @@ mod rich_wrap_tests {
                     Instant::now(),
                     0,
                     14.,
+                    None,
                     None,
                 ))
         }

@@ -1100,14 +1100,25 @@ fn remote_file(status: &str, oid: Option<&str>) -> ChangedFile {
     }
 }
 
+fn remote_stat(mtime_ms: u64, ctime_ns: &str, size: u64, ino: &str) -> review::RemoteStat {
+    review::RemoteStat {
+        mtime_ms: Some(mtime_ms),
+        mtime_ns: Some(format!("{mtime_ms}000000")),
+        ctime_ns: Some(ctime_ns.into()),
+        size: Some(size),
+        ino: Some(ino.into()),
+    }
+}
+
 #[test]
-fn remote_versions_use_listing_and_mtime_without_diffs() {
+fn remote_versions_use_listing_and_high_precision_stat_without_diffs() {
     let head = Some("h1".to_string());
     let tracked = remote_file("modified", Some("oid1"));
+    let s1 = remote_stat(10, "10000001", 42, "777");
     let staged = review::remote_fast_version(&tracked, true, &head, None).unwrap();
     assert_eq!(
         staged,
-        review::remote_fast_version(&tracked, true, &head, Some(Some(9))).unwrap(),
+        review::remote_fast_version(&tracked, true, &head, Some(&s1)).unwrap(),
         "staged versions ignore the disk"
     );
     let moved = Some("h2".to_string());
@@ -1120,21 +1131,45 @@ fn remote_versions_use_listing_and_mtime_without_diffs() {
         staged,
         review::remote_fast_version(&restaged, true, &head, None).unwrap()
     );
-    // Unstaged needs a stat; edits change only the mtime part.
+    // Unstaged needs high-precision stat; mtime-preserving replacement still changes ctime_ns or ino/size.
     assert!(review::remote_fast_version(&tracked, false, &head, None).is_none());
-    let a = review::remote_fast_version(&tracked, false, &head, Some(Some(10))).unwrap();
-    let b = review::remote_fast_version(&tracked, false, &head, Some(Some(11))).unwrap();
-    let gone = review::remote_fast_version(&tracked, false, &head, Some(None)).unwrap();
-    assert!(a != b && a != gone);
-    // An untracked file has no index entry but is still versioned by mtime.
+    let legacy_mtime_only = review::RemoteStat {
+        mtime_ms: Some(10),
+        ..Default::default()
+    };
+    assert!(
+        review::remote_fast_version(&tracked, false, &head, Some(&legacy_mtime_only)).is_none(),
+        "hosts without ctime_ns/size must fall back to diff fingerprinting"
+    );
+    let a = review::remote_fast_version(&tracked, false, &head, Some(&s1)).unwrap();
+    let b_same_mtime_diff_ctime = review::remote_fast_version(
+        &tracked,
+        false,
+        &head,
+        Some(&remote_stat(10, "10000002", 42, "777")),
+    )
+    .unwrap();
+    let c_same_mtime_diff_ino = review::remote_fast_version(
+        &tracked,
+        false,
+        &head,
+        Some(&remote_stat(10, "10000001", 42, "778")),
+    )
+    .unwrap();
+    let gone =
+        review::remote_fast_version(&tracked, false, &head, Some(&review::RemoteStat::default()))
+            .unwrap();
+    assert!(a != b_same_mtime_diff_ctime && a != c_same_mtime_diff_ino && a != gone);
+    // An untracked file has no index entry but is still versioned by full stat.
     let untracked = remote_file("untracked", None);
-    assert!(review::remote_fast_version(&untracked, false, &head, Some(Some(5))).is_some());
+    assert!(review::remote_fast_version(&untracked, false, &head, Some(&s1)).is_some());
 }
 
 #[test]
 fn remote_versions_fall_back_for_hosts_without_index_oid() {
     let head = None;
     let legacy = remote_file("modified", None);
-    assert!(review::remote_fast_version(&legacy, true, &head, Some(Some(1))).is_none());
-    assert!(review::remote_fast_version(&legacy, false, &head, Some(Some(1))).is_none());
+    let stat = remote_stat(1, "100", 10, "1");
+    assert!(review::remote_fast_version(&legacy, true, &head, Some(&stat)).is_none());
+    assert!(review::remote_fast_version(&legacy, false, &head, Some(&stat)).is_none());
 }

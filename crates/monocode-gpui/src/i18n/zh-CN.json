@@ -2210,7 +2210,9 @@
   "Rewind conversation only": "仅回退对话",
   "Rewind files only": "仅回退文件",
   "Rewind conversation & files": "回退对话与文件",
-  "Session is now busy; rewind is unavailable.": "会话已开始运行，无法执行回退",
+  "Session is now busy; rewind is unavailable.": "会话已开始运行，无法执行回退。",
+  "Clear or send queued messages before rewinding.": "请先清空或发送排队消息，再执行回退。",
+  "This message contains images or truncated text; rewind files only or rewind in Paseo.": "此消息包含图片或超长截断内容，为避免内容丢失，此处仅支持回退文件；如需回退对话请在 Paseo 中操作。",
   "Paseo session is busy or state changed; rewind cancelled.": "Paseo 会话正在运行或状态已变化，已取消回退。",
   "Rewinding…": "正在回退…",
   "Wait for Paseo rewind to finish before sending a message.": "正在回退 Paseo 会话，请稍候再发送消息。",
@@ -2219,5 +2221,7 @@
   "Local Mac": "本机 Mac",
   "Online": "在线",
   "Offline": "离线",
-  "Remote Paseo host has no projects": "远程 Paseo 宿主机暂无可用项目"
+  "Remote Paseo host has no projects": "远程 Paseo 宿主机暂无可用项目",
+  "Remote sessions cannot open files from another host.": "远程宿主机对话不能打开其他宿主机或本机 Mac 的文件。",
+  "Remote sessions cannot open local Mac files.": "远程宿主机对话不能打开本机 Mac 文件。"
 }

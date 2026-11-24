@@ -2123,8 +2123,9 @@ impl Shell {
     ) -> Entity<crate::review::ReviewPane> {
         use crate::review::ReviewEvent;
         let git = self.git.clone();
+        let owner = self.workspace.session_for_pane(id);
         let review = cx.new(|cx| {
-            let mut pane = crate::review::ReviewPane::new(git, state, cx);
+            let mut pane = crate::review::ReviewPane::new_for_session(git, state, Some(owner), cx);
             pane.pane_draggable = true;
             pane
         });
@@ -3151,6 +3152,7 @@ impl Shell {
         .map_err(crate::i18n::t)
     }
     /// A Paseo conversation's `remote://` file link, as this Mac's path.
+    #[cfg(test)]
     fn paseo_local_file(&self, raw: &str) -> Option<String> {
         let prefs = &self.workspace.preferences;
         let extra = |key: &str| prefs.extra.get(key).and_then(|v| v.as_str()).unwrap_or("");
@@ -3158,6 +3160,23 @@ impl Shell {
             crate::paseo_host::project_ui(prefs),
             extra("paseo_environment"),
             extra("paseo_host_endpoint"),
+            raw,
+        )
+    }
+    /// Source-aware file link check: blocks remote Devbox sessions from ever
+    /// opening local Mac files, even if the link claims the local Mac `serverId`.
+    fn paseo_resolve_open_file(
+        &self,
+        source_cwd: &str,
+        raw: &str,
+    ) -> crate::paseo_host::OpenFileResolution {
+        let prefs = &self.workspace.preferences;
+        let extra = |key: &str| prefs.extra.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        crate::paseo_host::resolve_open_file(
+            crate::paseo_host::project_ui(prefs),
+            extra("paseo_environment"),
+            extra("paseo_host_endpoint"),
+            source_cwd,
             raw,
         )
     }
@@ -9570,12 +9589,36 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
                     let mut cwd = this.git.read(cx).project().to_owned();
-                    let mut raw = event.0.clone();
-                    if let Some(local) = this.paseo_local_file(&raw) {
-                        // Opened from this Mac, beside the project's local checkout.
-                        raw = local;
-                        if let Ok(local) = this.allowed_terminal_cwd(cx) {
-                            cwd = local;
+                    let source_cwd = event
+                        .source_cwd
+                        .clone()
+                        .or_else(|| {
+                            this.workspace
+                                .active
+                                .and_then(|id| {
+                                    this.sessions.get(&this.workspace.session_for_pane(id))
+                                })
+                                .map(|view| view.read(cx).summary.cwd.clone())
+                        })
+                        .unwrap_or_else(|| cwd.clone());
+                    let mut raw = event.path.clone();
+                    match this.paseo_resolve_open_file(&source_cwd, &raw) {
+                        crate::paseo_host::OpenFileResolution::Blocked(reason) => {
+                            this.error = Some(crate::i18n::t(reason));
+                            cx.notify();
+                            return;
+                        }
+                        crate::paseo_host::OpenFileResolution::LocalMac(local) => {
+                            // Opened from this Mac, beside the project's local checkout.
+                            raw = local;
+                            if let Ok(local) = this.allowed_terminal_cwd(cx) {
+                                cwd = local;
+                            }
+                        }
+                        crate::paseo_host::OpenFileResolution::Keep => {
+                            if monocode_core::remote::parse_remote_path(&source_cwd).is_some() {
+                                cwd = source_cwd;
+                            }
                         }
                     }
                     let (path, location) = crate::file_editor::file_location(&raw, &cwd);
@@ -10400,7 +10443,10 @@ mod tests {
             .update(visual, |shell, w, cx| {
                 // The click comes from the focused conversation's transcript.
                 shell.focus_active(w, cx);
-                w.dispatch_action(Box::new(crate::file_editor::OpenPath(link.clone())), cx)
+                w.dispatch_action(
+                    Box::new(crate::file_editor::OpenPath::new(link.clone())),
+                    cx,
+                )
             })
             .unwrap();
         visual.run_until_parked();
@@ -10420,6 +10466,67 @@ mod tests {
                 );
             })
             .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[gpui::test]
+    fn remote_devbox_session_cannot_open_local_mac_file_links(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let dir = std::env::temp_dir().join(format!(
+            "paseo-remote-isolation-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let secret = dir.join("secret.txt");
+        std::fs::write(&secret, "mac-secret\n").unwrap();
+        let local = dir.canonicalize().unwrap();
+        let mac_link = format!(
+            "remote://mac-local{}/secret.txt:1:1",
+            local.to_str().unwrap()
+        );
+        let bare_mac_path = format!("{}/secret.txt", local.to_str().unwrap());
+        let devbox_cwd = "remote://devbox-boe/home/dev/project".to_owned();
+        window
+            .update(cx, |shell, _, cx| {
+                let prefs = &mut shell.workspace.preferences.extra;
+                prefs.insert(
+                    crate::paseo_host::PROJECT_SELECTION.into(),
+                    serde_json::json!({}),
+                );
+                prefs.insert("paseo_environment".into(), serde_json::json!("mac-local"));
+                prefs.insert(
+                    "paseo_host_endpoint".into(),
+                    serde_json::json!("http://127.0.0.1:1234"),
+                );
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        for link in [&mac_link, &bare_mac_path] {
+            window
+                .update(visual, |shell, w, cx| {
+                    shell.error = None;
+                    shell.focus_active(w, cx);
+                    w.dispatch_action(
+                        Box::new(crate::file_editor::OpenPath::scoped(
+                            link.clone(),
+                            devbox_cwd.clone(),
+                        )),
+                        cx,
+                    );
+                })
+                .unwrap();
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, _, cx| {
+                    assert!(
+                        shell.active_review(cx).is_none(),
+                        "remote devbox session must never open local Mac file {link}"
+                    );
+                    assert!(shell.error.is_some());
+                })
+                .unwrap();
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[gpui::test]

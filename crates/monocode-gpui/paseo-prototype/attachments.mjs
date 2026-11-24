@@ -7,10 +7,17 @@ import {join} from 'node:path';
 export const MAX_ATTACHMENT_BYTES=20*1024*1024;
 export const MAX_ATTACHMENTS_PER_SEND=20;
 export const MAX_CHUNK_BYTES=512*1024;
-const MAX_MESSAGES_PER_SESSION=200;
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const ALLOWED_IMAGE_MIMES=new Set(['image/png','image/jpeg','image/webp','image/gif']);
 const plain=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
+const PNG_MAGIC=Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]);
+function matchesImageMagic(bytes,mimeType) {
+  if(mimeType==='image/png')return bytes.length>=8&&bytes.subarray(0,8).equals(PNG_MAGIC);
+  if(mimeType==='image/jpeg')return bytes.length>=3&&bytes[0]===0xff&&bytes[1]===0xd8&&bytes[2]===0xff;
+  if(mimeType==='image/gif')return bytes.length>=6&&(bytes.subarray(0,6).toString('ascii')==='GIF87a'||bytes.subarray(0,6).toString('ascii')==='GIF89a');
+  if(mimeType==='image/webp')return bytes.length>=12&&bytes.subarray(0,4).toString('ascii')==='RIFF'&&bytes.subarray(8,12).toString('ascii')==='WEBP';
+  return false;
+}
 
 export class AttachmentStore {
   constructor(directory) {
@@ -61,17 +68,17 @@ export class AttachmentStore {
       const path=this.pathFor(entry.id);
       let actual=-1;try{actual=statSync(path).size;}catch(e){if(e.code!=='ENOENT')throw e;}
       if(actual!==entry.size)throw Error(`Attachment ${entry.name} is incomplete`);
+      const data=readFileSync(path);
+      if(!matchesImageMagic(data,entry.mimeType))throw Error('图片文件内容与声明的格式不匹配，无法发送。');
       refs.push({id:entry.id,name:entry.name,mimeType:entry.mimeType,kind:'image',size:entry.size});
-      images.push({data:readFileSync(path).toString('base64'),mimeType:entry.mimeType});
+      images.push({data:data.toString('base64'),mimeType:entry.mimeType});
     }
     return {refs,images};
   }
   bindToMessage(sessionId,messageId,refs) {
     if(!refs?.length)return;
     const messages=this.index[sessionId]??={};
-    delete messages[messageId];messages[messageId]=refs; // re-insert keeps insertion order == recency
-    const keys=Object.keys(messages);
-    for(const key of keys.slice(0,Math.max(0,keys.length-MAX_MESSAGES_PER_SESSION)))delete messages[key];
+    delete messages[messageId];messages[messageId]=refs; // keep persistent history mapping across >200 messages
     mkdirSync(join(this.indexPath,'..'),{recursive:true});
     const temp=`${this.indexPath}.tmp`;
     writeFileSync(temp,JSON.stringify(this.index),{mode:0o600});renameSync(temp,this.indexPath);

@@ -1071,7 +1071,7 @@ mod tests {
         let seen = opened.clone();
         cx.update(|cx| {
             cx.on_action(move |action: &crate::file_editor::OpenPath, _| {
-                seen.borrow_mut().push(action.0.clone())
+                seen.borrow_mut().push(action.path.clone())
             });
         });
         let window = cx.update(|cx| {

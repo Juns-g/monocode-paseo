@@ -499,9 +499,17 @@ impl TranscriptView {
                     (None, None) => d,
                 })
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(move |_, window, cx| {
-                    window
-                        .dispatch_action(Box::new(crate::file_editor::OpenPath(path.clone())), cx);
+                .on_click({
+                    let source_cwd = self.file_link_base.clone();
+                    move |_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(crate::file_editor::OpenPath {
+                                path: path.clone(),
+                                source_cwd: source_cwd.clone(),
+                            }),
+                            cx,
+                        );
+                    }
                 })
         });
         let rows: Vec<_> = rows.collect();

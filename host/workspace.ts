@@ -704,13 +704,24 @@ async function expandUntrackedDirectory(
     }).catch(() => []);
     // A nested repository stays one collapsed entry, as in Git itself.
     if (entries.some((entry) => entry.name === ".git")) return null;
+    const maybeIgnoredDirs: string[] = [];
     for (const entry of entries) {
       const path = `${dir}/${entry.name}`;
       if (entry.isDirectory()) {
-        if (!IGNORED_DIRS.has(entry.name)) pending.push(path);
+        if (IGNORED_DIRS.has(entry.name)) maybeIgnoredDirs.push(path);
+        else pending.push(path);
       } else {
         if (--left < 0) return null;
         found.push(path);
+      }
+    }
+    if (maybeIgnoredDirs.length) {
+      const ignored = await ignoredPaths(
+        root,
+        maybeIgnoredDirs.map((path) => `${path}/`),
+      );
+      for (const path of maybeIgnoredDirs) {
+        if (!ignored.has(`${path}/`) && !ignored.has(path)) pending.push(path);
       }
     }
   }

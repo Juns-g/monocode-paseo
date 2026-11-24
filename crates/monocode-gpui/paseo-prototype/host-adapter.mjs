@@ -71,6 +71,7 @@ export function projectBlocks(page,entries=page.displayEntries??page.entries,req
       block.startedAt=at;block.providerTurnId=entry.turnId??undefined;
       const messageId=extractUserMessageId(entry);
       if(messageId)block.paseoMessageId=messageId;
+      if(entry.prototypeTruncated)block.paseoTruncated=true;
       prompt=block;
       const files=item.clientMessageId?attachmentsFor(item.clientMessageId):null;
       if(files?.length)block.attachments=files;
@@ -596,7 +597,7 @@ export class PaseoHost {
       const page=await this.client.fetchAgentTimeline(id,{projection:'canonical',direction:'before',cursor:{epoch:p.epoch,seq:p.before},limit});this.identity();
       if(page.agent?.id!==id||page.epoch!==p.epoch||page.reset||page.staleCursor)throw Error('Paseo 历史已变化，请重新同步 (history changed)');
       // Read-only: no permission blocks, no turn duration for a prompt whose turn may continue past the page, and no cached window is touched.
-      const blocks=projectBlocks({epoch:page.epoch,partial:true},this.projectTimeline(page.entries));
+      const blocks=projectBlocks({epoch:page.epoch,partial:true},this.projectTimeline(page.entries),()=>null,messageId=>this.attachments.forMessage(id,messageId));
       return {result:{epoch:page.epoch,blocks,before:page.hasOlder&&page.entries.length?page.entries[0].seqStart:null}};
     }
     if(method==='sessions.syncChunk')return {result:this.transfers.chunk(p.sessionId,p.transfer,p.offset)};

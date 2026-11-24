@@ -22,6 +22,7 @@ pub(crate) enum Request {
         turn: usize,
         message_id: String,
         text: String,
+        can_restore_prompt: bool,
     },
     Draft {
         send: bool,

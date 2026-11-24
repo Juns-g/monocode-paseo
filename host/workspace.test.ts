@@ -586,3 +586,19 @@ it("reports tracked blobs by indexOid, and expands untracked folders within a ca
     false,
   );
 });
+
+it("does not skip unignored untracked folders named target when expanding", async () => {
+  const { root, git } = makeRepo();
+  writeFileSync(join(root, "README.md"), "hi\n");
+  git("add", ".");
+  git("commit", "-qm", "initial");
+  mkdirSync(join(root, "new/target"), { recursive: true });
+  writeFileSync(join(root, "new/target/result.txt"), "line1\nline2\n");
+
+  const index = await hostGitIndex(root);
+  const byPath = new Map(index.files.map((file) => [file.relative, file]));
+  expect(byPath.get("new/target/result.txt")).toMatchObject({
+    status: "untracked",
+    additions: 2,
+  });
+});

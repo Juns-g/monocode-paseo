@@ -59,6 +59,7 @@ impl Conversation {
         }
     }
     pub(super) fn save_follow_ups(&mut self, cx: &mut Context<Self>) {
+        self.sync_paseo_rewind_enabled(cx);
         self.follow_ups.state.revision += 1;
         let mut snapshot = self.follow_ups.state.clone();
         let revision = snapshot.revision;
@@ -324,7 +325,11 @@ impl Conversation {
         if self.paseo_follow_ups() && (!self.remote_state.online || self.remote_state.pending) {
             return;
         }
-        if self.editing_last_turn.pending() || self.stopping {
+        if self.editing_last_turn.pending()
+            || self.stopping
+            || self.remote_state.rewinding
+            || self.remote_state.rewind_confirm.is_some()
+        {
             return;
         }
         if !self.history_ready() {

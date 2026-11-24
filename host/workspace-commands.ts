@@ -399,11 +399,23 @@ export class WorkspaceCommands {
       throw new Error("Too many paths");
     return Promise.all(
       input.map(async (path) => {
-        const mtimeMs = await this.existing(path)
-          .then(({ path: actual }) => stat(actual))
-          .then((info) => (info.isFile() ? Math.floor(info.mtimeMs) : null))
+        const entry = await this.existing(path)
+          .then(({ path: actual }) => stat(actual, { bigint: true }))
+          .then((info) =>
+            info.isFile()
+              ? {
+                  mtimeMs: Number(info.mtimeMs),
+                  mtimeNs: info.mtimeNs.toString(),
+                  ctimeNs: info.ctimeNs.toString(),
+                  size: Number(info.size),
+                  ino: info.ino.toString(),
+                }
+              : null,
+          )
           .catch(() => null);
-        return { path: String(path), mtimeMs };
+        return entry
+          ? { path: String(path), ...entry }
+          : { path: String(path), mtimeMs: null };
       }),
     );
   }
