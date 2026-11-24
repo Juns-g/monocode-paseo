@@ -304,6 +304,7 @@ impl State {
 pub(crate) struct OpenHistory {
     remote: monocode_core::store::RemoteSession,
     settings: monocode_core::agent::Settings,
+    follow_ups: Option<monocode_core::follow_up::State>,
     snapshot: Option<Value>,
     history: Option<(
         crate::transcript::PreparedHistory,
@@ -421,7 +422,7 @@ pub(crate) fn prepare_remote_open_with(
     paged: bool,
 ) -> Result<OpenHistory, String> {
     let mut timings = OpenTimings::new();
-    let (mut remote, mut settings) = {
+    let (mut remote, mut settings, follow_ups) = {
         let store = locked(store)?;
         timings.mark("storeLockWaitMs");
         (
@@ -429,6 +430,11 @@ pub(crate) fn prepare_remote_open_with(
                 .remote_session(id)?
                 .ok_or("Remote session no longer exists")?,
             store.agent_settings(id)?.unwrap_or_default(),
+            if initial {
+                Some(store.follow_ups(id)?)
+            } else {
+                None
+            },
         )
     };
     timings.mark("storeReadMs");
@@ -525,6 +531,7 @@ pub(crate) fn prepare_remote_open_with(
     Ok(OpenHistory {
         remote,
         settings,
+        follow_ups,
         snapshot,
         history,
         window,
@@ -719,10 +726,30 @@ impl Conversation {
                     this.remote_state.viewed_at = Some(std::time::Instant::now());
                 }
                 match result {
-                    Ok(OpenHistory { remote, settings, snapshot, history, window, descriptor, workspace_choices, timings, machine_id }) => {
+                    Ok(OpenHistory {
+                        remote,
+                        settings,
+                        follow_ups,
+                        snapshot,
+                        history,
+                        window,
+                        descriptor,
+                        workspace_choices,
+                        timings,
+                        machine_id,
+                    }) => {
                         let install_started = std::time::Instant::now();
                         if initial && std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
                             this.remote_state.first_content_trace = Some(started);
+                        }
+                        if let Some(state) = follow_ups
+                            && (state.revision > this.follow_ups.state.revision
+                                || (initial
+                                    && this.follow_ups.persisted == 0
+                                    && state.revision >= this.follow_ups.state.revision))
+                        {
+                            this.follow_ups.persisted = state.revision;
+                            this.follow_ups.state = state;
                         }
                         this.remote_state.unbound = remote.session_id.is_none();
                         if let Some(choices) = workspace_choices {
@@ -1197,9 +1224,19 @@ impl Conversation {
         let store = self.store.clone();
         let id = self.summary.id;
         let work = cx.background_executor().spawn(async move {
-            let remote = locked(&store)?
-                .remote_session(id)?
-                .ok_or("Remote session no longer exists")?;
+            let (remote, queued_count) = {
+                let store = locked(&store)?;
+                let remote = store
+                    .remote_session(id)?
+                    .ok_or("Remote session no longer exists")?;
+                let queued = store.follow_ups(id)?.messages.len();
+                (remote, queued)
+            };
+            if queued_count > 0 {
+                return Err(crate::i18n::t(
+                    "Clear or send queued messages before rewinding.",
+                ));
+            }
             let session_id = remote.session_id.clone().ok_or("Unbound remote draft")?;
             let machine = remote.machine(&client)?;
             client.request(

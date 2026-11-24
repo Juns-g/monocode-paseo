@@ -1,5 +1,5 @@
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { mkdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { execGit, execGitSync } from "./git-exec";
 import { invalidateGitIndexCache } from "./workspace";
@@ -135,17 +135,19 @@ async function worktreesFingerprint(cwd: string): Promise<string> {
     }
     if (common) {
       const sig = (path: string) =>
-        stat(path).then(
-          (value) => `${value.mtimeMs}:${value.size}`,
+        stat(path, { bigint: true }).then(
+          (value) => `${value.mtimeNs}:${value.ctimeNs}:${value.size}`,
           () => "-",
         );
-      return (
-        await Promise.all([
-          sig(resolve(common, "worktrees")),
-          sig(resolve(common, "HEAD")),
-          sig(resolve(common, "config")),
-        ])
-      ).join("|");
+      const worktreesDir = resolve(common, "worktrees");
+      const linkedNames = await readdir(worktreesDir).catch(() => []);
+      const probes = [
+        worktreesDir,
+        resolve(common, "HEAD"),
+        resolve(common, "config"),
+        ...linkedNames.sort().map((name) => resolve(worktreesDir, name, "HEAD")),
+      ];
+      return (await Promise.all(probes.map(sig))).join("|");
     }
     const parent = resolve(dir, "..");
     if (parent === dir) break;
@@ -304,7 +306,7 @@ export async function renameHostWorktreeBranch(
   )
     throw new Error("Enter a valid branch name");
   await execGit(cwd, ["check-ref-format", "--branch", branch], { readOnly: true });
-  const tree = (await hostWorktrees(cwd)).worktrees.find(
+  const tree = (await listWorktrees(cwd)).worktrees.find(
     (entry) => entry.path === path && !entry.missing,
   );
   if (!tree || tree.isMain || tree.branch !== expectedBranch)

@@ -398,24 +398,26 @@ export class WorkspaceCommands {
     if (!Array.isArray(input) || input.length > MAX_STAT_FILES)
       throw new Error("Too many paths");
     return Promise.all(
-      input.map(async (path) => {
-        const entry = await this.existing(path)
-          .then(({ path: actual }) => stat(actual, { bigint: true }))
-          .then((info) =>
-            info.isFile()
-              ? {
-                  mtimeMs: Number(info.mtimeMs),
-                  mtimeNs: info.mtimeNs.toString(),
-                  ctimeNs: info.ctimeNs.toString(),
-                  size: Number(info.size),
-                  ino: info.ino.toString(),
-                }
-              : null,
-          )
-          .catch(() => null);
-        return entry
-          ? { path: String(path), ...entry }
-          : { path: String(path), mtimeMs: null };
+      input.map(async (path): Promise<FileMtime> => {
+        try {
+          const { path: actual } = await this.existing(path);
+          const info = await stat(actual, { bigint: true });
+          if (!info.isFile()) return { path: String(path), mtimeMs: null };
+          return {
+            path: String(path),
+            mtimeMs: Number(info.mtimeMs),
+            mtimeNs: info.mtimeNs.toString(),
+            ctimeNs: info.ctimeNs.toString(),
+            size: Number(info.size),
+            ino: info.ino.toString(),
+          };
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException | null)?.code;
+          if (code === "ENOENT" || code === "ENOTDIR") {
+            return { path: String(path), mtimeMs: null, missing: true };
+          }
+          return { path: String(path), mtimeMs: null };
+        }
       }),
     );
   }

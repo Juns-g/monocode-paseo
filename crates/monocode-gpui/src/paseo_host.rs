@@ -120,8 +120,13 @@ pub(crate) fn resolve_open_file(
             }
             return OpenFileResolution::Keep;
         }
-        let stripped = raw.strip_prefix("file://").unwrap_or(raw);
-        if raw.starts_with("file://") || stripped.starts_with('/') {
+        let lower = raw.to_ascii_lowercase();
+        let stripped = if lower.starts_with("file://") {
+            &raw[7..]
+        } else {
+            raw
+        };
+        if lower.starts_with("file:") || stripped.starts_with('/') || raw.contains("://") {
             return OpenFileResolution::Blocked("Remote sessions cannot open local Mac files.");
         }
         return OpenFileResolution::Keep;

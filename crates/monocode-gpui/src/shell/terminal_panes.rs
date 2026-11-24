@@ -88,7 +88,21 @@ impl Shell {
         if let Some(view) = self.terminal_pane_views.get(&pane) {
             return Some(view.clone());
         }
-        let cwd = self.workspace.terminal_panes.get(&pane)?.cwd.clone();
+        let raw_cwd = self.workspace.terminal_panes.get(&pane)?.cwd.clone();
+        let cwd = if raw_cwd.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX) {
+            let prefs = &self.workspace.preferences;
+            let extra = |key: &str| prefs.extra.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            crate::paseo_host::terminal_path(
+                crate::paseo_host::project_ui(prefs),
+                extra("paseo_environment"),
+                &raw_cwd,
+                extra("paseo_host_endpoint"),
+                &raw_cwd,
+            )
+            .ok()?
+        } else {
+            raw_cwd
+        };
         let view = self.spawn_terminal(cwd, cx);
         self.terminal_pane_views.insert(pane, view.clone());
         Some(view)
@@ -206,7 +220,14 @@ impl Shell {
             self.new_terminal(window, cx);
             return;
         };
-        let cwd = self.terminal_cwd(cx);
+        let cwd = match self.allowed_terminal_cwd(cx) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
         let terminal = self.spawn_terminal(cwd.clone(), cx);
         let pane = self.workspace.next_pane_id();
         self.workspace
@@ -244,7 +265,14 @@ impl Shell {
             self.new_title_terminal(window, cx);
             return;
         };
-        let cwd = self.terminal_cwd(cx);
+        let cwd = match self.allowed_terminal_cwd(cx) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
         let terminal = self.spawn_terminal(cwd.clone(), cx);
         let pane = self.workspace.next_pane_id();
         self.workspace

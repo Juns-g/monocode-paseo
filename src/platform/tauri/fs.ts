@@ -588,6 +588,7 @@ export type FileMtime = {
   ctimeNs?: string | null;
   size?: number | null;
   ino?: string | null;
+  missing?: boolean;
 };
 
 export function statFiles(paths: string[]): Promise<FileMtime[]> {

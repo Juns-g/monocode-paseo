@@ -715,11 +715,19 @@ pub(crate) fn resolve_file_links(row: &mut MarkdownRow, base: &str) {
 }
 
 fn open_link(url: &str, source_cwd: Option<&str>, window: &mut Window, cx: &mut App) {
-    // A remote conversation resolves file links against its `remote://` cwd.
-    let file = !url.starts_with("mailto:")
+    let lower = url.to_ascii_lowercase();
+    let is_web_or_mail = lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:");
+    let source_is_remote =
+        source_cwd.is_some_and(|src| src.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX));
+    // Match `file:` / `remote://` case-insensitively so mixed-case `FiLe://` URLs
+    // never bypass `OpenPath` and fall through to macOS `NSURL` (`cx.open_url`).
+    let file = !lower.starts_with("mailto:")
         && (!url.contains("://")
-            || url.starts_with("file://")
-            || url.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX));
+            || lower.starts_with("file:")
+            || lower.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX)
+            || (source_is_remote && !is_web_or_mail));
     if url.starts_with('#') {
         // An in-page anchor has nowhere to go in a transcript or a preview.
     } else if file {

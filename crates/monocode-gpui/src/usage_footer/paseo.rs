@@ -266,12 +266,21 @@ impl UsageFooter {
             return;
         }
         if let Some(prev) = state.active_host.take() {
+            // If a fetch was in flight when switching away, its response will be
+            // discarded by `request_gen`, so clear `attempted` so returning to this
+            // host re-fetches immediately instead of waiting out the 180 s throttle.
+            let prev_attempted = if state.fetching {
+                state.attempted.take();
+                None
+            } else {
+                state.attempted.take()
+            };
             state.by_host.insert(
                 prev,
                 PaseoHostUsageCache {
                     sources: std::mem::take(&mut state.sources),
                     updated_at: state.updated_at.take(),
-                    attempted: state.attempted.take(),
+                    attempted: prev_attempted,
                     error: state.error.take(),
                 },
             );
@@ -1255,6 +1264,17 @@ mod tests {
             f.switch_paseo_host("remote://mac-local/Users/me/repo", cx);
             assert_eq!(f.paseo.sources.len(), 1);
             assert_eq!(f.paseo.sources[0].id, "mac-cx");
+
+            // Switching away while a fetch is in flight (A -> B -> A) clears `attempted`
+            // so returning to A immediately re-fetches instead of hitting the 180 s throttle.
+            f.paseo.fetching = true;
+            f.paseo.attempted = Some(Instant::now());
+            f.switch_paseo_host("remote://devbox-boe/home/me/repo", cx);
+            f.switch_paseo_host("remote://mac-local/Users/me/repo", cx);
+            assert!(
+                f.paseo.attempted.is_none(),
+                "abandoned in-flight fetch must clear throttle timestamp"
+            );
         });
     }
 }

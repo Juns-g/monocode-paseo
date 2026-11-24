@@ -1107,6 +1107,7 @@ fn remote_stat(mtime_ms: u64, ctime_ns: &str, size: u64, ino: &str) -> review::R
         ctime_ns: Some(ctime_ns.into()),
         size: Some(size),
         ino: Some(ino.into()),
+        missing: false,
     }
 }
 
@@ -1156,9 +1157,21 @@ fn remote_versions_use_listing_and_high_precision_stat_without_diffs() {
         Some(&remote_stat(10, "10000001", 42, "778")),
     )
     .unwrap();
-    let gone =
+    assert!(
         review::remote_fast_version(&tracked, false, &head, Some(&review::RemoteStat::default()))
-            .unwrap();
+            .is_none(),
+        "stat failure without explicit missing=true must fall back to diff fingerprinting"
+    );
+    let gone = review::remote_fast_version(
+        &tracked,
+        false,
+        &head,
+        Some(&review::RemoteStat {
+            missing: true,
+            ..Default::default()
+        }),
+    )
+    .unwrap();
     assert!(a != b_same_mtime_diff_ctime && a != c_same_mtime_diff_ino && a != gone);
     // An untracked file has no index entry but is still versioned by full stat.
     let untracked = remote_file("untracked", None);

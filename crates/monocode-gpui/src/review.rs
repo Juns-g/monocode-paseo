@@ -192,14 +192,22 @@ pub(crate) struct ReviewCache {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ReviewCacheKey {
-    Changes { cwd: String, staged: Option<bool> },
-    Commit { cwd: String, sha: String },
+    Changes {
+        cwd: String,
+        path: Option<String>,
+        staged: Option<bool>,
+    },
+    Commit {
+        cwd: String,
+        sha: String,
+    },
 }
 impl ReviewCacheKey {
     fn from_tab(tab: &ReviewTab) -> Option<Self> {
         match tab {
-            ReviewTab::Changes { cwd, staged, .. } => Some(Self::Changes {
+            ReviewTab::Changes { cwd, path, staged } => Some(Self::Changes {
                 cwd: cwd.clone(),
+                path: path.clone(),
                 staged: *staged,
             }),
             ReviewTab::Commit { cwd, sha, .. } => Some(Self::Commit {
@@ -2433,6 +2441,23 @@ mod tests {
             assert_eq!(source.view.read(cx).draft_annotation_count(), 0);
             git.update(cx, |git, cx| {
                 git.review_cache.remember(&source, Some(202), cx)
+            });
+        });
+        // Closing an empty single-file Changes tab in the SAME session must NOT wipe
+        // the whole-repo Changes drafts cached for that session.
+        let single_file_tab = ReviewTab::Changes {
+            cwd: "/repo".into(),
+            path: Some("a.rs".into()),
+            staged: Some(false),
+        };
+        let pane_a_file = cx
+            .new(|cx| ReviewPane::new_for_session(git.clone(), Default::default(), Some(101), cx));
+        pane_a_file.update(cx, |pane, cx| {
+            let mut source = pane.source(single_file_tab, cx);
+            source.files = Some(Vec::new());
+            assert_eq!(source.view.read(cx).draft_annotation_count(), 0);
+            git.update(cx, |git, cx| {
+                git.review_cache.remember(&source, Some(101), cx)
             });
         });
         // Session A reopens Changes and gets its own 1 draft back cleanly!

@@ -134,11 +134,13 @@ pub(super) struct RemoteStat {
     pub(super) size: Option<u64>,
     #[serde(default)]
     pub(super) ino: Option<String>,
+    #[serde(default)]
+    pub(super) missing: bool,
 }
 
 /// A remote file's version from the listing alone, or `None` when only its
 /// diff can tell (a host too old to send `indexOid` or high-precision stat
-/// identity, or when stat is unavailable).
+/// identity, or when stat failed / is unavailable).
 pub(super) fn remote_fast_version(
     file: &ChangedFile,
     staged: bool,
@@ -161,15 +163,10 @@ pub(super) fn remote_fast_version(
         return None;
     }
     let stat = stat?;
-    // A missing/deleted file has no stat fields; an existing file requires
-    // kernel-updated ctime_ns + size (plus inode/mtime_ns) so mtime-preserving
-    // edits cannot reuse stale diffs. Older hosts without ctime_ns fall back
-    // to content fingerprinting.
-    let disk_token = if stat.mtime_ms.is_none()
-        && stat.mtime_ns.is_none()
-        && stat.ctime_ns.is_none()
-        && stat.size.is_none()
-    {
+    // Only an explicit ENOENT/ENOTDIR from the host (`missing: true`) is cacheable
+    // as missing; generic stat errors or non-regular files (all-None without `missing`)
+    // MUST return `None` so callers fall back to diff content fingerprinting.
+    let disk_token = if stat.missing {
         "missing".to_owned()
     } else {
         let ctime_ns = stat.ctime_ns.as_deref()?;

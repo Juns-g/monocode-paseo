@@ -10386,6 +10386,16 @@ impl Shell {
             "unexpected terminal error: {:?}",
             self.error
         );
+        // Title-bar new / split terminal entry points must also refuse remote host projects.
+        let before_panes = self.terminal_pane_views.len();
+        self.error = None;
+        self.new_title_terminal(window, cx);
+        assert_eq!(self.terminal_pane_views.len(), before_panes);
+        assert!(self.error.is_some());
+        self.error = None;
+        self.split_title_terminal(window, cx);
+        assert_eq!(self.terminal_pane_views.len(), before_panes);
+        assert!(self.error.is_some());
     }
     pub(crate) fn paseo_fixture_current_project_label(&self) -> String {
         self.project_label(&self.workspace.project)
@@ -10484,6 +10494,7 @@ mod tests {
             local.to_str().unwrap()
         );
         let bare_mac_path = format!("{}/secret.txt", local.to_str().unwrap());
+        let mixed_file_url = format!("FiLe://{}/secret.txt", local.to_str().unwrap());
         let devbox_cwd = "remote://devbox-boe/home/dev/project".to_owned();
         window
             .update(cx, |shell, _, cx| {
@@ -10502,7 +10513,7 @@ mod tests {
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        for link in [&mac_link, &bare_mac_path] {
+        for link in [&mac_link, &bare_mac_path, &mixed_file_url] {
             window
                 .update(visual, |shell, w, cx| {
                     shell.error = None;
