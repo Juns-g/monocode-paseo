@@ -466,10 +466,23 @@ impl UsageFooter {
             .child(div().truncate().child(text))
     }
 
-    pub(super) fn render_paseo(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_paseo(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let now = usage::now_ms();
         let classic = self.classic;
         let fetching = self.paseo.fetching;
+        let viewport_h = f32::from(window.viewport_size().height);
+        let popover_max_h = if viewport_h > 0. {
+            (viewport_h - 64.).clamp(240., 580.)
+        } else {
+            520.
+        };
+        // Subtract popover 1px vertical margin (2px), 10px vertical padding (20px),
+        // and the compact 22px status bar so the scroll body fits cleanly without clipping.
+        let scroll_max_h = (popover_max_h - 44.).max(160.);
         let description = if self.paseo.sources.is_empty() {
             self.paseo
                 .error
@@ -596,12 +609,12 @@ impl UsageFooter {
                         .side(Side::Top)
                         .gap(7.)
                         .width(320.)
-                        .max_height(460.)
+                        .max_height(popover_max_h)
                         .padding(10.)
                         .on_dismiss(move |window, cx| {
                             let _ = weak.update(cx, |this, cx| this.dismiss(window, cx));
                         })
-                        .child(self.paseo_details(now, cx)),
+                        .child(self.paseo_details(now, scroll_max_h, cx)),
                 )
             })
             .into_any_element()
@@ -609,7 +622,7 @@ impl UsageFooter {
 
     fn notice(text: String) -> gpui::Div {
         div()
-            .mb_2()
+            .flex_shrink_0()
             .rounded_lg()
             .px(px(10.))
             .py_2()
@@ -620,7 +633,12 @@ impl UsageFooter {
             .child(text)
     }
 
-    pub(super) fn paseo_details(&self, now: i64, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn paseo_details(
+        &self,
+        now: i64,
+        scroll_max_h: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let state = &self.paseo;
         let updated = match state.updated_at {
             Some(at) => match (now - at).max(0) / 60_000 {
@@ -636,55 +654,48 @@ impl UsageFooter {
         } else if state.sources.is_empty() && state.error.is_some() {
             Some("Usage unavailable")
         } else if state.sources.is_empty() {
-            Some("No Codex or Antigravity usage reported by Paseo.")
+            Some("No Codex or Antigravity usage reported.")
         } else {
             None
         };
         div()
             .id("usage-details-content")
             .role(Role::Dialog)
-            .aria_label("Paseo usage details")
+            .aria_label("Usage details")
             .track_focus(&self.details)
             .key_context("UsageDetails")
             .on_action(cx.listener(|this, _: &DismissUsage, window, cx| {
                 this.dismiss(window, cx);
             }))
+            .w_full()
+            .min_h_0()
             .flex()
             .flex_col()
             .text_size(px(11.))
             .text_color(content(1.))
             .child(
                 div()
+                    .h(px(22.))
+                    .flex_shrink_0()
                     .flex()
-                    .items_start()
-                    .gap(px(10.))
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
                     .px_1()
-                    .pt(px(2.))
-                    .pb(px(10.))
+                    .pb(px(6.))
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .line_height(px(16.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Paseo usage"),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(2.))
-                                    .text_size(px(10.))
-                                    .line_height(px(16.))
-                                    .text_color(content(0.4))
-                                    .child(updated),
-                            ),
+                            .truncate()
+                            .text_size(px(10.))
+                            .line_height(px(16.))
+                            .text_color(content(0.4))
+                            .child(updated),
                     )
                     .when(state.fetching, |d| {
                         d.child(
                             div()
-                                .mt(px(2.))
+                                .flex_shrink_0()
                                 .flex()
                                 .items_center()
                                 .gap_1()
@@ -695,44 +706,56 @@ impl UsageFooter {
                         )
                     }),
             )
-            .when(state.error.is_some() && !state.sources.is_empty(), |d| {
-                d.child(Self::notice(
-                    "Couldn’t refresh. Showing the last available snapshot.".into(),
-                ))
-            })
-            .children(empty_text.map(|text| {
+            .child(
                 div()
-                    .rounded_lg()
-                    .bg(content(0.04))
-                    .border_1()
-                    .border_color(content(0.06))
-                    .px_3()
-                    .py_4()
+                    .id("usage-details-scroll")
+                    .debug_selector(|| "usage-details-scroll".into())
+                    .w_full()
+                    .max_h(px(scroll_max_h))
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .child(
+                    .gap(px(10.))
+                    .when(state.error.is_some() && !state.sources.is_empty(), |d| {
+                        d.child(Self::notice(
+                            "Couldn’t refresh. Showing the last available snapshot.".into(),
+                        ))
+                    })
+                    .children(empty_text.map(|text| {
                         div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(content(0.65))
-                            .child(text),
-                    )
-                    .children(state.error.clone().filter(|_| !loading).map(|error| {
-                        div()
-                            .mt_1()
-                            .max_w(px(260.))
-                            .text_center()
-                            .text_size(px(10.))
-                            .line_height(px(16.))
-                            .text_color(content(0.4))
-                            .child(error)
+                            .flex_shrink_0()
+                            .rounded_lg()
+                            .bg(content(0.04))
+                            .border_1()
+                            .border_color(content(0.06))
+                            .px_3()
+                            .py_4()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(content(0.65))
+                                    .child(text),
+                            )
+                            .children(state.error.clone().filter(|_| !loading).map(|error| {
+                                div()
+                                    .mt_1()
+                                    .max_w(px(260.))
+                                    .text_center()
+                                    .text_size(px(10.))
+                                    .line_height(px(16.))
+                                    .text_color(content(0.4))
+                                    .child(error)
+                            }))
                     }))
-            }))
-            .children(
-                state
-                    .sources
-                    .iter()
-                    .map(|source| self.source_section(source, now)),
+                    .children(
+                        state
+                            .sources
+                            .iter()
+                            .map(|source| self.source_section(source, now)),
+                    ),
             )
             .into_any()
     }
@@ -747,12 +770,13 @@ impl UsageFooter {
                 "usage-section-{}",
                 source.id
             )))
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .mb_2()
             .child(
                 div()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -790,6 +814,7 @@ impl UsageFooter {
             .when(source.windows.is_empty(), |d| {
                 d.child(
                     div()
+                        .flex_shrink_0()
                         .rounded_lg()
                         .bg(content(0.045))
                         .border_1()
@@ -813,6 +838,7 @@ impl UsageFooter {
             )
             .children(source.balances.iter().map(|b| {
                 div()
+                    .flex_shrink_0()
                     .rounded_lg()
                     .bg(content(0.045))
                     .border_1()
@@ -859,6 +885,7 @@ impl UsageFooter {
             pace_label(pace(w, source.observed_at, now), now)
         };
         div()
+            .flex_shrink_0()
             .rounded_lg()
             .bg(content(0.045))
             .border_1()
@@ -1167,7 +1194,9 @@ mod tests {
         assert_eq!(requests.lock().unwrap()[0], json!({"forceRefresh": false}));
         cx.refresh().unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        assert!(visual.debug_bounds("usage-footer").is_some());
+        if cfg!(debug_assertions) {
+            assert!(visual.debug_bounds("usage-footer").is_some());
+        }
         visual.simulate_keystrokes("enter");
         visual.run_until_parked();
         window

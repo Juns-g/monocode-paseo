@@ -319,6 +319,23 @@ test('a mutation never answers from a directory fetch that started before it',as
     assert.deepEqual(w.calls,[['archiveAgent','child']]);
   }finally{w.close();}
 });
+test('archive updates in-memory directory without triggering a full paginated history rescan',async()=>{
+  const w=world();try{
+    await w.host.directory();
+    let historyCalls=0;
+    const history=w.client.fetchAgentHistory;
+    w.client.fetchAgentHistory=async(...a)=>{historyCalls++;return history(...a);};
+    const result=(await w.update({sessionId:'a',archived:true})).result;
+    assert.equal(result.archived,true);
+    assert.equal(result.pinned,false);
+    assert.equal(historyCalls,0,'archive must not rescan full directory');
+    const rows=await w.list();
+    assert.equal(historyCalls,0,'subsequent list uses patched directory without rescanning');
+    assert.equal(rows.find(r=>r.id==='a').archived,true);
+    assert.equal(rows.find(r=>r.id==='child').archived,true,'paseo.parent-agent-id child cascades');
+    assert.equal(rows.find(r=>r.id==='peer').archived,false,'detached sibling stays live');
+  }finally{w.close();}
+});
 test('16 parent-redacted snapshot sequences project without lost prose or duplicate block IDs',t=>{
   const directory=process.env.PASEO_R8_SHAPES;
   if(!directory){t.skip('Set PASEO_R8_SHAPES to the parent-redacted corpus');return;}

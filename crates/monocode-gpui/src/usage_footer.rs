@@ -377,7 +377,7 @@ impl UsageFooter {
     }
     fn details(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.paseo_mode {
-            return self.paseo_details(usage::now_ms(), cx);
+            return self.paseo_details(usage::now_ms(), 480., cx);
         }
         if self.show_accounts
             && let Some(center) = crate::accounts::get(cx)
@@ -856,9 +856,9 @@ impl UsageFooter {
 }
 use crate::accounts::ui::bar_color as usage_color;
 impl Render for UsageFooter {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.paseo_mode {
-            self.render_paseo(cx)
+            self.render_paseo(window, cx)
         } else {
             self.render_default(cx).into_any_element()
         }

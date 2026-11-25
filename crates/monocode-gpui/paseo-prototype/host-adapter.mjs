@@ -152,7 +152,7 @@ export class PaseoHost {
     try{for(const [id,at] of JSON.parse(readFileSync(this.seenPath,'utf8')))if(typeof id==='string'&&Number.isFinite(at))this.seen.set(id,at);}catch{}
     this.transfers=new SyncTransfers();
     this.attachments=new AttachmentStore(directory);
-    this.directoryAt=0;this.directoryRequests=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
+    this.directoryAt=0;this.directoryRequests=0;this.directoryGeneration=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
   }
   capabilities(){return this.isRemoteHost?BASE_CAPABILITIES:CAPABILITIES;}
   comparePath(path){return this.isRemoteHost?normalizePosixPath(path):canonicalPath(path);}
@@ -193,6 +193,7 @@ export class PaseoHost {
       await this.directoryWork.catch(()=>{});
     }
     const started=++this.directoryRequests;
+    const generation=this.directoryGeneration;
     this.directoryWork=(async()=>{
       const entries=new Map(),projects=new Map();let cursor;const seen=new Set();
       do{
@@ -267,10 +268,38 @@ export class PaseoHost {
       let pruned=false;
       for(const id of [...this.seen.keys()])if(this.statuses.get(id)?.bucket!=='attention'||!entries.has(id)){this.seen.delete(id);pruned=true;}
       if(pruned)this.saveSeen();
+      // Discard snapshots that started before a local sessions.update mutation so
+      // stale pre-archive / pre-rename rows never overwrite confirmed in-memory patches.
+      if(this.directoryGeneration!==generation){this.directoryAt=0;return;}
       this.entries=entries;this.projects=projects;this.directoryAt=Date.now();
     })();
     const work=this.directoryWork;work.started=started;
     try{await work;}finally{if(this.directoryWork===work)this.directoryWork=null;}
+  }
+  refreshEntryStatus(e){
+    const bucket=deriveAgentStateBucket({...e.agent,status:e.agent.status==='error'?'error':e.agent.activeTurn?'running':e.agent.status,pendingPermissionCount:e.agent.pendingPermissions?.length??0});
+    const old=this.statuses.get(e.agent.id);const entered=old?.bucket===bucket?old.entered:stamp(e.agent.updatedAt)||Date.now();
+    this.statuses.set(e.agent.id,{bucket,entered});e.paseoStatusEnteredAt=entered;
+    e.paseoBucket=bucket==='attention'&&stamp(e.agent.updatedAt)<=(this.seen.get(e.agent.id)??-1)?'done':bucket;
+  }
+  recomputeWorkspaceLinks(workspaceKey){
+    const group=[...this.entries.values()].filter(e=>(e.agent.workspaceId??e.agent.id)===workspaceKey);
+    if(!group.length)return;
+    const ordered=[...group].sort((a,b)=>Number(!!a.agent.archivedAt)-Number(!!b.agent.archivedAt)
+      ||Number(!!(a.agent.labels?.['paseo.parent-agent-id']||a.agent.labels?.['paseo.parent-server-id']||a.agent.labels?.['parent_agent']))
+        -Number(!!(b.agent.labels?.['paseo.parent-agent-id']||b.agent.labels?.['paseo.parent-server-id']||b.agent.labels?.['parent_agent']))
+      ||stamp(a.agent.createdAt)-stamp(b.agent.createdAt)||a.agent.id.localeCompare(b.agent.id));
+    const anchorId=ordered[0].agent.id;
+    for(const e of group){
+      e.paseoWorkspaceAnchorId=anchorId;
+      const labels=e.agent.labels??{};
+      const foreignParent=labels['paseo.parent-server-id']&&labels['paseo.parent-server-id']!==this.serverId;
+      const labeledParent=labels['parent_agent']&&this.entries.has(labels['parent_agent'])&&!this.entries.get(labels['parent_agent']).agent.archivedAt
+        ?labels['parent_agent']:null;
+      const sameWorkspaceAnchor=e.agent.workspaceId&&anchorId&&anchorId!==e.agent.id?anchorId:null;
+      const resolvedParent=foreignParent?null:(labels['paseo.parent-agent-id']||labeledParent||sameWorkspaceAnchor||null);
+      e.paseoParentAgentId=resolvedParent&&resolvedParent!==e.agent.id?resolvedParent:null;
+    }
   }
   async target(id){
     this.identity();if(!this.entries.has(id))await this.directory(true);
@@ -617,29 +646,81 @@ export class PaseoHost {
       // Exactly one field per operation avoids partial multi-field mutations.
       if(Object.keys(p).filter(k=>!['sessionId','projectId'].includes(k)).length!==1)throw Error('One supported session change required');
       const agent=e.agent,anchor=e.paseoWorkspaceAnchorId===agent.id;
+      const workspaceKey=agent.workspaceId??agent.id;
+      const touchedWorkspaces=new Set([workspaceKey]);
       if(p.title!==undefined){
         const title=typeof p.title==='string'?p.title.trim():'';if(!title)throw Error('Empty rename cancelled');
         // Same condition summary() uses to show agent.title; the anchor shows (and renames) the workspace title.
-        if(agent.labels?.['paseo.parent-agent-id']||!anchor){this.identity();await this.client.updateAgent(agent.id,{name:title});}
-        else await this.control(agent).dispatch({serverId:this.serverId,agentId:agent.id,workspaceId:agent.workspaceId,op:'renameWorkspace',title});
+        if(agent.labels?.['paseo.parent-agent-id']||!anchor){
+          this.identity();await this.client.updateAgent(agent.id,{name:title});
+          e.agent={...e.agent,title};
+        }else{
+          await this.control(agent).dispatch({serverId:this.serverId,agentId:agent.id,workspaceId:agent.workspaceId,op:'renameWorkspace',title});
+          for(const row of this.entries.values()){
+            if((row.agent.workspaceId??row.agent.id)===workspaceKey){
+              row.workspace={...(row.workspace??{id:agent.workspaceId}),title};
+            }
+          }
+        }
       }
       else if(p.pinned!==undefined){
         if(!anchor)throw Error('置顶只适用于工作区的主会话；子会话或同一工作区的其他会话不能单独置顶。');
         await this.control(agent).dispatch({serverId:this.serverId,agentId:agent.id,workspaceId:agent.workspaceId,op:'pinWorkspace',pinned:p.pinned});
+        const pinnedAt=p.pinned?(e.workspace?.pinnedAt||new Date().toISOString()):null;
+        for(const row of this.entries.values()){
+          if((row.agent.workspaceId??row.agent.id)===workspaceKey){
+            row.workspace={...(row.workspace??{id:agent.workspaceId}),pinnedAt};
+          }
+        }
       }
       else if(p.archived===true){
-        if(!agent.archivedAt){
-          // Paseo closes the agent runtime (stopping a running turn) and archives its children.
+        let archivedAt=agent.archivedAt;
+        if(!archivedAt){
+          // Paseo closes the agent runtime (stopping a running turn) and cascades to paseo.parent-agent-id children.
           this.identity();const r=await this.client.archiveAgent(agent.id);if(!r?.archivedAt)throw Error('Archive not confirmed');
+          archivedAt=r.archivedAt;
+        }
+        const archivedIds=new Set([agent.id]);
+        e.agent={...e.agent,archivedAt,activeTurn:undefined,status:e.agent.status==='running'?'idle':e.agent.status};
+        this.refreshEntryStatus(e);
+        // Mirror Paseo's cascadeArchiveChildren (paseo.parent-agent-id chain only; detached siblings stay live).
+        let changed=true;
+        while(changed){
+          changed=false;
+          for(const row of this.entries.values()){
+            const parentId=row.agent.labels?.['paseo.parent-agent-id'];
+            if(parentId&&archivedIds.has(parentId)&&!archivedIds.has(row.agent.id)&&!row.agent.archivedAt){
+              archivedIds.add(row.agent.id);
+              row.agent={...row.agent,archivedAt,activeTurn:undefined,status:row.agent.status==='running'?'idle':row.agent.status};
+              this.refreshEntryStatus(row);
+              touchedWorkspaces.add(row.agent.workspaceId??row.agent.id);
+              changed=true;
+            }
+          }
+        }
+        // Any non-child referencing an archived agent via parent_agent label needs its link refreshed.
+        for(const row of this.entries.values()){
+          if(archivedIds.has(row.agent.labels?.['parent_agent']))touchedWorkspaces.add(row.agent.workspaceId??row.agent.id);
         }
       }
       else if(p.archived===false){
         // refreshAgent interrupts a live turn, so it is only sent for an archived agent.
-        if(agent.archivedAt){this.identity();await this.client.refreshAgent(agent.id);}
+        if(agent.archivedAt){
+          this.identity();await this.client.refreshAgent(agent.id);
+          const refreshed=await this.client.fetchAgent(agent.id);this.identity();
+          e.agent=refreshed?.agent??{...e.agent,archivedAt:null};
+          this.refreshEntryStatus(e);
+        }
+        for(const row of this.entries.values()){
+          if(row.agent.labels?.['parent_agent']===agent.id)touchedWorkspaces.add(row.agent.workspaceId??row.agent.id);
+        }
       }
       else throw Error('请在 Paseo 中修改此设置');
-      this.invalidate();await this.directory(true);const fresh=this.entries.get(agent.id);
-      return {result:fresh?summary(fresh,fresh.projectId):{...summary(e,e.projectId),archived:p.archived??!!agent.archivedAt}};
+      for(const key of touchedWorkspaces)this.recomputeWorkspaceLinks(key);
+      for(const h of this.histories.values()){h.dirty=true;h.generation=(h.generation??0)+1;}
+      this.directoryGeneration++;
+      this.directoryAt=Date.now();
+      return {result:summary(e,e.projectId)};
     }
     if(method==='paseo.checkCleanup'){
       const attempt=this.attempts.values[p.commandId];

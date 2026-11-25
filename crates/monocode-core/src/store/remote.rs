@@ -760,6 +760,59 @@ impl Store {
     pub fn remote_mutations(&self) -> u64 {
         self.remote_mutations.get()
     }
+    pub(crate) fn bump_remote_mutations(&self) {
+        self.remote_mutations.set(self.remote_mutations.get() + 1);
+    }
+    /// Archives or unarchives a session without holding `store`'s mutex across a
+    /// blocking remote host `sessions.update` RPC.
+    pub fn set_archived_shared(
+        store: &std::sync::Mutex<Store>,
+        id: i64,
+        archived: bool,
+    ) -> Result<(), String> {
+        let lock = || {
+            store
+                .lock()
+                .map_err(|_| "Session store lock poisoned".to_owned())
+        };
+        let remote_call = {
+            let guard = lock()?;
+            let Some(remote) = guard.remote_session(id)? else {
+                return guard.set_archived(id, archived);
+            };
+            if let Some(session_id) = &remote.session_id {
+                let client = crate::remote::default_connections()?;
+                let machine = remote.machine(&client)?;
+                guard.bump_remote_mutations();
+                Some((
+                    client,
+                    machine.id,
+                    session_id.clone(),
+                    remote.project.project_id.clone(),
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((client, machine_id, session_id, project_id)) = remote_call {
+            let params = json!({
+                "sessionId": session_id,
+                "projectId": project_id,
+                "archived": archived,
+            });
+            let result = client.request(&machine_id, "sessions.update", params);
+            if let Ok(guard) = lock() {
+                guard.bump_remote_mutations();
+            }
+            result?;
+        }
+        let guard = lock()?;
+        if let Some(mut fresh) = guard.remote_session(id)? {
+            fresh.summary.archived = archived;
+            guard.save_remote_session(&fresh)?;
+        }
+        Ok(())
+    }
     pub fn patch_remote_session(&self, id: i64, patch: Value) -> Result<(), String> {
         let mut remote = self
             .remote_session(id)?
