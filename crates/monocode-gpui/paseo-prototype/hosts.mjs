@@ -176,7 +176,10 @@ export class HostRegistry {
         });
         if (typeof unsubStatus === 'function') record.unsubscribers.push(unsubStatus);
         const unsubRaw = client.subscribeRawMessages?.(msg => {
-          if (msg?.type === 'agent_status') adapter.invalidate();
+          if (msg?.type === 'agent_status') {
+            if (typeof adapter.applyAgentStatus === 'function') adapter.applyAgentStatus(msg);
+            else adapter.invalidate();
+          }
         });
         if (typeof unsubRaw === 'function') record.unsubscribers.push(unsubRaw);
 

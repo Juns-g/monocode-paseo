@@ -153,10 +153,26 @@ export class PaseoHost {
     this.transfers=new SyncTransfers();
     this.attachments=new AttachmentStore(directory);
     this.directoryAt=0;this.directoryRequests=0;this.directoryGeneration=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
+    this.pathCache=new Map();this.repoRootCache=new Map();
   }
   capabilities(){return this.isRemoteHost?BASE_CAPABILITIES:CAPABILITIES;}
   comparePath(path){return this.isRemoteHost?normalizePosixPath(path):canonicalPath(path);}
-  resolveNavigationPath(path){return this.isRemoteHost?normalizePosixPath(path):navigationPath(path);}
+  resolveNavigationPath(path){
+    if(this.isRemoteHost)return normalizePosixPath(path);
+    const now=Date.now(),cached=this.pathCache.get(path);
+    if(cached && now-cached.at<30000)return cached.value;
+    const value=navigationPath(path);
+    this.pathCache.set(path,{at:now,value});
+    return value;
+  }
+  resolveRepositoryRoot(cwd){
+    if(this.isRemoteHost)return null;
+    const now=Date.now(),cached=this.repoRootCache.get(cwd);
+    if(cached && now-cached.at<30000)return cached.value;
+    const value=linkedRepositoryRoot(cwd);
+    this.repoRootCache.set(cwd,{at:now,value});
+    return value;
+  }
   fileProjects(){
     if(this.isRemoteHost)return [];
     return [...this.projects.keys()].flatMap(id=>{
@@ -180,10 +196,32 @@ export class PaseoHost {
   async clearAttention(control,agent){
     if(this.clearing.has(agent.id))return;
     const work=control.dispatch({serverId:this.serverId,agentId:agent.id,op:'clearAttention'}).then(()=>{},()=>{});
-    this.clearing.set(agent.id,work);work.then(()=>{this.clearing.delete(agent.id);this.invalidate();});
+    this.clearing.set(agent.id,work);work.then(()=>{this.clearing.delete(agent.id);});
     let timer;try{await Promise.race([work,new Promise(done=>{timer=setTimeout(done,this.clearTimeoutMs);})]);}finally{clearTimeout(timer);}
   }
   invalidate(){for(const h of this.histories.values()){h.dirty=true;h.generation=(h.generation??0)+1;}this.directoryAt=0;}
+  /** O(1) incremental handler for daemon `agent_status` broadcasts so active agent streaming
+   *  never forces a 26-page full `fetchAgentHistory` directory rescan. */
+  applyAgentStatus(message){
+    const info=message?.payload?.info;
+    const id=message?.payload?.agentId??info?.id;
+    if(!id||!info){this.invalidate();return;}
+    const entry=this.entries.get(id);
+    if(!entry||entry.agent.workspaceId!==info.workspaceId){this.invalidate();return;}
+    const archivedChanged=Boolean(entry.agent.archivedAt)!==Boolean(info.archivedAt);
+    const titleChanged=entry.agent.title!==info.title;
+    entry.agent=info;
+    this.refreshEntryStatus(entry);
+    if(archivedChanged){
+      this.recomputeWorkspaceLinks(info.workspaceId??id);
+      for(const row of this.entries.values()){
+        if(row.agent.labels?.['parent_agent']===id)this.recomputeWorkspaceLinks(row.agent.workspaceId??row.agent.id);
+      }
+    }
+    const h=this.histories.get(id);
+    if(h){h.dirty=true;h.generation=(h.generation??0)+1;}
+    if(archivedChanged||titleChanged)this.directoryGeneration++;
+  }
   async directory(force=false){
     this.identity();if(!force && Date.now()-this.directoryAt<2500)return;
     // A forced refresh follows a mutation: never answer it from a fetch that started before it.
@@ -233,7 +271,7 @@ export class PaseoHost {
       }
       // Linked Git checkouts share navigation, never their execution cwd or agent identity.
       const canonicalProjects=new Map(),aliases=new Map(),repositoryRoots=new Map();
-      for(const p of projects.values())repositoryRoots.set(p.id,this.isRemoteHost?null:linkedRepositoryRoot(p.cwd));
+      for(const p of projects.values())repositoryRoots.set(p.id,this.resolveRepositoryRoot(p.cwd));
       const placements=[...projects.values()].sort((a,b)=>Number(!!repositoryRoots.get(a.id))-Number(!!repositoryRoots.get(b.id))||a.cwd.localeCompare(b.cwd));
       for(const p of placements){
         const root=repositoryRoots.get(p.id),path=this.resolveNavigationPath(root??p.cwd),prior=canonicalProjects.get(path);
@@ -485,7 +523,10 @@ export class PaseoHost {
         // Record the viewed episode first so the index shows `done` even if the daemon clear hangs or fails.
         const at=stamp(agent.updatedAt);
         if(this.seen.get(agent.id)!==at){this.seen.set(agent.id,at);this.saveSeen();}
-        this.invalidate();await this.clearAttention(control,agent);
+        // Patch the in-memory bucket immediately so clicking a finished chat never forces a full directory rescan.
+        this.refreshEntryStatus(entry);
+        this.directoryGeneration++;
+        await this.clearAttention(control,agent);
       }
       return {commandId:c.commandId,sessionId:agent.id,revision:this.revision};
     }

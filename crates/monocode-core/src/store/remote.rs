@@ -763,13 +763,14 @@ impl Store {
     pub(crate) fn bump_remote_mutations(&self) {
         self.remote_mutations.set(self.remote_mutations.get() + 1);
     }
-    /// Archives or unarchives a session without holding `store`'s mutex across a
-    /// blocking remote host `sessions.update` RPC.
-    pub fn set_archived_shared(
+    /// Patches a remote session without holding `store`'s mutex across the
+    /// blocking `sessions.update` RPC. Returns `Ok(true)` if the session was
+    /// remote and handled, `Ok(false)` if it is a local session.
+    pub fn patch_remote_session_shared(
         store: &std::sync::Mutex<Store>,
         id: i64,
-        archived: bool,
-    ) -> Result<(), String> {
+        patch: Value,
+    ) -> Result<bool, String> {
         let lock = || {
             store
                 .lock()
@@ -778,7 +779,7 @@ impl Store {
         let remote_call = {
             let guard = lock()?;
             let Some(remote) = guard.remote_session(id)? else {
-                return guard.set_archived(id, archived);
+                return Ok(false);
             };
             if let Some(session_id) = &remote.session_id {
                 let client = crate::remote::default_connections()?;
@@ -795,11 +796,9 @@ impl Store {
             }
         };
         if let Some((client, machine_id, session_id, project_id)) = remote_call {
-            let params = json!({
-                "sessionId": session_id,
-                "projectId": project_id,
-                "archived": archived,
-            });
+            let mut params = patch.clone();
+            params["sessionId"] = json!(session_id);
+            params["projectId"] = json!(project_id);
             let result = client.request(&machine_id, "sessions.update", params);
             if let Ok(guard) = lock() {
                 guard.bump_remote_mutations();
@@ -808,9 +807,111 @@ impl Store {
         }
         let guard = lock()?;
         if let Some(mut fresh) = guard.remote_session(id)? {
-            fresh.summary.archived = archived;
+            if let Some(title) = patch["title"].as_str() {
+                fresh.summary.title = title.into();
+            }
+            if let Some(archived) = patch["archived"].as_bool() {
+                fresh.summary.archived = archived;
+            }
+            if let Some(pinned) = patch["pinned"].as_bool() {
+                fresh.summary.pinned = pinned;
+            }
+            if let Some(item) = patch.get("linkedWorkItem") {
+                fresh.summary.work_item = serde_json::from_value(item.clone()).ok();
+            }
             guard.save_remote_session(&fresh)?;
         }
+        Ok(true)
+    }
+    /// Archives or unarchives a session without holding `store`'s mutex across a
+    /// blocking remote host `sessions.update` RPC.
+    pub fn set_archived_shared(
+        store: &std::sync::Mutex<Store>,
+        id: i64,
+        archived: bool,
+    ) -> Result<(), String> {
+        if Self::patch_remote_session_shared(store, id, json!({"archived": archived}))? {
+            return Ok(());
+        }
+        store
+            .lock()
+            .map_err(|_| "Session store lock poisoned".to_owned())?
+            .set_archived(id, archived)
+    }
+    /// Renames a session without holding `store`'s mutex across a blocking remote RPC.
+    pub fn set_title_shared(
+        store: &std::sync::Mutex<Store>,
+        id: i64,
+        title: &str,
+    ) -> Result<(), String> {
+        if Self::patch_remote_session_shared(store, id, json!({"title": title}))? {
+            return Ok(());
+        }
+        store
+            .lock()
+            .map_err(|_| "Session store lock poisoned".to_owned())?
+            .title(id, title)
+    }
+    /// Pins or unpins sessions without holding `store`'s mutex across blocking remote RPCs.
+    pub fn set_pinned_shared(
+        store: &std::sync::Mutex<Store>,
+        ids: &[i64],
+        pinned: bool,
+    ) -> Result<(), String> {
+        let mut local = Vec::new();
+        for &id in ids {
+            if !Self::patch_remote_session_shared(store, id, json!({"pinned": pinned}))? {
+                local.push(id);
+            }
+        }
+        if !local.is_empty() {
+            store
+                .lock()
+                .map_err(|_| "Session store lock poisoned".to_owned())?
+                .set_pinned(&local, pinned)?;
+        }
+        Ok(())
+    }
+    /// Deletes a session without holding `store`'s mutex across a blocking remote RPC.
+    pub fn delete_shared(store: &std::sync::Mutex<Store>, id: i64) -> Result<(), String> {
+        let lock = || {
+            store
+                .lock()
+                .map_err(|_| "Session store lock poisoned".to_owned())
+        };
+        let remote_call = {
+            let mut guard = lock()?;
+            let Some(remote) = guard.remote_session(id)? else {
+                return guard.delete(id);
+            };
+            if let Some(session_id) = &remote.session_id {
+                let client = crate::remote::default_connections()?;
+                let machine = remote.machine(&client)?;
+                Some((
+                    client,
+                    machine.id,
+                    session_id.clone(),
+                    remote.project.project_id.clone(),
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((client, machine_id, session_id, project_id)) = remote_call {
+            client.request(
+                &machine_id,
+                "sessions.delete",
+                json!({"sessionId": session_id, "projectId": project_id}),
+            )?;
+        }
+        let guard = lock()?;
+        let dir = guard.thread_dir(id).ok().flatten();
+        let mut sessions = guard.remote_sessions()?;
+        sessions.remove(&id);
+        guard.hide_legacy_remote_sessions([id])?;
+        guard.commit_remote_sessions(&sessions, Vec::new())?;
+        drop(guard);
+        crate::store::thread_files::remove_dir(dir);
         Ok(())
     }
     pub fn patch_remote_session(&self, id: i64, patch: Value) -> Result<(), String> {

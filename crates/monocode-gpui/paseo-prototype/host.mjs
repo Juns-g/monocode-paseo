@@ -47,7 +47,7 @@ client.subscribeConnectionStatus(state=>{
     }).catch(()=>{console.error('Cannot discover Paseo projects');process.exit(1);});
   }
 });
-client.subscribeRawMessages(message=>{if(message.type==='agent_status')host.invalidate();});
+client.subscribeRawMessages(message=>{if(message.type==='agent_status')host.applyAgentStatus(message);});
 const stop=()=>{registry.close();host.close();server.close();process.exit(0);};
 process.on('SIGTERM',stop);process.on('SIGINT',stop);
 // Parent death releases client resources, never remote agents.

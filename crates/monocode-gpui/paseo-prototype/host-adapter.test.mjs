@@ -336,6 +336,21 @@ test('archive updates in-memory directory without triggering a full paginated hi
     assert.equal(rows.find(r=>r.id==='peer').archived,false,'detached sibling stays live');
   }finally{w.close();}
 });
+test('applyAgentStatus patches known agent in place without wiping directory cache and invalidates unknown agent',async()=>{
+  const w=world();try{
+    await w.host.directory();
+    let historyCalls=0;
+    const history=w.client.fetchAgentHistory;
+    w.client.fetchAgentHistory=async(...a)=>{historyCalls++;return history(...a);};
+    const updated={...w.agents.get('peer'),status:'running',activeTurn:{turnId:'t1'}};
+    w.host.applyAgentStatus({type:'agent_status',payload:{agentId:'peer',status:'running',info:updated}});
+    const rows=await w.list();
+    assert.equal(historyCalls,0,'known agent_status must not force a full directory rescan');
+    assert.equal(rows.find(r=>r.id==='peer').status,'running');
+    w.host.applyAgentStatus({type:'agent_status',payload:{agentId:'brand-new',status:'idle',info:{id:'brand-new',workspaceId:'w-new'}}});
+    assert.equal(w.host.directoryAt,0,'unknown agent_status invalidates directory for discovery');
+  }finally{w.close();}
+});
 test('16 parent-redacted snapshot sequences project without lost prose or duplicate block IDs',t=>{
   const directory=process.env.PASEO_R8_SHAPES;
   if(!directory){t.skip('Set PASEO_R8_SHAPES to the parent-redacted corpus');return;}

@@ -2223,5 +2223,8 @@
   "Offline": "离线",
   "Remote Paseo host has no projects": "远程 Paseo 宿主机暂无可用项目",
   "Remote sessions cannot open files from another host.": "远程宿主机对话不能打开其他宿主机或本机 Mac 的文件。",
-  "Remote sessions cannot open local Mac files.": "远程宿主机对话不能打开本机 Mac 文件。"
+  "Remote sessions cannot open local Mac files.": "远程宿主机对话不能打开本机 Mac 文件。",
+  "Usage": "用量",
+  "Pin to footer": "固定到底栏",
+  "Unpin from footer": "取消固定到底栏"
 }

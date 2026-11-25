@@ -1141,6 +1141,28 @@ impl Shell {
             .get(&workspace.project)
             .map(|id| classic_sidebar::ClassicSidebarTab::from_id(id))
             .unwrap_or_default();
+        let usage_pins: Option<Vec<crate::usage_footer::UsagePin>> = workspace
+            .preferences
+            .extra
+            .get("paseo_usage_pins")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let shell_weak_for_usage = cx.weak_entity();
+        let usage_footer = cx.new(|cx| {
+            let mut footer = UsageFooter::new(active_kind, cx);
+            footer.set_paseo_pins(usage_pins, cx);
+            footer.on_paseo_pins_change(move |pins, cx| {
+                let _ = shell_weak_for_usage.update(cx, |this, cx| {
+                    if let Ok(value) = serde_json::to_value(&pins) {
+                        this.workspace
+                            .preferences
+                            .extra
+                            .insert("paseo_usage_pins".into(), value);
+                        this.persist(cx);
+                    }
+                });
+            });
+            footer
+        });
         let mut this = Self {
             monos: None,
             quick_open: None,
@@ -1153,7 +1175,7 @@ impl Shell {
             orchestration_summaries: sidebar_metadata.orchestrations,
             started_by: sidebar_metadata.started_by,
             rails: Default::default(),
-            usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
+            usage_footer,
             resources,
             sidebar_frame,
             projects_frame,

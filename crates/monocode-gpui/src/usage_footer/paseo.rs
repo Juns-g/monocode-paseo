@@ -203,6 +203,14 @@ fn paseo_host_key(project: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A usage window pinned to the bottom footer bar (matches Paseo's `UsagePin`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UsagePin {
+    pub source_id: String,
+    pub window_id: String,
+}
+
 #[derive(Default)]
 pub(super) struct PaseoUsageState {
     pub(super) sources: Vec<PaseoUsageSource>,
@@ -210,6 +218,9 @@ pub(super) struct PaseoUsageState {
     pub(super) fetching: bool,
     pub(super) attempted: Option<Instant>,
     pub(super) error: Option<String>,
+    /// `None` follows source `summary: true` defaults; `Some(vec)` is the user's explicit pins.
+    pub(super) pinned: Option<Vec<UsagePin>>,
+    pub(super) on_pins_change: Option<std::rc::Rc<dyn Fn(Vec<UsagePin>, &mut App)>>,
     active_host: Option<String>,
     by_host: std::collections::HashMap<String, PaseoHostUsageCache>,
     request_gen: u64,
@@ -393,8 +404,83 @@ impl UsageFooter {
         cx.notify();
     }
 
-    fn source_chip(&self, source: &PaseoUsageSource, now: i64) -> gpui::Stateful<gpui::Div> {
-        let windows = summary_windows(source);
+    /// Effective pinned windows: explicit user selection if customized, else each
+    /// source's default `summary_windows` picks (matches Paseo's `effectiveUsagePins`).
+    pub(super) fn effective_paseo_pins(&self) -> Vec<UsagePin> {
+        if let Some(pins) = &self.paseo.pinned {
+            return pins.clone();
+        }
+        let mut defaults = Vec::new();
+        for source in &self.paseo.sources {
+            for w in summary_windows(source) {
+                let pin = UsagePin {
+                    source_id: source.source_id.clone(),
+                    window_id: w.id.clone(),
+                };
+                if !defaults.contains(&pin) {
+                    defaults.push(pin);
+                }
+            }
+        }
+        defaults
+    }
+
+    pub(super) fn is_paseo_window_pinned(&self, source_id: &str, window_id: &str) -> bool {
+        self.effective_paseo_pins()
+            .iter()
+            .any(|p| p.source_id == source_id && p.window_id == window_id)
+    }
+
+    /// Snapshots default pins on first edit, then toggles `(source_id, window_id)`
+    /// and notifies persistence.
+    pub(super) fn toggle_paseo_pin(
+        &mut self,
+        source_id: String,
+        window_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let mut pins = self.effective_paseo_pins();
+        if let Some(ix) = pins
+            .iter()
+            .position(|p| p.source_id == source_id && p.window_id == window_id)
+        {
+            pins.remove(ix);
+        } else {
+            pins.push(UsagePin {
+                source_id,
+                window_id,
+            });
+        }
+        self.paseo.pinned = Some(pins.clone());
+        if let Some(callback) = self.paseo.on_pins_change.clone() {
+            callback(pins, cx);
+        }
+        cx.notify();
+    }
+
+    fn pinned_windows_for<'a>(
+        &self,
+        source: &'a PaseoUsageSource,
+        pins: &[UsagePin],
+    ) -> Vec<&'a PaseoUsageWindow> {
+        source
+            .windows
+            .iter()
+            .filter(|w| {
+                self.paseo_percent(w).is_some()
+                    && pins
+                        .iter()
+                        .any(|p| p.source_id == source.source_id && p.window_id == w.id)
+            })
+            .collect()
+    }
+
+    fn source_chip(
+        &self,
+        source: &PaseoUsageSource,
+        windows: &[&PaseoUsageWindow],
+        now: i64,
+    ) -> gpui::Stateful<gpui::Div> {
         let worst = windows
             .iter()
             .filter_map(|w| Self::paseo_used(w))
@@ -415,17 +501,23 @@ impl UsageFooter {
                         .short_label
                         .as_deref()
                         .filter(|s| !s.is_empty() && !is_duration_token(s));
+                    let fallback_name = (!w.label.is_empty()
+                        && short.is_none()
+                        && (multiple || source.windows.len() > 1))
+                        .then_some(w.label.as_str());
                     let countdown = w
                         .resets_at
                         .filter(|at| *at > now)
                         .map(|at| compact(duration(at - now)));
                     let mut parts = Vec::new();
-                    parts.extend(short.map(str::to_owned));
+                    parts.extend(short.or(fallback_name).map(str::to_owned));
                     parts.push(format!("{percent:.0}%"));
                     // Windows without a reset time still need a name to tell them apart.
                     match (countdown, multiple, &w.short_label) {
                         (Some(c), _, _) => parts.push(c),
-                        (None, true, Some(s)) if short.is_none() && !s.is_empty() => {
+                        (None, true, Some(s))
+                            if short.is_none() && fallback_name.is_none() && !s.is_empty() =>
+                        {
                             parts.insert(0, s.clone())
                         }
                         _ => {}
@@ -483,6 +575,8 @@ impl UsageFooter {
         // Subtract popover 1px vertical margin (2px), 10px vertical padding (20px),
         // and the compact 22px status bar so the scroll body fits cleanly without clipping.
         let scroll_max_h = (popover_max_h - 44.).max(160.);
+        let pins = self.effective_paseo_pins();
+        let custom_pins = self.paseo.pinned.is_some();
         let description = if self.paseo.sources.is_empty() {
             self.paseo
                 .error
@@ -492,8 +586,12 @@ impl UsageFooter {
             self.paseo
                 .sources
                 .iter()
-                .map(|s| {
-                    let windows = summary_windows(s)
+                .filter_map(|s| {
+                    let windows = self.pinned_windows_for(s, &pins);
+                    if windows.is_empty() {
+                        return None;
+                    }
+                    let summary = windows
                         .iter()
                         .filter_map(|w| {
                             let percent = self.paseo_percent(w)?;
@@ -509,7 +607,7 @@ impl UsageFooter {
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("{}: {windows}", s.source_label)
+                    Some(format!("{}: {summary}", s.source_label))
                 })
                 .collect::<Vec<_>>()
                 .join(" · ")
@@ -518,13 +616,27 @@ impl UsageFooter {
             .paseo
             .sources
             .iter()
-            .map(|s| self.source_chip(s, now).into_any_element())
+            .filter_map(|s| {
+                let windows = self.pinned_windows_for(s, &pins);
+                if windows.is_empty() && (custom_pins || !s.windows.is_empty()) {
+                    return None;
+                }
+                Some(self.source_chip(s, &windows, now).into_any_element())
+            })
             .collect();
-        let placeholder = if chips.is_empty() {
-            Some(if fetching || self.paseo.error.is_none() {
-                "···"
+        let placeholder: Option<gpui::AnyElement> = if chips.is_empty() {
+            Some(if !self.paseo.sources.is_empty() {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(icon("pin", 11.).text_color(content(0.45)))
+                    .child(crate::i18n::t("Usage"))
+                    .into_any_element()
+            } else if fetching || self.paseo.error.is_none() {
+                div().child("···").into_any_element()
             } else {
-                "usage unavailable"
+                div().child("usage unavailable").into_any_element()
             })
         } else {
             None
@@ -571,7 +683,7 @@ impl UsageFooter {
                     .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
                     .child(self.anchor.probe())
                     .children(chips)
-                    .children(placeholder.map(|text| div().child(text)))
+                    .children(placeholder)
                     .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx)))
                     .on_action(
                         cx.listener(|this, _: &ToggleUsage, window, cx| this.toggle(window, cx)),
@@ -754,13 +866,18 @@ impl UsageFooter {
                         state
                             .sources
                             .iter()
-                            .map(|source| self.source_section(source, now)),
+                            .map(|source| self.source_section(source, now, cx)),
                     ),
             )
             .into_any()
     }
 
-    fn source_section(&self, source: &PaseoUsageSource, now: i64) -> gpui::Stateful<gpui::Div> {
+    fn source_section(
+        &self,
+        source: &PaseoUsageSource,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let title = match &source.account_label {
             Some(account) => format!("{} · {account}", source.source_label),
             None => source.source_label.clone(),
@@ -834,7 +951,7 @@ impl UsageFooter {
                 source
                     .windows
                     .iter()
-                    .map(|w| self.paseo_window_card(source, w, now)),
+                    .map(|w| self.paseo_window_card(source, w, now, cx)),
             )
             .children(source.balances.iter().map(|b| {
                 div()
@@ -869,10 +986,16 @@ impl UsageFooter {
         source: &PaseoUsageSource,
         w: &PaseoUsageWindow,
         now: i64,
-    ) -> gpui::Div {
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let shown = self.paseo_percent(w);
         let used = Self::paseo_used(w);
         let other = shown.map(|s| 100. - s);
+        let pinnable = shown.is_some();
+        let pinned = pinnable && self.is_paseo_window_pinned(&source.source_id, &w.id);
+        let source_id = source.source_id.clone();
+        let window_id = w.id.clone();
+        let card_id = gpui::SharedString::from(format!("usage-win-{}-{}", source.id, w.id));
         let reset = match w.resets_at {
             Some(at) if at <= now => Some("Resets now".to_owned()),
             Some(at) => Some(format!("Resets in {}", duration(at - now))),
@@ -885,19 +1008,41 @@ impl UsageFooter {
             pace_label(pace(w, source.observed_at, now), now)
         };
         div()
+            .id(card_id)
+            .group("usage-win-card")
             .flex_shrink_0()
+            .w_full()
             .rounded_lg()
-            .bg(content(0.045))
+            .bg(content(if pinned { 0.065 } else { 0.045 }))
             .border_1()
-            .border_color(content(0.06))
+            .border_color(content(if pinned { 0.12 } else { 0.06 }))
             .px_3()
             .py(px(10.))
+            .when(pinnable, |d| {
+                d.role(Role::Button)
+                    .aria_label(format!(
+                        "{}: {} {}",
+                        if pinned {
+                            crate::i18n::t("Unpin from footer")
+                        } else {
+                            crate::i18n::t("Pin to footer")
+                        },
+                        source.source_label,
+                        w.label
+                    ))
+                    .aria_selected(pinned)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(content(if pinned { 0.09 } else { 0.075 })))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_paseo_pin(source_id.clone(), window_id.clone(), cx);
+                    }))
+            })
             .child(
                 div()
                     .flex()
                     .justify_between()
-                    .items_baseline()
-                    .gap_3()
+                    .items_center()
+                    .gap_2()
                     .child(
                         div()
                             .min_w_0()
@@ -906,19 +1051,48 @@ impl UsageFooter {
                             .text_color(content(0.65))
                             .child(w.label.clone()),
                     )
-                    .child(div().flex_shrink_0().font_weight(FontWeight::MEDIUM).child(
-                        match shown {
-                            Some(p) => format!(
-                                "{p:.0}% {}",
-                                if self.show_remaining {
-                                    "remaining"
-                                } else {
-                                    "used"
-                                }
-                            ),
-                            None => "Disabled".into(),
-                        },
-                    )),
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().font_weight(FontWeight::MEDIUM).child(match shown {
+                                Some(p) => format!(
+                                    "{p:.0}% {}",
+                                    if self.show_remaining {
+                                        "remaining"
+                                    } else {
+                                        "used"
+                                    }
+                                ),
+                                None => "Disabled".into(),
+                            }))
+                            .when(pinnable, |d| {
+                                d.child(
+                                    div()
+                                        .size(px(18.))
+                                        .rounded_sm()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(pinned, |b| b.bg(content(0.14)))
+                                        .child(
+                                            icon("pin", 11.)
+                                                .text_color(content(if pinned {
+                                                    0.95
+                                                } else {
+                                                    0.28
+                                                }))
+                                                .when(!pinned, |i| {
+                                                    i.group_hover("usage-win-card", |s| {
+                                                        s.text_color(content(0.75))
+                                                    })
+                                                }),
+                                        ),
+                                )
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1305,5 +1479,97 @@ mod tests {
                 "abandoned in-flight fetch must clear throttle timestamp"
             );
         });
+    }
+
+    #[gpui::test]
+    fn paseo_usage_pins_follow_defaults_snapshot_on_first_toggle_and_persist(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let saved: Arc<Mutex<Vec<Vec<UsagePin>>>> = Arc::new(Mutex::new(Vec::new()));
+        let saved_cb = saved.clone();
+        let footer = cx.new(|cx| {
+            let mut f = UsageFooter::new(Kind::Codex, cx);
+            f.paseo_mode = true;
+            f.on_paseo_pins_change(move |pins, _| {
+                saved_cb.lock().unwrap().push(pins);
+            });
+            f
+        });
+        footer.update(cx, |f, cx| {
+            f.paseo.sources = vec![
+                PaseoUsageSource {
+                    id: "cx".into(),
+                    source_id: "codex".into(),
+                    source_label: "Codex".into(),
+                    status: "available".into(),
+                    windows: vec![
+                        PaseoUsageWindow {
+                            id: "five_hour".into(),
+                            label: "5h".into(),
+                            summary: true,
+                            used_pct: Some(20.),
+                            ..Default::default()
+                        },
+                        PaseoUsageWindow {
+                            id: "weekly".into(),
+                            label: "Weekly".into(),
+                            summary: false,
+                            used_pct: Some(40.),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                PaseoUsageSource {
+                    id: "ag".into(),
+                    source_id: "antigravity".into(),
+                    source_label: "Antigravity".into(),
+                    status: "available".into(),
+                    windows: vec![
+                        PaseoUsageWindow {
+                            id: "claude".into(),
+                            label: "Claude".into(),
+                            summary: true,
+                            used_pct: Some(10.),
+                            ..Default::default()
+                        },
+                        PaseoUsageWindow {
+                            id: "gemini".into(),
+                            label: "Gemini".into(),
+                            summary: false,
+                            used_pct: Some(5.),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ];
+            // Default pins come from summary: true windows.
+            assert!(f.is_paseo_window_pinned("codex", "five_hour"));
+            assert!(!f.is_paseo_window_pinned("codex", "weekly"));
+            assert!(f.is_paseo_window_pinned("antigravity", "claude"));
+            assert!(!f.is_paseo_window_pinned("antigravity", "gemini"));
+
+            // First toggle snapshots defaults and adds gemini without dropping existing defaults.
+            f.toggle_paseo_pin("antigravity".into(), "gemini".into(), cx);
+            assert!(f.is_paseo_window_pinned("codex", "five_hour"));
+            assert!(f.is_paseo_window_pinned("antigravity", "claude"));
+            assert!(f.is_paseo_window_pinned("antigravity", "gemini"));
+
+            // Unpinning codex removes only codex from footer while keeping antigravity pins.
+            f.toggle_paseo_pin("codex".into(), "five_hour".into(), cx);
+            assert!(!f.is_paseo_window_pinned("codex", "five_hour"));
+            let pins = f.effective_paseo_pins();
+            assert!(f.pinned_windows_for(&f.paseo.sources[0], &pins).is_empty());
+            assert_eq!(f.pinned_windows_for(&f.paseo.sources[1], &pins).len(), 2);
+
+            // Unpinning everything leaves an explicit empty pin list (never snaps back to defaults).
+            f.toggle_paseo_pin("antigravity".into(), "claude".into(), cx);
+            f.toggle_paseo_pin("antigravity".into(), "gemini".into(), cx);
+            assert_eq!(f.paseo.pinned, Some(vec![]));
+            assert!(f.effective_paseo_pins().is_empty());
+        });
+        assert_eq!(saved.lock().unwrap().len(), 4);
+        assert!(saved.lock().unwrap().last().unwrap().is_empty());
     }
 }

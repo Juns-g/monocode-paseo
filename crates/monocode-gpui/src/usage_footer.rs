@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 mod paseo;
 mod resets;
 
+pub(crate) use paseo::UsagePin;
+
 actions!(usage_footer, [DismissUsage, ToggleUsage, RefreshUsage]);
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
@@ -214,6 +216,16 @@ impl UsageFooter {
             self.classic = classic;
             cx.notify();
         }
+    }
+    pub(crate) fn set_paseo_pins(&mut self, pins: Option<Vec<UsagePin>>, cx: &mut Context<Self>) {
+        self.paseo.pinned = pins;
+        cx.notify();
+    }
+    pub(crate) fn on_paseo_pins_change(
+        &mut self,
+        callback: impl Fn(Vec<UsagePin>, &mut App) + 'static,
+    ) {
+        self.paseo.on_pins_change = Some(std::rc::Rc::new(callback));
     }
     #[cfg(test)]
     pub(crate) fn provider(&mut self, kind: Kind, cx: &mut Context<Self>) {
