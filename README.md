@@ -7,9 +7,21 @@ A fork of the native GPUI client of [MonoCode](https://github.com/hardbeat920/mo
 > ⚠️ **Personal experiment.** Only used on the author's own macOS (Apple Silicon) machine with Paseo 0.17.4. No guarantees on behavior, compatibility or stability, and no support. For the real thing, use upstream MonoCode. The upstream README is kept as [README.upstream.md](README.upstream.md).
 <img width="2600" height="1784" alt="image" src="https://github.com/user-attachments/assets/af4ad010-1e00-481f-b3a8-eaf71ecc07fd" />
 
+## Why this fork (Architecture)
+
+Upstream MonoCode Native and official Paseo each solve half of the problem well. This fork combines **MonoCode's Rust + GPUI native shell** with **Paseo's daemon and orchestration runtime** via a lightweight bundled Node sidecar (`paseo-host.mjs` / `host-adapter.mjs`) that translates MonoCode Host RPC onto the official `@getpaseo/client` SDK:
+
+| Dimension | Upstream MonoCode Native | Official Paseo | This Fork (`monocode-paseo`) |
+| --- | --- | --- | --- |
+| **UI & Rendering** | Rust + GPUI + Metal (low memory, recursive split panes, `alacritty_terminal`, `tree-sitter`) | Expo / React Native + Electron wrapper (cross-platform & UI plugins, heavier desktop shell) | **MonoCode GPUI native shell** + tailored multi-agent sidebar, diff review & quota UX |
+| **Orchestration & Runtime** | Local single-process (`monocode-core` + SQLite); `/operator`, file-scoped plans & Monos are local-only | Client–daemon split (`~/.paseo`), detached `terminal-worker`, HTTP MCP sub-agent trees, durable finish wakeups & cross-host routing | **Paseo daemon backend** — inherits MCP sub-agent orchestration, multi-client sync & remote hosts |
+| **Lifecycle Boundary** | Closing the desktop app stops local orchestration | Clients connect over WebSocket; closing UI never kills running agents | **Daemon stays external by design** — rebuilding/restarting this UI never interrupts active agents |
+
+- **Why Paseo daemon is not bundled into this app:** embedding the daemon would break C/S decoupling (every UI rebuild/restart would disrupt running agents and couple upstream Paseo upgrades). To use only this app day-to-day, run the Paseo daemon headless/standalone instead of keeping the Electron `Paseo.app` window open, and open official Paseo or the CLI only for low-frequency admin (plugins, relay, permissions).
+
 ## Usage
 
-Requirements: macOS; a Paseo daemon already running locally (default `127.0.0.1:6973`, loopback only); Rust stable; Node (tested with 24.22.0); a Paseo source checkout with its dependencies installed (used only at packaging time to bundle the official SDK; the installed app does not need it).
+Requirements: macOS; a Paseo daemon already running locally (default `127.0.0.1:6973`, loopback only — can run headless without keeping `Paseo.app` open); Rust stable; Node (tested with 24.22.0); a Paseo source checkout with its dependencies installed (used only at packaging time to bundle the official SDK; the installed app does not need it).
 
 ```sh
 RUSTUP_TOOLCHAIN=stable cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --release
@@ -35,16 +47,17 @@ open "/tmp/monocode-paseo/Monocode Paseo Prototype.app"
 - A "working" line with a timer appears as soon as a turn starts, before the first output arrives.
 - New conversations are created in Paseo only on first send, which avoids duplicates. They can start in a new workspace or join one of the 20 most recent workspaces in the same project. The default model follows the project default, then the Settings default, then the current conversation, then your most recent choice.
 - Model and effort switching, presets, and favorite models (star a model in the picker; presets also appear under Favorites).
-- Sub-agents nest under their parent conversation (with a collapsed aggregate status badge for running/needs-input/failed children); linked worktrees of the same Git repository share one project entry.
-- Image/screenshot attachments in composer (paste, drag-and-drop, or upload) routed through Paseo's image payload API.
-- Built-in Codex & Antigravity quota/usage footer powered by Paseo's `listUsageReports()` (with reset countdown and pace forecast).
+- Sub-agents nest under their parent conversation (including same-workspace sibling sub-agents); clicking a parent row keeps children collapsed with an aggregate status badge (needs input / failed / unread / working). Linked worktrees of the same Git repository share one project entry.
+- Image/screenshot attachments in composer (paste, drag-and-drop, or upload) routed through Paseo's image payload API, preserved across `historyBefore` pagination.
+- Built-in Codex & Antigravity quota/usage footer powered by Paseo's `listUsageReports()` (scrollable popover, reset countdown, pace forecast, and Paseo-style pin toggles to choose which items stay pinned in the footer).
 - Paseo-native Rewind (idle-only, with confirmation modal supporting conversation-only or conversation+files revert) and Paseo-managed Git worktree creation/reuse on new drafts.
-- Multi-host sidebar switcher connecting through the local Paseo daemon to remote Paseo hosts (such as devboxes) with strict remote filesystem/terminal isolation.
+- Multi-host sidebar switcher connecting through the local Paseo daemon to remote Paseo hosts (such as devboxes) with strict remote filesystem/terminal/`file://` isolation.
 - Permission approvals, answering questions, and cancelling the current turn.
 - Sending while a turn is running: Settings → Chat → "Follow-up behavior" chooses **Queue** (sent automatically when the turn ends, editable and removable) or **Steer** (inserted into the current turn; providers that cannot steer get the turn interrupted and replaced by Paseo). Cmd+Enter uses the opposite behavior for that message. The queue lives only in this client, and both ends see a message only after it is sent; uncertain results are never resent automatically. Steer supports plain text only.
-- Sidebar: filtering, grouping by project or **by status** (needs input → failed → unread → working → done), sorting by latest activity or creation time; archive and unarchive, rename, pin (top-level conversations), and folders.
-- Project icons and the bottom project switcher (keep only the projects you use; add others back by hand).
+- Sidebar: filtering, grouping by project or **by status** (needs input → failed → unread → working → done), sorting by latest activity or creation time; instant incremental archive/unarchive, rename, pin (top-level conversations), and folders without full directory rescans.
+- Project icons, bottom project switcher (keep only the projects you use; add others back by hand), and two-finger horizontal swipe on the sidebar (1:1 dual-page carousel with spring and edge rubber-banding) to switch projects.
 - Read-only file and Git panels with multi-line Diff selection and inline review annotation tray (inserts formatted review notes into composer without auto-sending); a **local terminal** for projects on this machine.
+- Performance hardening: bypasses shell shims to invoke native `git`, merges status/numstat queries with singleflight/TTL caching, removes remote 2s hard polling, and avoids holding the `Store` lock across remote RPCs.
 - Older conversation history pagination (`historyBefore`).
 - Local notes; **English / 简体中文** UI (Settings → General → Language, follows the system by default).
 
