@@ -458,6 +458,7 @@ fn supported_remote_method(method: &str) -> bool {
             | "paseo.usage"
             | "paseo.rewind"
             | "paseo.worktrees"
+            | "paseo.readImage"
             | "paseo.hosts.list"
             | "paseo.hosts.connect"
             | "sessions.list"
@@ -962,6 +963,7 @@ mod tests {
             "paseo.usage",
             "paseo.rewind",
             "paseo.worktrees",
+            "paseo.readImage",
             "paseo.hosts.list",
             "paseo.hosts.connect",
         ] {

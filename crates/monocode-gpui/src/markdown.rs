@@ -1,5 +1,6 @@
 //! GPUI port of AgentMarkdown.tsx and its .agent-markdown CSS.
 mod cache;
+pub(crate) mod media;
 pub(crate) mod mermaid;
 mod search;
 use crate::markdown_model::{Block, InlineRun, TableAlign};
@@ -171,6 +172,10 @@ pub(crate) enum Part {
         id: String,
         caption: String,
     },
+    Image {
+        url: String,
+        alt: String,
+    },
 }
 #[derive(Clone, PartialEq)]
 pub(crate) struct MarkdownRow {
@@ -292,6 +297,13 @@ fn flatten(
                 caption: caption.clone(),
             },
             16.,
+        ),
+        Block::Image { url, alt } => add(
+            Part::Image {
+                url: url.clone(),
+                alt: alt.clone(),
+            },
+            12.,
         ),
     }
     if let Some(row) = out.get_mut(first)
@@ -910,6 +922,14 @@ pub(crate) fn body_selected(
                 id,
                 fence: fence.clone(),
                 selection,
+            })
+            .into_any_element(),
+        Part::Image { url, alt } => body
+            .child(media::MarkdownImage {
+                id,
+                url: url.clone(),
+                alt: alt.clone(),
+                source_cwd: row.source_cwd.clone(),
             })
             .into_any_element(),
     }

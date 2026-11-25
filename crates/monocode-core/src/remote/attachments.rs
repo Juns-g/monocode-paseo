@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 const PREFIX: &str = "remote-attachment://";
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_CHUNK_BYTES: usize = 512 * 1024;
+const MAX_REMOTE_IMAGE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HTTP_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
 fn encode(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
@@ -146,6 +148,299 @@ fn download(
     Ok(bytes)
 }
 
+fn percent_decode_path(input: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let raw = input.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            if let (Some(hi), Some(lo)) = (hex(raw[i + 1]), hex(raw[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decodes a `file://` URI (including percent-encoded UTF-8/spaces) or returns a
+/// raw filesystem path unchanged. Preserves `+` in filenames.
+pub fn decode_file_url_or_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("file:") {
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            if parsed.scheme() == "file" {
+                let mut decoded = percent_decode_path(parsed.path());
+                if let Some(host) = parsed.host_str() {
+                    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+                        decoded = format!("//{host}{decoded}");
+                    }
+                }
+                let bytes = decoded.as_bytes();
+                if bytes.len() >= 3
+                    && bytes[0] == b'/'
+                    && bytes[1].is_ascii_alphabetic()
+                    && bytes[2] == b':'
+                {
+                    decoded.remove(0);
+                }
+                return (!decoded.is_empty()).then_some(decoded);
+            }
+        }
+        let rest = trimmed
+            .get(5..)
+            .unwrap_or("")
+            .trim_start_matches("//");
+        let rest = if rest.len() >= 10 && rest[..10].eq_ignore_ascii_case("localhost/") {
+            &rest[9..]
+        } else {
+            rest
+        };
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let decoded = percent_decode_path(rest);
+        return (!decoded.is_empty()).then_some(decoded);
+    }
+    Some(trimmed.to_owned())
+}
+
+pub fn detect_image_mime(bytes: &[u8], hinted: Option<&str>, path_or_url: &str) -> Option<String> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png".into());
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg".into());
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif".into());
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp".into());
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp".into());
+    }
+    if bytes.starts_with(b"\x00\x00\x01\x00") {
+        return Some("image/x-icon".into());
+    }
+    let head_len = bytes.len().min(512);
+    if let Ok(head) = std::str::from_utf8(&bytes[..head_len]) {
+        let trimmed = head.trim_start();
+        if trimmed.starts_with("<svg")
+            || (trimmed.starts_with("<?xml") && trimmed.contains("<svg"))
+        {
+            return Some("image/svg+xml".into());
+        }
+    }
+    if let Some(hint) = hinted {
+        let clean = hint.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if clean.starts_with("image/") {
+            return Some(clean);
+        }
+    }
+    let clean_path = path_or_url.split(['?', '#']).next().unwrap_or(path_or_url);
+    let ext = clean_path.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png".into()),
+        "jpg" | "jpeg" => Some("image/jpeg".into()),
+        "gif" => Some("image/gif".into()),
+        "webp" => Some("image/webp".into()),
+        "bmp" => Some("image/bmp".into()),
+        "ico" => Some("image/x-icon".into()),
+        "svg" => Some("image/svg+xml".into()),
+        _ => None,
+    }
+}
+
+fn download_remote_image(
+    mut request: impl FnMut(usize) -> Result<Value, String>,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let mut bytes = Vec::new();
+    let mut expected_size: Option<usize> = None;
+    let mut mime: Option<String> = None;
+    loop {
+        let chunk = request(bytes.len())?;
+        let size = chunk["size"]
+            .as_u64()
+            .and_then(|s| usize::try_from(s).ok())
+            .ok_or("Invalid image transfer")?;
+        if size > MAX_ATTACHMENT_BYTES {
+            return Err("Image is larger than 20 MB.".into());
+        }
+        if let Some(prev) = expected_size {
+            if prev != size {
+                return Err("Invalid image transfer".into());
+            }
+        } else {
+            expected_size = Some(size);
+            bytes.reserve(size);
+        }
+        if mime.is_none() {
+            mime = chunk["mimeType"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+        }
+        if size == 0 {
+            return Err("Image is empty".into());
+        }
+        let encoded = chunk["data"]
+            .as_str()
+            .filter(|data| data.len() <= MAX_REMOTE_IMAGE_CHUNK_BYTES.div_ceil(3) * 4)
+            .ok_or("Invalid image transfer")?;
+        let offset = chunk["offset"]
+            .as_u64()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or("Invalid image transfer")?;
+        let data = STANDARD
+            .decode(encoded)
+            .map_err(|_| "Invalid image transfer")?;
+        if offset <= bytes.len()
+            || offset > size
+            || data.len() > MAX_REMOTE_IMAGE_CHUNK_BYTES
+            || data.len() != offset - bytes.len()
+        {
+            return Err("Invalid image transfer".into());
+        }
+        bytes.extend_from_slice(&data);
+        if bytes.len() >= size {
+            break;
+        }
+    }
+    Ok((bytes, mime))
+}
+
+pub fn read_remote_image(
+    environment: &str,
+    cwd: &str,
+    path: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let connections = super::default_connections()?;
+    let machine = connections.machine_for_environment(environment)?;
+    match download_remote_image(|offset| {
+        connections.request(
+            &machine.id,
+            "paseo.readImage",
+            json!({"cwd": cwd, "path": path, "offset": offset}),
+        )
+    }) {
+        Ok((bytes, hinted)) => {
+            let mime = detect_image_mime(&bytes, hinted.as_deref(), path)
+                .ok_or_else(|| "Remote file is not a supported image".to_string())?;
+            Ok((bytes, mime))
+        }
+        Err(primary_err) => {
+            let unsupported = primary_err.contains("暂不支持")
+                || primary_err.contains("Unknown method")
+                || primary_err.contains("Unsupported")
+                || primary_err.contains("not supported")
+                || primary_err.contains("HTTP 404");
+            if !unsupported {
+                return Err(primary_err);
+            }
+            // Standard non-Paseo Monocode hosts do not implement `paseo.readImage`;
+            // fall back to `workspace.run` `read_binary_file` when available.
+            let host_path = if path.starts_with('/')
+                || (path.len() >= 2 && path.as_bytes()[1] == b':')
+            {
+                path.to_owned()
+            } else {
+                format!("{}/{}", cwd.trim_end_matches('/'), path.trim_start_matches("./"))
+            };
+            let qualified = super::remote_path(environment, &host_path);
+            let encoded = connections
+                .request(
+                    &machine.id,
+                    "workspace.run",
+                    json!({"command": "read_binary_file", "args": {"path": qualified}}),
+                )
+                .map_err(|_| primary_err.clone())?;
+            let encoded = encoded
+                .as_str()
+                .ok_or(primary_err)?;
+            let bytes = STANDARD
+                .decode(encoded)
+                .map_err(|e| format!("Invalid remote image content: {e}"))?;
+            if bytes.len() > MAX_ATTACHMENT_BYTES {
+                return Err("Image is larger than 20 MB.".into());
+            }
+            let mime = detect_image_mime(&bytes, None, path)
+                .ok_or_else(|| "Remote file is not a supported image".to_string())?;
+            Ok((bytes, mime))
+        }
+    }
+}
+
+pub fn read_http_image(url: &str) -> Result<(Vec<u8>, String), String> {
+    use std::io::Read;
+    use std::time::Duration;
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.len() > 8192 {
+        return Err("Invalid image URL".into());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|_| "Invalid image URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Unsupported image URL scheme".into());
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .redirects(5)
+        .build();
+    let response = agent
+        .get(trimmed)
+        .set("Accept", "image/*,*/*;q=0.1")
+        .set("User-Agent", "MonoCode")
+        .call()
+        .map_err(|e| format!("Failed to fetch image: {e}"))?;
+    let hinted = response.header("Content-Type").map(str::to_owned);
+    if let Some(ref ct) = hinted {
+        let lower = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if lower.starts_with("text/html")
+            || lower.starts_with("text/javascript")
+            || lower == "application/javascript"
+            || lower == "application/xhtml+xml"
+        {
+            return Err("URL did not return an image".into());
+        }
+    }
+    if let Some(len) = response
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if len > MAX_HTTP_IMAGE_BYTES {
+            return Err("Image is larger than 10 MB.".into());
+        }
+    }
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_HTTP_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Failed to read image: {e}"))?;
+    if bytes.len() as u64 > MAX_HTTP_IMAGE_BYTES {
+        return Err("Image is larger than 10 MB.".into());
+    }
+    let mime = detect_image_mime(&bytes, hinted.as_deref(), trimmed)
+        .ok_or_else(|| "URL did not return a supported image".to_string())?;
+    Ok((bytes, mime))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +505,58 @@ mod tests {
         assert!(download(3, |_| Ok(json!({"size":3,"offset":0,"data":""}))).is_err());
         assert!(download(4, |_| Ok(json!({"size":4,"offset":2,"data":"YWI="}))).is_err());
         assert!(download(MAX_ATTACHMENT_BYTES + 1, |_| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn decode_file_urls_preserves_utf8_spaces_plus_and_windows_drives() {
+        assert_eq!(
+            decode_file_url_or_path(
+                "file:///Users/bytedance/%E8%A1%8C%E4%B8%9A%20FE/img+1.jpg"
+            )
+            .as_deref(),
+            Some("/Users/bytedance/行业 FE/img+1.jpg")
+        );
+        assert_eq!(
+            decode_file_url_or_path("file://localhost/tmp/a%20b.png").as_deref(),
+            Some("/tmp/a b.png")
+        );
+        assert_eq!(
+            decode_file_url_or_path("file:///C:/Users/me/my%20shot.png").as_deref(),
+            Some("C:/Users/me/my shot.png")
+        );
+        assert_eq!(
+            decode_file_url_or_path("./relative/pic.webp").as_deref(),
+            Some("./relative/pic.webp")
+        );
+    }
+
+    #[test]
+    fn download_remote_image_supports_single_and_chunked_transfers() {
+        let png = b"\x89PNG\r\n\x1a\n1234";
+        let (bytes, mime) = download_remote_image(|offset| {
+            Ok(if offset == 0 {
+                json!({
+                    "mimeType": "image/png",
+                    "size": png.len(),
+                    "offset": 6,
+                    "data": STANDARD.encode(&png[..6]),
+                })
+            } else {
+                json!({
+                    "mimeType": "image/png",
+                    "size": png.len(),
+                    "offset": png.len(),
+                    "data": STANDARD.encode(&png[6..]),
+                })
+            })
+        })
+        .unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(mime.as_deref(), Some("image/png"));
+        assert_eq!(
+            detect_image_mime(&bytes, None, "unknown").as_deref(),
+            Some("image/png")
+        );
+        assert!(download_remote_image(|_| Ok(json!({"size": 0, "offset": 0, "data": ""}))).is_err());
     }
 }

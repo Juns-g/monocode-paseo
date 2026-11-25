@@ -18,8 +18,41 @@ const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume
 export const LOCAL_FS_CAPABILITIES=['files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
 export const BASE_CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.worktrees','paseo.history-pages','sessions.no-delete','sessions.list-revision',
-  'attachments.upload','attachments.read','paseo.usage','paseo.rewind'];
+  'attachments.upload','attachments.read','paseo.read-image','paseo.usage','paseo.rewind'];
 export const CAPABILITIES=[...BASE_CAPABILITIES,'paseo.hosts',...LOCAL_FS_CAPABILITIES];
+const MAX_READ_IMAGE_BYTES=20*1024*1024;
+const MAX_READ_IMAGE_CHUNK=3*1024*1024;
+const IMAGE_CACHE_TTL_MS=60000;
+const IMAGE_CACHE_MAX_ENTRIES=8;
+function isAbsAnyPath(p){return p.startsWith('/')||/^[A-Za-z]:[\\/]/.test(p)||p.startsWith('\\\\');}
+function trimSep(p){return p==='/'||/^[A-Za-z]:[\\/]?$/.test(p)?p.replace(/\\/g,'/'):p.replace(/[\\/]+$/,'');}
+function normCmp(p){const n=trimSep(p.replace(/\\/g,'/'));return /^[A-Za-z]:\//.test(n)?n[0].toUpperCase()+n.slice(1):n;}
+function pathWithin(candidate,root){
+  const c=normCmp(candidate),r=normCmp(root);
+  if(!c||!r)return false;
+  if(r==='/')return c.startsWith('/');
+  return c===r||c.startsWith(`${r}/`);
+}
+function fsRootFor(p){
+  if(p.startsWith('/'))return '/';
+  const drive=/^([A-Za-z]:)[\\/]/.exec(p);if(drive)return `${drive[1]}/`;
+  const unc=/^(\\\\[^\\]+\\[^\\]+)/.exec(p);if(unc)return unc[1];
+  return null;
+}
+export function resolveImageReadTarget(rawPath,workspaceRoot){
+  const path=typeof rawPath==='string'?rawPath.trim():'';
+  if(!path)throw Error('Missing image path');
+  if(path==='~'||path.startsWith('~/')||path.startsWith('~\\'))return {cwd:'~',path};
+  const root=typeof workspaceRoot==='string'?workspaceRoot.trim():'';
+  if(!isAbsAnyPath(path)){
+    if(!root||!isAbsAnyPath(root))throw Error('Relative image path requires workspace cwd');
+    return {cwd:root,path};
+  }
+  if(root&&isAbsAnyPath(root)&&pathWithin(path,root))return {cwd:root,path};
+  const fsRoot=fsRootFor(path);
+  if(!fsRoot)throw Error('Unsupported image path');
+  return {cwd:fsRoot,path};
+}
 const stamp=value=>{const n=typeof value==='number'?value:Date.parse(value);return Number.isFinite(n)?n:0;};
 // Only the filesystem boundary canonicalizes paths; recorded Paseo identity stays intact.
 function canonicalPath(path) {
@@ -153,7 +186,7 @@ export class PaseoHost {
     this.transfers=new SyncTransfers();
     this.attachments=new AttachmentStore(directory);
     this.directoryAt=0;this.directoryRequests=0;this.directoryGeneration=0;this.connected=false;this.revision=Date.now();this.catalogs=new Map();this.icons=new Map();
-    this.pathCache=new Map();this.repoRootCache=new Map();
+    this.pathCache=new Map();this.repoRootCache=new Map();this.imageCache=new Map();
   }
   capabilities(){return this.isRemoteHost?BASE_CAPABILITIES:CAPABILITIES;}
   comparePath(path){return this.isRemoteHost?normalizePosixPath(path):canonicalPath(path);}
@@ -594,10 +627,42 @@ export class PaseoHost {
       this.invalidate();return {commandId:c.commandId,sessionId:agent.id,revision:this.revision};
     });
   }
+  async readImage(p){
+    const target=resolveImageReadTarget(p?.path,p?.cwd);
+    const offset=p?.offset??0;
+    if(!Number.isSafeInteger(offset)||offset<0)throw Error('Invalid image offset');
+    const key=`${target.cwd}\0${target.path}`;
+    const now=Date.now();
+    for(const [k,v] of this.imageCache)if(now-v.at>=IMAGE_CACHE_TTL_MS)this.imageCache.delete(k);
+    let cached=offset>0?this.imageCache.get(key):null;
+    if(!cached){
+      if(typeof this.client.readFile!=='function')throw Error('Paseo client does not support reading files');
+      const file=await this.client.readFile(target.cwd,target.path,undefined,MAX_READ_IMAGE_BYTES);
+      this.identity();
+      const mime=typeof file?.mime==='string'?file.mime.trim():'';
+      const isImage=file?.kind==='image'||mime.toLowerCase().startsWith('image/');
+      if(!isImage)throw Error('Requested file is not an image');
+      const bytes=file?.bytes instanceof Uint8Array?Buffer.from(file.bytes.buffer,file.bytes.byteOffset,file.bytes.byteLength):null;
+      if(!bytes)throw Error('Image bytes unavailable');
+      if(bytes.byteLength>MAX_READ_IMAGE_BYTES)throw Error('Image is larger than 20 MB.');
+      cached={mimeType:mime||'image/png',bytes,at:now};
+      if(bytes.byteLength>MAX_READ_IMAGE_CHUNK){
+        this.imageCache.delete(key);
+        this.imageCache.set(key,cached);
+        while(this.imageCache.size>IMAGE_CACHE_MAX_ENTRIES)this.imageCache.delete(this.imageCache.keys().next().value);
+      }
+    }
+    const size=cached.bytes.byteLength;
+    if(offset>size)throw Error('Invalid image offset');
+    const end=Math.min(size,offset+MAX_READ_IMAGE_CHUNK);
+    if(end>=size)this.imageCache.delete(key);
+    return {mimeType:cached.mimeType,data:cached.bytes.subarray(offset,end).toString('base64'),offset:end,size};
+  }
   async request(method,p){
     this.identity();
     if(method==='attachments.upload')return {result:this.attachments.upload(p)};
     if(method==='attachments.read')return {result:this.attachments.read(p)};
+    if(method==='paseo.readImage')return {result:await this.readImage(p)};
     if(method==='paseo.workspaces'){
       await this.directory();
       return {result:this.workspaceChoices(p.projectId).slice(0,WORKSPACE_CHOICE_LIMIT)};
@@ -785,5 +850,5 @@ export class PaseoHost {
     if(['files.read','files.list','files.index','files.search','files.searchContent','git.diff','git.branches','git.worktrees','git.index','git.fileDiff'].includes(method)){this.prepareFiles(p);return null;}
     throw Error('此操作暂不支持，请在 Paseo 完成。');
   }
-  close(){for(const h of this.histories.values())h.subscription?.();this.client.close();}
+  close(){this.imageCache.clear();for(const h of this.histories.values())h.subscription?.();this.client.close();}
 }

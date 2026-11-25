@@ -1400,4 +1400,51 @@ test('primary PaseoHost dispatches paseo.hosts.list and paseo.hosts.connect via 
     lf.close();
   }
 });
+
+test('paseo.readImage reads local, remote, outside-workspace, relative, tilde and chunked images and rejects non-images',async()=>{
+  const rf=remoteFixture('srv-devbox-img');
+  const calls=[];
+  const tiny=Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,1,2,3,4]);
+  const big=Buffer.alloc(3*1024*1024+128,0xab);
+  rf.client.readFile=async(cwd,path)=>{
+    calls.push({cwd,path});
+    if(path.endsWith('secret.txt'))return {kind:'text',mime:'text/plain',bytes:Buffer.from('nope'),size:4,path};
+    if(path.endsWith('big.png'))return {kind:'image',mime:'image/png',bytes:big,size:big.length,path};
+    return {kind:'image',mime:'image/jpeg',bytes:tiny,size:tiny.length,path};
+  };
+  try{
+    const caps=(await rf.host.request('environment.describe',{})).result.capabilities;
+    assert.ok(caps.includes('paseo.read-image'));
+    // Inside workspace -> uses workspace cwd
+    const r1=(await rf.host.request('paseo.readImage',{cwd:'/home/dev/repo',path:'/home/dev/repo/out/a.jpg'})).result;
+    assert.equal(r1.mimeType,'image/jpeg');
+    assert.deepEqual(Buffer.from(r1.data,'base64'),tiny);
+    assert.equal(r1.offset,tiny.length);
+    assert.equal(r1.size,tiny.length);
+    // Outside workspace (e.g. /tmp/paseo-provider-images) -> falls back to '/'
+    await rf.host.request('paseo.readImage',{cwd:'/home/dev/repo',path:'/tmp/paseo-provider-images/x.jpg'});
+    // Relative path -> uses workspace cwd
+    await rf.host.request('paseo.readImage',{cwd:'/home/dev/repo',path:'./shot.jpg'});
+    // Home path -> uses '~'
+    await rf.host.request('paseo.readImage',{cwd:'/home/dev/repo',path:'~/pic.jpg'});
+    assert.deepEqual(calls,[
+      {cwd:'/home/dev/repo',path:'/home/dev/repo/out/a.jpg'},
+      {cwd:'/',path:'/tmp/paseo-provider-images/x.jpg'},
+      {cwd:'/home/dev/repo',path:'./shot.jpg'},
+      {cwd:'~',path:'~/pic.jpg'},
+    ]);
+    // Chunked transfer for >3 MiB images only invokes daemon readFile once
+    const c1=(await rf.host.request('paseo.readImage',{cwd:'/home/dev/repo',path:'/tmp/big.png',offset:0})).result;
+    assert.equal(c1.size,big.length);
+    assert.equal(c1.offset,3*1024*1024);
+    const c2=(await rf.host.request('paseo.readImage',{cwd:'/home/dev/repo',path:'/tmp/big.png',offset:c1.offset})).result;
+    assert.equal(c2.offset,big.length);
+    assert.deepEqual(Buffer.concat([Buffer.from(c1.data,'base64'),Buffer.from(c2.data,'base64')]),big);
+    assert.equal(calls.filter(c=>c.path==='/tmp/big.png').length,1);
+    // Rejects non-images
+    await assert.rejects(rf.host.request('paseo.readImage',{cwd:'/home/dev/repo',path:'/home/dev/repo/secret.txt'}),/not an image/);
+  }finally{
+    rf.close();
+  }
+});
 }
