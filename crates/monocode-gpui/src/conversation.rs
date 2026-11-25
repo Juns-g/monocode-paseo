@@ -14,6 +14,7 @@ mod history;
 mod mobile;
 mod mono;
 mod notifications;
+pub(crate) mod paseo_descendants;
 mod presets;
 pub(crate) mod remote;
 pub(crate) mod remote_plans;
@@ -40,6 +41,7 @@ use crate::{
     transcript::TranscriptView,
 };
 pub(crate) use accounts::UsageResumed;
+pub(crate) use paseo_descendants::OpenPaseoAgent;
 use gpui::{
     AnyElement, Context, CursorStyle, Entity, EventEmitter, Focusable, MouseButton, Role,
     SharedString, StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
@@ -1616,6 +1618,7 @@ impl EventEmitter<SessionChanged> for Conversation {}
 impl EventEmitter<UserSubmitted> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
+impl EventEmitter<OpenPaseoAgent> for Conversation {}
 impl EventEmitter<Transfer> for Conversation {}
 impl EventEmitter<composer_features::StartOrchestration> for Conversation {}
 impl EventEmitter<composer_features::StopOrchestration> for Conversation {}
@@ -3246,6 +3249,7 @@ impl Conversation {
             .children(menu)
             .children(self.model_list_popover(cx))
             .children(self.orchestration_card(cx))
+            .children(self.paseo_descendants_shelf(cx))
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
             .child(self.changes_shelf(window, cx))
             .child(self.background_shelf(window, cx))

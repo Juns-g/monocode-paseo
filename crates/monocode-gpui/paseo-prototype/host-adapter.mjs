@@ -11,6 +11,7 @@ import {fetchPaseoUsage} from './usage.mjs';
 import {AttachmentStore} from './attachments.mjs';
 import {normalizePosixPath,validateWorktreeSpec,listProjectWorktrees,verifyExistingWorktreeCwd} from './worktrees.mjs';
 import {supportedRewindModes,extractUserMessageId,rewindPaseoAgent} from './rewind.mjs';
+import {queryDescendants} from './descendants.mjs';
 
 export const SERVER='fixture-server'; // Synthetic test identity; runtime learns and pins the handshake.
 const WORKSPACE_CHOICE_LIMIT=20; // Menu shows recent workspaces; creation still validates the full list.
@@ -18,7 +19,7 @@ const CLEAR_ATTENTION_TIMEOUT_MS=5000; // The daemon can swallow a failed resume
 export const LOCAL_FS_CAPABILITIES=['files.read','files.list','files.index','files.search','files.searchContent','diff','git.branches','git.worktrees',
   'git.index','git.fileDiff','workspace.run'];
 export const BASE_CAPABILITIES=['sessions','approvals','questions','paseo.preserve-prose','paseo.configure','paseo.steer','paseo.project-icons','paseo.workspaces','paseo.worktrees','paseo.history-pages','sessions.no-delete','sessions.list-revision',
-  'attachments.upload','attachments.read','paseo.read-image','paseo.usage','paseo.rewind'];
+  'attachments.upload','attachments.read','paseo.read-image','paseo.descendants','paseo.usage','paseo.rewind'];
 export const CAPABILITIES=[...BASE_CAPABILITIES,'paseo.hosts',...LOCAL_FS_CAPABILITIES];
 const MAX_READ_IMAGE_BYTES=20*1024*1024;
 const MAX_READ_IMAGE_CHUNK=3*1024*1024;
@@ -175,6 +176,8 @@ export class Attempts {
 export class PaseoHost {
   constructor(client,directory,projectTimeline=rows=>rows,options={}) {
     this.client=client;this.isRemoteHost=options.isRemoteHost===true;this.hostRegistry=options.hostRegistry??null;
+    this.descendantRegistry=options.descendantRegistry??this.hostRegistry??null;
+    this.descendantSummaryCache=new Map();
     this.serverId=options.expectedServerId??client.getLastServerInfoMessage()?.serverId??null;
     this.projectTimeline=projectTimeline;this.attempts=new Attempts(directory);
     this.statuses=new Map();this.entries=new Map();this.projects=new Map();this.histories=new Map();this.numbers=new Map();
@@ -663,6 +666,17 @@ export class PaseoHost {
     if(method==='attachments.upload')return {result:this.attachments.upload(p)};
     if(method==='attachments.read')return {result:this.attachments.read(p)};
     if(method==='paseo.readImage')return {result:await this.readImage(p)};
+    if(method==='paseo.descendants'){
+      const registry=this.descendantRegistry??this.hostRegistry??null;
+      return {result:await queryDescendants({
+        host:this,
+        registry,
+        agentId:p?.agentId??p?.sessionId,
+        serverId:p?.serverId??this.serverId,
+        includeSummaries:p?.includeSummaries!==false,
+        summaryCache:registry?.summaryCache??this.descendantSummaryCache,
+      })};
+    }
     if(method==='paseo.workspaces'){
       await this.directory();
       return {result:this.workspaceChoices(p.projectId).slice(0,WORKSPACE_CHOICE_LIMIT)};

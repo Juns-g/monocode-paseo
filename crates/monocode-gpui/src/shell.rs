@@ -918,6 +918,9 @@ pub(crate) struct Shell {
     review_slide: Option<(i64, PaneSlide, Entity<crate::review::ReviewPane>)>,
     /// A session review card's Review, opened beside its pane next frame.
     pending_review: Option<(i64, crate::review::ReviewTab)>,
+    /// A descendant/ancestor Paseo agent jump requested from a conversation card.
+    pending_paseo_agent_open: Option<crate::conversation::OpenPaseoAgent>,
+    opening_paseo_agent: bool,
     pending_composer_focus: Option<i64>,
     review_focused: bool,
     review_drag: bool,
@@ -1329,6 +1332,8 @@ impl Shell {
             reviews: HashMap::new(),
             review_slide: None,
             pending_review: None,
+            pending_paseo_agent_open: None,
+            opening_paseo_agent: false,
             pending_composer_focus: None,
             review_focused: false,
             review_drag: false,
@@ -1615,6 +1620,13 @@ impl Shell {
                 let tab = event.0.clone();
                 // The card's pane takes focus, so its review opens beside it.
                 this.pending_review = Some((id, tab));
+                cx.notify();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            |this, _, event: &crate::conversation::OpenPaseoAgent, cx| {
+                this.pending_paseo_agent_open = Some(event.clone());
                 cx.notify();
             },
         ));
@@ -5277,6 +5289,202 @@ impl Shell {
                     Err(error) => {
                         this.error = Some(error);
                         this.refresh_paseo_hosts(cx);
+                        this.invalidate_chrome(cx);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+    fn open_paseo_agent(
+        &mut self,
+        target: crate::conversation::OpenPaseoAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote.machine_for_environment(&target.server_id).is_ok()
+            && let Ok(Some(local_id)) = locked(&self.store)
+                .and_then(|s| s.find_remote_session_id(&target.server_id, &target.agent_id))
+            && self.session_summaries.contains_key(&local_id)
+        {
+            self.open(local_id, window, cx);
+            return;
+        }
+        if self.opening_paseo_agent {
+            return;
+        }
+        let Some(local_env) = self.paseo_local_environment().map(str::to_owned) else {
+            return;
+        };
+        self.opening_paseo_agent = true;
+        self.error = None;
+        let directory = self.remote_dir.clone();
+        let store = self.store.clone();
+        let connections = self.remote.clone();
+        let selection = crate::paseo_host::ProjectSelection::read(
+            self.workspace
+                .preferences
+                .extra
+                .get(crate::paseo_host::PROJECT_SELECTION),
+        );
+        let work = cx.background_executor().spawn(async move {
+            crate::paseo_host::ensure_remote_agent_session(
+                &directory,
+                &store,
+                &connections,
+                &local_env,
+                &target.server_id,
+                &target.agent_id,
+                &target.cwd,
+                &target.host_label,
+                &selection,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.opening_paseo_agent = false;
+                match result {
+                    Ok(opened) => {
+                        if let Some(connected) = opened.connected_host {
+                            let mut hosts = this.paseo_hosts();
+                            for h in &mut hosts {
+                                if h.server_id.as_deref() == Some(connected.server_id.as_str()) {
+                                    h.connected = true;
+                                    h.status = "online".into();
+                                    if !connected.label.is_empty() {
+                                        h.label = connected.label.clone();
+                                    }
+                                }
+                            }
+                            this.workspace.preferences.extra.insert(
+                                crate::paseo_host::PASEO_HOSTS.into(),
+                                serde_json::to_value(&hosts).unwrap_or_default(),
+                            );
+                            let mut all: Vec<String> = this
+                                .workspace
+                                .preferences
+                                .extra
+                                .get("paseo_all_projects")
+                                .cloned()
+                                .and_then(|v| serde_json::from_value(v).ok())
+                                .unwrap_or_default();
+                            for key in &connected.all_projects {
+                                if !all.iter().any(|existing| existing == key) {
+                                    all.push(key.clone());
+                                }
+                            }
+                            this.workspace
+                                .preferences
+                                .extra
+                                .insert("paseo_all_projects".into(), serde_json::json!(all));
+                            for (key, label) in connected.labels {
+                                this.workspace
+                                    .project_appearance
+                                    .entry(key)
+                                    .or_insert_with(|| {
+                                        monocode_core::project_appearance::ProjectAppearance {
+                                            name: label,
+                                            ..Default::default()
+                                        }
+                                    });
+                            }
+                            for (key, path) in connected.icons {
+                                this.workspace
+                                    .project_appearance
+                                    .entry(key)
+                                    .or_default()
+                                    .logo = Some(path);
+                            }
+                            let previous: HashMap<i64, Option<String>> = connected
+                                .presentation
+                                .keys()
+                                .map(|id| {
+                                    (
+                                        *id,
+                                        this.remote_details
+                                            .get(id)
+                                            .and_then(|d| d["bucket"].as_str())
+                                            .map(str::to_owned),
+                                    )
+                                })
+                                .collect();
+                            this.remote_details.extend(connected.presentation);
+                            for (summary, running, waiting, draft) in connected.summaries {
+                                let id = summary.id;
+                                this.started_by.remove(&id);
+                                if let Some(parent) = connected.started_by.get(&id) {
+                                    this.started_by.insert(id, *parent);
+                                }
+                                if draft {
+                                    this.draft_sessions.insert(id);
+                                } else {
+                                    this.draft_sessions.remove(&id);
+                                }
+                                if !this.session_summaries.contains_key(&id) {
+                                    this.order.push(id);
+                                }
+                                this.session_summaries.insert(id, summary);
+                                let before = previous.get(&id).and_then(|b| b.as_deref());
+                                this.apply_remote_row(id, before, running, waiting, cx);
+                            }
+                            for p in &connected.projects {
+                                this.add_paseo_project(p, cx);
+                            }
+                        }
+                        if let Some(label) = opened.project_label {
+                            this.workspace
+                                .project_appearance
+                                .entry(opened.project_key.clone())
+                                .or_insert_with(|| {
+                                    monocode_core::project_appearance::ProjectAppearance {
+                                        name: label,
+                                        ..Default::default()
+                                    }
+                                });
+                        }
+                        if let Some(icon_path) = opened.icon_path {
+                            this.workspace
+                                .project_appearance
+                                .entry(opened.project_key.clone())
+                                .or_default()
+                                .logo = Some(icon_path);
+                        }
+                        this.add_paseo_project(&opened.project_key, cx);
+                        let id = opened.session_id;
+                        let before = this
+                            .remote_details
+                            .get(&id)
+                            .and_then(|d| d["bucket"].as_str())
+                            .map(str::to_owned);
+                        if let Some(pres) = opened.presentation {
+                            this.remote_details.insert(id, pres);
+                        }
+                        if opened.draft {
+                            this.draft_sessions.insert(id);
+                        } else {
+                            this.draft_sessions.remove(&id);
+                        }
+                        if !this.session_summaries.contains_key(&id) {
+                            this.order.push(id);
+                        }
+                        this.session_summaries.insert(id, opened.summary);
+                        this.apply_remote_row(
+                            id,
+                            before.as_deref(),
+                            opened.running,
+                            opened.needs_input,
+                            cx,
+                        );
+                        this.open(id, window, cx);
+                        this.persist(cx);
+                        this.invalidate_chrome(cx);
+                        this.refresh_sidebar_structure(cx);
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.error = Some(error);
                         this.invalidate_chrome(cx);
                         cx.notify();
                     }
@@ -10551,6 +10759,9 @@ impl Render for Shell {
         {
             self.focus_pane(id, window, cx);
             self.open_review(tab, window, cx);
+        }
+        if let Some(target) = self.pending_paseo_agent_open.take() {
+            self.open_paseo_agent(target, window, cx);
         }
         // Native fullscreen transitions resize the window, which redraws it.
         self.fullscreen = window.is_fullscreen();

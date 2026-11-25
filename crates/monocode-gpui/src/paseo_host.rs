@@ -493,6 +493,162 @@ pub(crate) fn connect_remote_host(
     })
 }
 
+pub(crate) struct OpenedPaseoAgent {
+    pub(crate) session_id: i64,
+    pub(crate) summary: monocode_core::store::Session,
+    pub(crate) running: bool,
+    pub(crate) needs_input: bool,
+    pub(crate) draft: bool,
+    pub(crate) presentation: Option<Value>,
+    pub(crate) project_key: String,
+    pub(crate) project_label: Option<String>,
+    pub(crate) icon_path: Option<String>,
+    pub(crate) connected_host: Option<ConnectedRemoteHost>,
+}
+
+/// Ensures the target Paseo host is connected and the target `(server_id, agent_id)`
+/// is registered in the local `Store`, returning its local session handle so `Shell`
+/// can jump straight into it across hosts and repositories.
+pub(crate) fn ensure_remote_agent_session(
+    directory: &Path,
+    store: &Arc<Mutex<Store>>,
+    connections: &Connections,
+    local_server_id: &str,
+    target_server_id: &str,
+    target_agent_id: &str,
+    target_cwd: &str,
+    host_label: &str,
+    selection: &ProjectSelection,
+) -> Result<OpenedPaseoAgent, String> {
+    let mut connected_host = None;
+    if connections.machine_for_environment(target_server_id).is_err() {
+        if target_server_id == local_server_id {
+            return Err("Local Paseo host is not connected".into());
+        }
+        connected_host = Some(connect_remote_host(
+            directory,
+            store,
+            connections,
+            local_server_id,
+            target_server_id,
+            selection,
+        )?);
+    }
+    let machine = connections.machine_for_environment(target_server_id)?;
+
+    // Fast path: already registered in Store (either previously or by `connect_remote_host`).
+    {
+        let guard = store.lock().map_err(|_| "Store unavailable")?;
+        if let Some(local_id) = guard.find_remote_session_id(target_server_id, target_agent_id)?
+            && let Some(remote) = guard.remote_session(local_id)?
+        {
+            return Ok(OpenedPaseoAgent {
+                session_id: local_id,
+                project_key: remote.project.key,
+                summary: remote.summary,
+                running: false,
+                needs_input: false,
+                draft: false,
+                presentation: None,
+                project_label: None,
+                icon_path: None,
+                connected_host,
+            });
+        }
+    }
+
+    // Slow path: locate the session's project on `machine` and register it into Store.
+    let projects_val = connections.request(
+        &machine.id,
+        "projects.list",
+        json!({"includeAll": true, "includeIcons": true}),
+    )?;
+    let rows = projects_val
+        .as_array()
+        .ok_or("Invalid Paseo projects response")?;
+    let target_norm = target_cwd.trim_end_matches('/');
+    let mut ordered_indices: Vec<usize> = (0..rows.len()).collect();
+    ordered_indices.sort_by_key(|&ix| {
+        let cwd = rows[ix]["cwd"].as_str().unwrap_or("").trim_end_matches('/');
+        if !target_norm.is_empty() && cwd == target_norm {
+            0usize
+        } else if !target_norm.is_empty() && (target_norm.starts_with(cwd) || cwd.starts_with(target_norm)) {
+            1
+        } else {
+            2
+        }
+    });
+
+    let mut matched: Option<(Value, Value)> = None;
+    for ix in ordered_indices {
+        let project = &rows[ix];
+        let Some(project_id) = project["id"].as_str() else {
+            continue;
+        };
+        let Ok(response) = connections.request(
+            &machine.id,
+            "sessions.list",
+            json!({"projectId": project_id}),
+        ) else {
+            continue;
+        };
+        let Some(values) = response
+            .as_array()
+            .or_else(|| response["values"].as_array())
+        else {
+            continue;
+        };
+        if let Some(session) = values
+            .iter()
+            .find(|v| v["id"].as_str() == Some(target_agent_id))
+        {
+            matched = Some((project.clone(), session.clone()));
+            break;
+        }
+    }
+    let (matched_project, matched_session) =
+        matched.ok_or_else(|| format!("未在宿主机上找到会话 {target_agent_id}"))?;
+
+    let (remote_project, summary) = {
+        let guard = store.lock().map_err(|_| "Store unavailable")?;
+        guard.ephemeral_remote_status(&machine.environment_id);
+        let remote_project =
+            guard.remember_remote_project(&machine.environment_id, &matched_project)?;
+        let summary = guard.register_remote_summary(&remote_project, &matched_session)?;
+        (remote_project, summary)
+    };
+    let raw_name = matched_project["name"].as_str().unwrap_or("Paseo");
+    let project_label = if target_server_id == local_server_id || host_label.trim().is_empty() {
+        Some(raw_name.to_owned())
+    } else {
+        Some(format!("{raw_name} · {host_label}"))
+    };
+    let icon_path = cache_project_icon(directory, &remote_project.key, &matched_project)
+        .ok()
+        .flatten();
+    let presentation = Some(json!({
+        "bucket": matched_session["paseoBucket"],
+        "enteredAt": matched_session["paseoStatusEnteredAt"],
+        "createdAt": matched_session["createdAt"],
+        "workspaceAnchor": matched_session["paseoWorkspaceAnchor"],
+    }));
+    let running = matched_session["status"].as_str() == Some("running");
+    let needs_input = matched_session["needsInput"].as_bool().unwrap_or(false);
+    let draft = matched_session["draft"] == true;
+    Ok(OpenedPaseoAgent {
+        session_id: summary.id,
+        summary,
+        running,
+        needs_input,
+        draft,
+        presentation,
+        project_key: remote_project.key,
+        project_label,
+        icon_path,
+        connected_host,
+    })
+}
+
 pub(crate) struct Host {
     pub(crate) child: Arc<Mutex<Child>>,
     pub(crate) cwd: String,

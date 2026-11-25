@@ -25,6 +25,10 @@ export class HostRegistry {
     this.createRoutedClient = createRoutedClient;
     this.createServer = createServer;
     this.routed = new Map(); // serverId -> { client, host, server, endpoint, label, unsubscribers, connecting }
+    this.primaryHost = null;
+    this.summaryCache = new Map();
+    this.listCache = null; // { at, raw }
+    this.listInFlight = null;
   }
 
   verifyToken(value) {
@@ -35,7 +39,7 @@ export class HostRegistry {
       && timingSafeEqual(Buffer.from(value), Buffer.from(this.token));
   }
 
-  async list() {
+  async list({force = false} = {}) {
     const info = this.origin.getLastServerInfoMessage?.();
     const fallbackSelf = {
       serverId: info?.serverId ?? '',
@@ -44,7 +48,24 @@ export class HostRegistry {
     if (info?.features?.connectedHosts !== true) {
       return {supported: false, self: fallbackSelf, hosts: []};
     }
-    const dir = await this.origin.listHosts();
+    const now = Date.now();
+    let dir;
+    if (!force && this.listCache && now - this.listCache.at < 15000) {
+      dir = this.listCache.raw;
+    } else {
+      if (!this.listInFlight) {
+        this.listInFlight = Promise.resolve()
+          .then(() => this.origin.listHosts())
+          .then(raw => {
+            this.listCache = {at: Date.now(), raw};
+            return raw;
+          })
+          .finally(() => {
+            this.listInFlight = null;
+          });
+      }
+      dir = await this.listInFlight;
+    }
     const self = {
       serverId: dir?.self?.serverId || fallbackSelf.serverId,
       label: dir?.self?.label || fallbackSelf.label,
@@ -147,6 +168,7 @@ export class HostRegistry {
         const adapter = this.createAdapter(client, hostDir, {
           isRemoteHost: true,
           expectedServerId: serverId,
+          descendantRegistry: this,
         });
         record.host = adapter;
         const store = {

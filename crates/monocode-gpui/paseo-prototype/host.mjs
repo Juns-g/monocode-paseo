@@ -25,6 +25,7 @@ const registry=new HostRegistry({
   createServer:(store,adapter)=>createHostServer({store},[],undefined,adapter),
 });
 const host=new PaseoHost(client,directory,projectTimeline,{hostRegistry:registry});
+registry.primaryHost=host;
 host.allowLiveCheck=process.argv.includes('--live-create');
 const store={get environmentId(){return host.serverId;},
   authenticated(value){return value.length===token.length && timingSafeEqual(Buffer.from(value),Buffer.from(token));},

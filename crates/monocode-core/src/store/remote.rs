@@ -368,6 +368,21 @@ impl Store {
         }
         Ok(sessions)
     }
+    pub fn find_remote_session_id(
+        &self,
+        environment_id: &str,
+        remote_session_id: &str,
+    ) -> Result<Option<i64>, String> {
+        let sessions = self.stored_remote_sessions()?;
+        if let Some(found) = sessions.values().find(|remote| {
+            remote.project.environment_id == environment_id
+                && remote.session_id.as_deref() == Some(remote_session_id)
+        }) {
+            return Ok(Some(found.summary.id));
+        }
+        Ok(None)
+    }
+
     pub fn remote_session(&self, id: i64) -> Result<Option<RemoteSession>, String> {
         let mut stored = self.stored_remote_sessions()?;
         if let Some(remote) = stored.remove(&id) {

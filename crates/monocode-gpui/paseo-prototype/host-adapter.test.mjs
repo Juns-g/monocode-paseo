@@ -1447,4 +1447,119 @@ test('paseo.readImage reads local, remote, outside-workspace, relative, tilde an
     rf.close();
   }
 });
+
+test('paseo.descendants builds multi-host multi-level tree (collab.by + paseo.parent-agent-id), ancestor breadcrumbs, and caches summaries',async()=>{
+  const lf=fixture();
+  const boe=remoteFixture('srv-devbox-boe');
+  const ai=remoteFixture('srv-devbox-ai');
+  const leaderId='a'; // lf.a
+  const timelineFetches=[];
+  boe.client.fetchAgentHistory=async()=>({
+    entries:[
+      {
+        agent:{id:'cap-3',title:'[队长3] mall_channel',provider:'claude',model:'claude-opus-5-5',status:'running',activeTurn:{turnId:'t1'},
+          cwd:'/data00/home/u/work/worktrees/mall_channel/vacation-list-v2',workspaceId:'w-c3',
+          createdAt:'2026-11-25T12:00:00Z',updatedAt:'2026-11-25T12:10:00Z',
+          labels:{'collab.by':leaderId}},
+        project:{projectKey:'p-mc',projectName:'vacation-list-v2',checkout:{cwd:'/data00/home/u/work/worktrees/mall_channel/vacation-list-v2',currentBranch:'feat/v2'}},
+      },
+      {
+        agent:{id:'grand-3a',title:'[孙3A] 直播schema',provider:'claude',model:'claude-sonnet-5-5',status:'idle',
+          cwd:'/data00/home/u/work/worktrees/mall_channel/vacation-list-v2',workspaceId:'w-c3',
+          createdAt:'2026-11-25T12:02:00Z',updatedAt:'2026-11-25T12:08:00Z',
+          labels:{'paseo.parent-agent-id':'cap-3'}},
+        project:{projectKey:'p-mc',projectName:'vacation-list-v2',checkout:{cwd:'/data00/home/u/work/worktrees/mall_channel/vacation-list-v2',currentBranch:'feat/v2'}},
+      },
+      {
+        agent:{id:'grand-3b',title:'[孙3B] mall_api',provider:'claude',model:'claude-sonnet-5-5',status:'running',activeTurn:{turnId:'t2'},
+          cwd:'/data00/home/u/work/worktrees/mall_api/vacation-list-v2',workspaceId:'w-3b',
+          createdAt:'2026-11-25T12:03:00Z',updatedAt:'2026-11-25T12:09:00Z',
+          labels:{'paseo.parent-agent-id':'cap-3'}},
+        project:{projectKey:'p-ma',projectName:'vacation-list-v2',checkout:{cwd:'/data00/home/u/work/worktrees/mall_api/vacation-list-v2',currentBranch:'feat/v2'}},
+      },
+    ],
+    pageInfo:{hasMore:false,nextCursor:null},
+  });
+  boe.client.fetchAgentTimeline=async(id)=>{
+    timelineFetches.push(`boe:${id}`);
+    if(id==='cap-3')return {entries:[{item:{type:'assistant_message',text:'已拉起 2 个 Sonnet 5.5 孙子并行开发中。'}}]};
+    if(id==='grand-3a')return {entries:[{item:{type:'assistant_message',text:'**完成**：schema 已合入。'}}]};
+    return {entries:[{item:{type:'tool_call',name:'Bash',metadata:{title:'go test ./...'}}}]};
+  };
+  ai.client.fetchAgentHistory=async()=>({
+    entries:[{
+      agent:{id:'cap-4',title:'[队长4] 前端骨架',provider:'claude',model:'claude-opus-5-5',status:'idle',
+        cwd:'/data00/home/u/work/worktrees/industry-canal-mono/vacation-list-v2-base',workspaceId:'w-c4',
+        createdAt:'2026-11-25T12:01:00Z',updatedAt:'2026-11-25T12:07:00Z',
+        labels:{'collab.by':leaderId}},
+      project:{projectKey:'p-fe',projectName:'vacation-list-v2-base',checkout:{cwd:'/data00/home/u/work/worktrees/industry-canal-mono/vacation-list-v2-base',currentBranch:'feat/fe'}},
+    }],
+    pageInfo:{hasMore:false,nextCursor:null},
+  });
+  ai.client.fetchAgentTimeline=async(id)=>{
+    timelineFetches.push(`ai:${id}`);
+    return {entries:[{item:{type:'assistant_message',text:'前端底座骨架已落盘 commit abc123。'}}]};
+  };
+  lf.client.getLastServerInfoMessage=()=>({serverId:SERVER,version:'0.17.4',features:{connectedHosts:true}});
+  lf.client.listHosts=async()=>({
+    self:{serverId:SERVER,label:'Local Mac'},
+    hosts:[
+      {registrationId:'r-boe',serverId:'srv-devbox-boe',label:'Devbox BOE',enabled:true,status:'online',targetDescription:'ssh://devbox-boe'},
+      {registrationId:'r-ai',serverId:'srv-devbox-ai',label:'Devbox AI',enabled:true,status:'online',targetDescription:'ssh://devbox-ai'},
+    ],
+  });
+  lf.client.openHostRoute=async(sid)=>`route-${sid}`;
+  const registry=new HostRegistry({
+    originClient:lf.client,
+    baseDirectory:lf.directory,
+    token:TOKEN,
+    createRoutedClient:({serverId})=>{
+      const target=serverId==='srv-devbox-boe'?boe.client:ai.client;
+      return {...target,connect:async()=>{},setReconnectEnabled(){},subscribeConnectionStatus:()=>()=>{},subscribeRawMessages:()=>()=>{}};
+    },
+    createAdapter:(c,dir,opts)=>new PaseoHost(c,dir,rows=>rows,opts),
+    createServer:(store,adapter)=>createHostServer({store},[],undefined,adapter),
+  });
+  registry.primaryHost=lf.host;
+  lf.host.hostRegistry=registry;
+  lf.host.descendantRegistry=registry;
+  try{
+    const tree=(await lf.host.request('paseo.descendants',{agentId:leaderId})).result;
+    assert.equal(tree.parent,null);
+    assert.equal(tree.counts.total,4);
+    assert.equal(tree.counts.running,2);
+    assert.equal(tree.children.length,2);
+    assert.equal(tree.children[0].agentId,'cap-3');
+    assert.equal(tree.children[0].hostLabel,'Devbox BOE');
+    assert.equal(tree.children[0].repoName,'mall_channel');
+    assert.match(tree.children[0].summary,/已拉起 2 个 Sonnet/);
+    assert.equal(tree.children[0].children.length,2);
+    assert.equal(tree.children[0].children[0].agentId,'grand-3a');
+    assert.equal(tree.children[0].children[0].summary,'完成：schema 已合入。');
+    assert.equal(tree.children[0].children[1].agentId,'grand-3b');
+    assert.equal(tree.children[0].children[1].repoName,'mall_api');
+    assert.match(tree.children[0].children[1].summary,/执行中：go test/);
+    assert.equal(tree.children[1].agentId,'cap-4');
+    assert.equal(tree.children[1].hostLabel,'Devbox AI');
+    assert.equal(tree.children[1].repoName,'industry-canal-mono');
+    assert.match(tree.children[1].summary,/前端底座骨架/);
+
+    // Querying from grandchild on remote host yields full ancestor chain [cap-3, leader]!
+    const routedBoe=registry.routed.get('srv-devbox-boe').host;
+    const grandView=(await routedBoe.request('paseo.descendants',{agentId:'grand-3a'})).result;
+    assert.equal(grandView.parent.agentId,'cap-3');
+    assert.deepEqual(grandView.ancestors.map(a=>a.agentId),['cap-3',leaderId]);
+    assert.equal(grandView.ancestors[1].serverId,SERVER);
+
+    // Second query with unchanged updatedAt reuses summary cache (0 extra timeline RPCs)!
+    const countBefore=timelineFetches.length;
+    await lf.host.request('paseo.descendants',{agentId:leaderId});
+    assert.equal(timelineFetches.length,countBefore);
+  }finally{
+    registry.close();
+    ai.close();
+    boe.close();
+    lf.close();
+  }
+});
 }

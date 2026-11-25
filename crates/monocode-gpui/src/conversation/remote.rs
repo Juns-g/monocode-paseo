@@ -39,6 +39,7 @@ pub(super) struct State {
     pub(super) rewind_modes: Vec<String>,
     pub(super) rewinding: bool,
     pub(super) rewind_confirm: Option<PendingRewind>,
+    pub(super) descendants: paseo_descendants::State,
     resync_after_refresh: bool,
 }
 
@@ -599,6 +600,9 @@ impl Conversation {
                             {
                                 this.refresh_remote_snapshot(cx);
                             }
+                            if !this.history_unloaded && !this.remote_state.unbound {
+                                this.refresh_paseo_descendants(false, cx);
+                            }
                         })
                         .is_err()
                     {
@@ -857,6 +861,7 @@ impl Conversation {
                         if initial {
                             this.refresh_catalog(cx);
                             this.refresh_git(cx);
+                            this.refresh_paseo_descendants(true, cx);
                         }
                         if initial && std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
                             eprintln!("native remote-open-main {}", json!({"session":id,
