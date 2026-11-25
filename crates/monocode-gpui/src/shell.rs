@@ -1157,7 +1157,7 @@ impl Shell {
                             .preferences
                             .extra
                             .insert("paseo_usage_pins".into(), value);
-                        this.persist(cx);
+                        this.save_state(cx);
                     }
                 });
             });

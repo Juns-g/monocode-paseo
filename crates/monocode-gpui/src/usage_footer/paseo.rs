@@ -453,7 +453,9 @@ impl UsageFooter {
         }
         self.paseo.pinned = Some(pins.clone());
         if let Some(callback) = self.paseo.on_pins_change.clone() {
-            callback(pins, cx);
+            // Defer outside `UsageFooter`'s active entity borrow so callers that
+            // touch `Shell::persist` / `UsageFooter` can never panic re-entrantly.
+            cx.defer(move |cx| callback(pins, cx));
         }
         cx.notify();
     }
@@ -1490,10 +1492,16 @@ mod tests {
         let footer = cx.new(|cx| {
             let mut f = UsageFooter::new(Kind::Codex, cx);
             f.paseo_mode = true;
-            f.on_paseo_pins_change(move |pins, _| {
+            f
+        });
+        let footer_for_cb = footer.clone();
+        footer.update(cx, |f, _| {
+            f.on_paseo_pins_change(move |pins, cx| {
+                // Re-entering `footer.update` inside the pin-change callback MUST NOT panic
+                // (regression guard for `Shell::persist -> update_usage_provider -> usage_footer.update`).
+                footer_for_cb.update(cx, |_, _| {});
                 saved_cb.lock().unwrap().push(pins);
             });
-            f
         });
         footer.update(cx, |f, cx| {
             f.paseo.sources = vec![
@@ -1569,6 +1577,7 @@ mod tests {
             assert_eq!(f.paseo.pinned, Some(vec![]));
             assert!(f.effective_paseo_pins().is_empty());
         });
+        cx.run_until_parked();
         assert_eq!(saved.lock().unwrap().len(), 4);
         assert!(saved.lock().unwrap().last().unwrap().is_empty());
     }
