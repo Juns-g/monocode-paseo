@@ -1562,4 +1562,33 @@ test('paseo.descendants builds multi-host multi-level tree (collab.by + paseo.pa
     lf.close();
   }
 });
+
+test('models.list resolves known cwd without rescanning directory, returns providers, and uses stale-while-revalidate',async()=>{
+  const f=fixture();
+  try{
+    await f.host.directory(true);
+    let historyCalls=0,modelCalls=0,featureCalls=0;
+    const origHistory=f.client.fetchAgentHistory;
+    f.client.fetchAgentHistory=async(...args)=>{historyCalls++;return origHistory(...args);};
+    f.client.listAvailableProviders=async()=>({providers:[{provider:'claude',available:true}]});
+    f.client.listProviderModels=async()=>{modelCalls++;return {models:[{provider:'claude',id:`m-${modelCalls}`,label:`Model ${modelCalls}`}]};};
+    f.client.listProviderFeatures=async()=>{featureCalls++;return {features:[]};};
+    // Expire directory TTL so a naive models.list would trigger a full multi-page directory rescan.
+    f.host.directoryAt=0;
+    const first=(await f.host.request('models.list',{cwd:'/fixture'})).result;
+    assert.equal(historyCalls,0);
+    assert.deepEqual(first.providers,['claude']);
+    assert.equal(first.models.claude[0].id,'claude:m-1');
+    assert.equal(modelCalls,1);
+    assert.equal(featureCalls,1);
+    // Expire catalog cache entry -> SWR returns cached m-1 immediately and refreshes in background.
+    for(const entry of f.host.catalogs.values())entry.at=0;
+    const stale=(await f.host.request('models.list',{cwd:'/fixture'})).result;
+    assert.equal(stale.models.claude[0].id,'claude:m-1');
+    await new Promise(r=>setTimeout(r,20));
+    const refreshed=(await f.host.request('models.list',{cwd:'/fixture'})).result;
+    assert.equal(refreshed.models.claude[0].id,'claude:m-2');
+    assert.equal(historyCalls,0);
+  }finally{f.close();}
+});
 }

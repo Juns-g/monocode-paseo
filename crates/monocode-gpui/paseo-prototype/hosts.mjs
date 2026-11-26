@@ -219,6 +219,7 @@ export class HostRegistry {
           throw Error('Failed to bind loopback server for remote Paseo host');
         }
         record.endpoint = `http://127.0.0.1:${addr.port}`;
+        adapter.prewarmCatalog?.().catch(() => {});
         return {
           serverId,
           label: record.label,

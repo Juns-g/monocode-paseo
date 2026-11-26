@@ -44,6 +44,8 @@ client.subscribeConnectionStatus(state=>{
       server.listen(0,'127.0.0.1',()=>{
         process.stdout.write(JSON.stringify({endpoint:`http://127.0.0.1:${server.address().port}`,token,serverId:host.serverId,
           version:client.getLastServerInfoMessage()?.version})+'\n');
+        // Pre-warm model catalogs in the background after startup so opening the model picker is instant.
+        host.prewarmCatalog().catch(()=>{});
       });
     }).catch(()=>{console.error('Cannot discover Paseo projects');process.exit(1);});
   }

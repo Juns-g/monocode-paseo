@@ -25,6 +25,9 @@ const MAX_READ_IMAGE_BYTES=20*1024*1024;
 const MAX_READ_IMAGE_CHUNK=3*1024*1024;
 const IMAGE_CACHE_TTL_MS=60000;
 const IMAGE_CACHE_MAX_ENTRIES=8;
+const PROVIDER_CACHE_TTL_MS=5*60*1000;
+const CATALOG_CACHE_TTL_MS=10*60*1000;
+const COLD_PROVIDER_TIMEOUT_MS=8000;
 function isAbsAnyPath(p){return p.startsWith('/')||/^[A-Za-z]:[\\/]/.test(p)||p.startsWith('\\\\');}
 function trimSep(p){return p==='/'||/^[A-Za-z]:[\\/]?$/.test(p)?p.replace(/\\/g,'/'):p.replace(/[\\/]+$/,'');}
 function normCmp(p){const n=trimSep(p.replace(/\\/g,'/'));return /^[A-Za-z]:\//.test(n)?n[0].toUpperCase()+n.slice(1):n;}
@@ -457,31 +460,99 @@ export class PaseoHost {
     }).filter(p=>includeAll||(p.exists&&p.active)).sort((a,b)=>b.updatedAt-a.updatedAt||a.id.localeCompare(b.id));
   }
   async providers(){
-    if(!this.providerCache || Date.now()-this.providerCache.at>60000){
+    const now=Date.now(),prior=this.providerCache;
+    if(prior?.rows){
+      if(now-prior.at<PROVIDER_CACHE_TTL_MS)return prior.rows;
+      if(!prior.refreshing){
+        prior.refreshing=(async()=>{
+          try{
+            const value=await this.client.listAvailableProviders();this.identity();
+            if(!value.error){this.providerCache={at:Date.now(),rows:value.providers.filter(p=>p.available).map(p=>p.provider)};}
+          }catch{}finally{if(this.providerCache===prior)prior.refreshing=null;}
+        })();
+      }
+      return prior.rows;
+    }
+    if(prior?.work)return prior.work;
+    const work=(async()=>{
       const value=await this.client.listAvailableProviders();this.identity();
       if(value.error)throw Error(value.error);
-      this.providerCache={at:Date.now(),rows:value.providers.filter(p=>p.available).map(p=>p.provider)};
-    }
-    return this.providerCache.rows;
+      const rows=value.providers.filter(p=>p.available).map(p=>p.provider);
+      this.providerCache={at:Date.now(),rows};
+      return rows;
+    })();
+    this.providerCache={at:now,work};
+    try{return await work;}catch(error){if(this.providerCache?.work===work)this.providerCache=null;throw error;}
   }
   async catalog(provider,cwd){
-    const key=JSON.stringify([provider,cwd]),prior=this.catalogs.get(key);
-    if(prior && Date.now()-prior.at<60000)return prior.work;
-    const work=(async()=>{
+    const key=JSON.stringify([provider,cwd]),now=Date.now(),prior=this.catalogs.get(key);
+    const fetchModels=async()=>{
       const value=await this.client.listProviderModels(provider,{cwd});this.identity();
       if(value.error)throw Error(value.error);
       if(!value.models?.length)throw Error('Paseo returned an empty model catalog');
       return value.models;
-    })();
-    this.catalogs.set(key,{at:Date.now(),work});
-    try{return await work;}catch(error){this.catalogs.delete(key);throw error;}
+    };
+    if(prior?.value){
+      if(now-prior.at<CATALOG_CACHE_TTL_MS)return prior.value;
+      if(!prior.refreshing){
+        prior.refreshing=fetchModels()
+          .then(value=>{this.catalogs.set(key,{at:Date.now(),value});})
+          .catch(()=>{})
+          .finally(()=>{if(this.catalogs.get(key)===prior)prior.refreshing=null;});
+      }
+      return prior.value;
+    }
+    if(prior?.work)return prior.work;
+    const work=fetchModels().then(value=>{this.catalogs.set(key,{at:Date.now(),value});return value;});
+    this.catalogs.set(key,{at:now,work});
+    try{return await work;}catch(error){if(this.catalogs.get(key)?.work===work)this.catalogs.delete(key);throw error;}
   }
   async features(provider,cwd,model){
-    const key=JSON.stringify(['features',provider,cwd,model]),prior=this.catalogs.get(key);
-    if(prior && Date.now()-prior.at<60000)return prior.work;
-    const work=(async()=>{const value=await this.client.listProviderFeatures({provider,cwd,model});this.identity();if(value.error)throw Error(value.error);return value.features??[];})();
-    this.catalogs.set(key,{at:Date.now(),work});
-    try{return await work;}catch(error){this.catalogs.delete(key);throw error;}
+    const key=JSON.stringify(['features',provider,cwd,model]),now=Date.now(),prior=this.catalogs.get(key);
+    const fetchFeatures=async()=>{
+      const value=await this.client.listProviderFeatures({provider,cwd,model});this.identity();
+      if(value.error)throw Error(value.error);
+      return value.features??[];
+    };
+    if(prior?.value){
+      if(now-prior.at<CATALOG_CACHE_TTL_MS)return prior.value;
+      if(!prior.refreshing){
+        prior.refreshing=fetchFeatures()
+          .then(value=>{this.catalogs.set(key,{at:Date.now(),value});})
+          .catch(()=>{})
+          .finally(()=>{if(this.catalogs.get(key)===prior)prior.refreshing=null;});
+      }
+      return prior.value;
+    }
+    if(prior?.work)return prior.work;
+    const work=fetchFeatures().then(value=>{this.catalogs.set(key,{at:Date.now(),value});return value;});
+    this.catalogs.set(key,{at:now,work});
+    try{return await work;}catch(error){if(this.catalogs.get(key)?.work===work)this.catalogs.delete(key);throw error;}
+  }
+  resolveCatalogCwd(p){
+    if(p?.projectId && this.projects.has(p.projectId))return this.projects.get(p.projectId).cwd;
+    const raw=typeof p?.cwd==='string'?p.cwd.trim():'';
+    if(!raw)return null;
+    for(const proj of this.projects.values()){if(proj.cwd===raw)return proj.cwd;}
+    for(const entry of this.entries.values()){
+      const ecwd=entry.agent?.cwd||entry.project?.checkout?.cwd;
+      if(ecwd===raw)return ecwd;
+    }
+    const want=this.resolveNavigationPath(raw);
+    for(const proj of this.projects.values()){if(this.resolveNavigationPath(proj.cwd)===want)return proj.cwd;}
+    for(const entry of this.entries.values()){
+      const ecwd=entry.agent?.cwd||entry.project?.checkout?.cwd;
+      if(ecwd&&this.resolveNavigationPath(ecwd)===want)return ecwd;
+    }
+    return null;
+  }
+  async prewarmCatalog(){
+    try{
+      if(this.projects.size===0)await this.directory();
+      const first=this.projectList(false)[0]??this.projectList(true)[0];
+      if(!first)return;
+      await this.request('models.list',{projectId:first.id,cwd:first.cwd});
+    }catch{}
   }
   async config(provider,cwd,c){
     const prefix=harness(provider)+':';
@@ -715,17 +786,30 @@ export class PaseoHost {
       return {result:values};
     }
     if(method==='models.list'){
-      await this.directory();const cwd=this.projects.get(p.projectId)?.cwd??p.cwd;
-      if(!cwd||![...this.projects.values()].some(v=>v.cwd===cwd))throw Error('Unknown model catalog cwd');
+      // Avoid forcing a multi-page full directory rescan when the requested project/cwd is already known.
+      let cwd=this.resolveCatalogCwd(p);
+      if(!cwd){
+        await this.directory();
+        cwd=this.resolveCatalogCwd(p);
+      }
+      if(!cwd)throw Error('Unknown model catalog cwd');
       const models={},errors={};
       const providers=await this.providers();
+      const timed=(promise,label)=>{
+        let timer;
+        const limit=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error(`${label} catalog timed out`)),COLD_PROVIDER_TIMEOUT_MS);timer.unref?.();});
+        return Promise.race([promise,limit]).finally(()=>clearTimeout(timer));
+      };
       await Promise.all(providers.map(async provider=>{
         const key=harness(provider);
         // Aliases remain attachable; the native new-session harness chooses its builtin first.
         if(provider!==key && providers.includes(key))return;
-        try{const catalog=await this.catalog(provider,cwd);models[key]=await Promise.all(catalog.map(async m=>({...nativeModel(m,await this.features(provider,cwd,m.id)),id:`${key}:${m.id}`})));}
-        catch(error){errors[key]=error.message;}
-      }));return {result:{models,errors}};
+        try{
+          const catalog=await timed(this.catalog(provider,cwd),key);
+          models[key]=await timed(Promise.all(catalog.map(async m=>({...nativeModel(m,await this.features(provider,cwd,m.id)),id:`${key}:${m.id}`}))),key);
+        }catch(error){errors[key]=error.message;}
+      }));
+      return {result:{models,errors,providers:[...new Set(providers.map(harness))]}};
     }
     if(method==='paseo.projectIcons'){
       await this.directory();const icons={};

@@ -2180,6 +2180,27 @@ impl Conversation {
         }
         let kind = Kind::from_id(&self.summary.provider);
         self.attach_account(cx);
+        if self.is_remote()
+            && let Some((cached, false)) =
+                monocode_core::catalog::cached_full_remote_catalog(&self.summary.cwd)
+            && let Some(models) = cached.models.get(&kind).filter(|m| !m.is_empty())
+        {
+            self.catalog_epoch += 1;
+            self.catalog = cx
+                .try_global::<crate::settings::Preferences>()
+                .map(|prefs| prefs.named_catalog(kind.id(), models.clone()))
+                .unwrap_or_else(|| models.clone());
+            if self.model.is_none() {
+                self.model = self
+                    .catalog
+                    .iter()
+                    .find(|model| model.default)
+                    .or_else(|| self.catalog.first())
+                    .map(|model| model.id.clone());
+            }
+            cx.notify();
+            return;
+        }
         self.catalog_epoch += 1;
         let epoch = self.catalog_epoch;
         let account = self.settings.account.clone();
@@ -2561,10 +2582,14 @@ impl Conversation {
                 cx.notify();
                 return false;
             }
-            let attached = locked(&self.store)
-                .ok()
-                .and_then(|s| s.remote_session(self.summary.id).ok().flatten())
-                .is_some_and(|s| s.session_id.is_some());
+            let attached = if self.loaded {
+                !self.remote_state.unbound
+            } else {
+                locked(&self.store)
+                    .ok()
+                    .and_then(|s| s.remote_session(self.summary.id).ok().flatten())
+                    .is_some_and(|s| s.session_id.is_some())
+            };
             if attached && self.summary.provider != picked.0.id() {
                 self.status = "现有 Paseo agent 不能切换 provider；请新建会话".into();
                 cx.notify();
@@ -2651,10 +2676,18 @@ impl Conversation {
             self.completion.update(cx, |completion, cx| {
                 completion.set_provider(picked.0.id(), cx)
             });
+            let cached_models = self
+                .is_remote()
+                .then(|| {
+                    monocode_core::catalog::cached_full_remote_catalog(&self.summary.cwd)
+                        .and_then(|(c, _)| c.models.get(&picked.0).cloned())
+                })
+                .flatten()
+                .unwrap_or_default();
             self.catalog = cx
                 .try_global::<crate::settings::Preferences>()
-                .map(|prefs| prefs.named_catalog(picked.0.id(), Vec::new()))
-                .unwrap_or_default();
+                .map(|prefs| prefs.named_catalog(picked.0.id(), cached_models.clone()))
+                .unwrap_or(cached_models);
             if !self.summary.has_messages {
                 self.summary.title = format!("New {} session", picked.0.label());
             }
