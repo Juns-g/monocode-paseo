@@ -3067,7 +3067,7 @@ impl Conversation {
                             width: 310.,
                             padding: 0.,
                             height: (!self.paseo_controls()).then_some(442.),
-                            max_height: self.paseo_controls().then_some(320.),
+                            max_height: self.paseo_controls().then_some(400.),
                             focus: Some(focus),
                             surface: None,
                         })

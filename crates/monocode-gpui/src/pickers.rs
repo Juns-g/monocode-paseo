@@ -989,11 +989,48 @@ impl ModelList {
             .map(|model| model_display_name(kind, &model.id, &model.name))
             .unwrap_or_else(|| model_name(kind, id))
     }
+    fn visible_providers(&self) -> Vec<Kind> {
+        Kind::ALL
+            .into_iter()
+            .filter(|kind| {
+                if self.remote_project.is_some() {
+                    *kind == self.provider
+                        || self
+                            .remote_providers
+                            .as_ref()
+                            .is_some_and(|providers| providers.contains(kind))
+                } else {
+                    *kind == self.provider
+                        || (!self.hidden.iter().any(|id| id == kind.id())
+                            && !self.missing.contains(kind))
+                }
+            })
+            .collect()
+    }
+    fn provider_rail_height(&self) -> f32 {
+        // Favorites star + every visible provider button (32px each, 4px gap, 12px vertical padding).
+        let tabs = 1 + self.visible_providers().len();
+        12. + tabs as f32 * 32. + tabs.saturating_sub(1) as f32 * 4.
+    }
     pub(crate) fn preferred_height(&self, cx: &gpui::App) -> f32 {
         if self.presets.is_none() {
             return 442.;
         }
-        (64. + self.entries(cx).len() as f32 * 48.).clamp(112., 320.)
+        let max_catalog_rows = self
+            .visible_providers()
+            .into_iter()
+            .map(|kind| {
+                self.catalogs
+                    .iter()
+                    .find(|(k, _)| *k == kind)
+                    .map_or(1, |(_, models)| models.len() + 1)
+            })
+            .max()
+            .unwrap_or(0);
+        let rows = self.entries(cx).len().max(max_catalog_rows);
+        let list_height = 64. + rows as f32 * 48.;
+        let rail_height = self.provider_rail_height();
+        list_height.max(rail_height).clamp(112., 400.)
     }
     fn current_index(&self, cx: &gpui::App) -> usize {
         self.entries(cx)
@@ -1291,21 +1328,8 @@ impl Render for ModelList {
                     .border_color(content(0.07))
                     .child(self.tab(ModelTab::Favorites, cx))
                     .children(
-                        Kind::ALL
+                        self.visible_providers()
                             .into_iter()
-                            .filter(|kind| {
-                                if self.remote_project.is_some() {
-                                    *kind == self.provider
-                                        || self
-                                            .remote_providers
-                                            .as_ref()
-                                            .is_some_and(|providers| providers.contains(kind))
-                                } else {
-                                    *kind == self.provider
-                                        || (!self.hidden.iter().any(|id| id == kind.id())
-                                            && !self.missing.contains(kind))
-                                }
-                            })
                             .map(|kind| self.tab(ModelTab::Harness(kind), cx)),
                     ),
             )
@@ -2095,7 +2119,9 @@ mod configured_tests {
     use gpui::TestAppContext;
 
     #[gpui::test]
-    fn paseo_favorite_height_hugs_rows_without_changing_ordinary_picker(cx: &mut TestAppContext) {
+    fn paseo_favorite_height_keeps_provider_rail_visible_and_stable_across_tabs(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             cx.set_global(crate::settings::Preferences::default());
             let list = cx.new(|cx| {
@@ -2104,8 +2130,41 @@ mod configured_tests {
             assert_eq!(list.read(cx).preferred_height(cx), 442.);
             list.update(cx, |list, cx| {
                 list.presets = Some(true);
-                list.tab = ModelTab::Favorites;
-                assert_eq!(list.preferred_height(cx), 112.);
+                list.remote_project = Some("remote://env/repo".into());
+                list.remote_providers = Some(vec![
+                    Kind::Claude,
+                    Kind::Codex,
+                    Kind::Grok,
+                    Kind::Omp,
+                    Kind::Antigravity,
+                ]);
+                list.catalogs = vec![
+                    (
+                        Kind::Grok,
+                        vec![monocode_core::catalog::Model {
+                            id: "grok:4.7".into(),
+                            name: "Grok 4.7".into(),
+                            ..Default::default()
+                        }],
+                    ),
+                    (
+                        Kind::Antigravity,
+                        (0..8)
+                            .map(|i| monocode_core::catalog::Model {
+                                id: format!("antigravity:m-{i}"),
+                                name: format!("Model {i}"),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                ];
+                let rail_height = list.provider_rail_height();
+                list.tab = ModelTab::Harness(Kind::Grok);
+                let grok_height = list.preferred_height(cx);
+                list.tab = ModelTab::Harness(Kind::Antigravity);
+                let agy_height = list.preferred_height(cx);
+                assert!(grok_height >= rail_height);
+                assert_eq!(grok_height, agy_height);
             });
         });
     }

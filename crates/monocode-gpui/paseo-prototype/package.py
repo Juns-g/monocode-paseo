@@ -17,7 +17,7 @@ for source,name in [(root/'LICENSE','Monocode-LICENSE'),(root/'NOTICE','Monocode
     if source.exists():shutil.copy2(source,resources/name)
 metadata={'CFBundleExecutable':'monocode-gpui','CFBundleIdentifier':'dev.usemono.paseo-prototype',
  'CFBundleName':'Monocode Paseo Prototype','CFBundleDisplayName':'Monocode Paseo Prototype',
- 'CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.2.12','CFBundleVersion':'43',
+ 'CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.2.12','CFBundleVersion':'44',
  'MonocodeUpstreamBase':'main','MonocodeUpstreamCommit':'09d04436babb39ad72198cdf22f735067027fc04',
  'CFBundleIconFile':'monocode.icns','NSHighResolutionCapable':True,'NSPrincipalClass':'NSApplication',
  'PaseoPrototype':True,'MonocodeDataMode':'paseo-prototype'}
