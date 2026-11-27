@@ -205,7 +205,8 @@ export class HostRegistry {
         });
         if (typeof unsubRaw === 'function') record.unsubscribers.push(unsubRaw);
 
-        await adapter.directory(true);
+        // Warm the (windowed) directory without blocking connect; the first projects.list joins this in-flight fetch.
+        adapter.directory(true).catch(() => {});
         await new Promise((resolve, reject) => {
           const onError = err => reject(err);
           server.once('error', onError);

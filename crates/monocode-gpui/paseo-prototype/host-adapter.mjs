@@ -28,6 +28,15 @@ const IMAGE_CACHE_MAX_ENTRIES=8;
 const PROVIDER_CACHE_TTL_MS=5*60*1000;
 const CATALOG_CACHE_TTL_MS=10*60*1000;
 const COLD_PROVIDER_TIMEOUT_MS=8000;
+// Remote first open: tail + 1 older page + tail (~3 routed trips) instead of ~11; older rows stay reachable via sessions.historyBefore.
+const REMOTE_HISTORY_BACKFILL=200;
+const DIRECTORY_TTL_MS=2500,REMOTE_DIRECTORY_TTL_MS=30000,DAY_MS=86400000;
+// prototype.json `directoryRecentDays`: absent -> remote hosts 7 days, local host full scan; a positive number -> that window on every host;
+// 0, negative or non-numeric -> full scan everywhere. A windowed directory lists only unarchived agents updated within the window.
+export function directoryRecentDays(value,isRemoteHost){
+  if(value===undefined||value===null)return isRemoteHost?7:0;
+  return typeof value==='number'&&Number.isFinite(value)&&value>0?value:0;
+}
 function isAbsAnyPath(p){return p.startsWith('/')||/^[A-Za-z]:[\\/]/.test(p)||p.startsWith('\\\\');}
 function trimSep(p){return p==='/'||/^[A-Za-z]:[\\/]?$/.test(p)?p.replace(/\\/g,'/'):p.replace(/[\\/]+$/,'');}
 function normCmp(p){const n=trimSep(p.replace(/\\/g,'/'));return /^[A-Za-z]:\//.test(n)?n[0].toUpperCase()+n.slice(1):n;}
@@ -179,6 +188,9 @@ export class Attempts {
 export class PaseoHost {
   constructor(client,directory,projectTimeline=rows=>rows,options={}) {
     this.client=client;this.isRemoteHost=options.isRemoteHost===true;this.hostRegistry=options.hostRegistry??null;
+    this.recentDays=directoryRecentDays(options.recentDays,this.isRemoteHost);this.directoryTtl=this.isRemoteHost?REMOTE_DIRECTORY_TTL_MS:DIRECTORY_TTL_MS;
+    // Windowed hosts: agents opened by id outside the window stay listed; unknown status ids invalidate at most once.
+    this.outside=new Map();this.missing=new Set();
     this.descendantRegistry=options.descendantRegistry??this.hostRegistry??null;
     this.descendantSummaryCache=new Map();
     this.serverId=options.expectedServerId??client.getLastServerInfoMessage()?.serverId??null;
@@ -246,6 +258,11 @@ export class PaseoHost {
     const id=message?.payload?.agentId??info?.id;
     if(!id||!info){this.invalidate();return;}
     const entry=this.entries.get(id);
+    if(!entry&&this.recentDays){
+      // Out-of-window or archived agents are not listed by design; a new in-window id reloads once, not per broadcast.
+      if(info.archivedAt||stamp(info.updatedAt)<Date.now()-this.recentDays*DAY_MS||this.missing.has(id))return;
+      this.missing.add(id);this.invalidate();return;
+    }
     if(!entry||entry.agent.workspaceId!==info.workspaceId){this.invalidate();return;}
     const archivedChanged=Boolean(entry.agent.archivedAt)!==Boolean(info.archivedAt);
     const titleChanged=entry.agent.title!==info.title;
@@ -262,7 +279,9 @@ export class PaseoHost {
     if(archivedChanged||titleChanged)this.directoryGeneration++;
   }
   async directory(force=false){
-    this.identity();if(!force && Date.now()-this.directoryAt<2500)return;
+    this.identity();if(!force && Date.now()-this.directoryAt<this.directoryTtl)return;
+    // Windowed remote: a stale (expired or invalidated) snapshot is served at once while one background refresh runs; failures keep it.
+    if(!force&&this.isRemoteHost&&this.recentDays&&this.directoryLoaded){if(!this.directoryWork)this.directory(true).catch(()=>{});return;}
     // A forced refresh follows a mutation: never answer it from a fetch that started before it.
     const requested=++this.directoryRequests;
     while(this.directoryWork){
@@ -273,20 +292,34 @@ export class PaseoHost {
     const generation=this.directoryGeneration;
     this.directoryWork=(async()=>{
       const entries=new Map(),projects=new Map();let cursor;const seen=new Set();
+      const cutoff=this.recentDays?Date.now()-this.recentDays*DAY_MS:null;
+      const place=entry=>{
+        const cwd=entry.project?.checkout?.cwd;if(!cwd)return;
+        // Native remote project identities are cwd-qualified; merge same-cwd placements.
+        const id=`paseo:${cwd}`;projects.set(id,{id,cwd,name:entry.project.projectName});entries.set(entry.agent.id,{...entry,projectId:id});
+      };
       do{
-        const page=await this.client.fetchAgentHistory({page:{limit:100,...(cursor?{cursor}:{})},filter:{includeArchived:true}});
-        for(const entry of page.entries){
-          const cwd=entry.project?.checkout?.cwd;if(!cwd)continue;
-          // Native remote project identities are cwd-qualified; merge same-cwd placements.
-          const id=`paseo:${cwd}`;projects.set(id,{id,cwd,name:entry.project.projectName});entries.set(entry.agent.id,{...entry,projectId:id});
-        }
-        cursor=page.pageInfo?.nextCursor;
+        // Windowed: newest-first pages; the first entry older than the cutoff ends paging (server has no time filter).
+        const page=await this.client.fetchAgentHistory(cutoff==null?{page:{limit:100,...(cursor?{cursor}:{})},filter:{includeArchived:true}}
+          :{page:{limit:200,...(cursor?{cursor}:{})},filter:{includeArchived:false},sort:[{key:'updated_at',direction:'desc'}]});
+        let older=false;
+        for(const entry of page.entries){if(cutoff!=null&&stamp(entry.agent.updatedAt)<cutoff){older=true;continue;}place(entry);}
+        cursor=older?null:page.pageInfo?.nextCursor;
         if(cursor && seen.has(JSON.stringify(cursor)))throw Error('Repeated directory cursor');
         seen.add(JSON.stringify(cursor));
       }while(cursor);
+      for(const [id,pin] of this.outside)if(!entries.has(id))place({...pin,agent:this.entries.get(id)?.agent??pin.agent});
+      for(const id of entries.keys())this.missing.delete(id);
       const ids=new Set([...entries.values()].map(e=>e.agent.workspaceId).filter(Boolean));
-      const workspaces=await this.control(null).workspaces(ids);this.identity();
-      for(const entry of entries.values())entry.workspace=workspaces.get(entry.agent.workspaceId);
+      // Windowed remote: workspace lookup scans every remote workspace (~24 s on Byte), so publish with the prior snapshot's objects and attach later.
+      const deferWorkspaces=this.isRemoteHost&&this.recentDays>0;
+      if(deferWorkspaces){
+        const known=new Map([...this.entries.values()].filter(e=>e.workspace&&e.agent.workspaceId).map(e=>[e.agent.workspaceId,e.workspace]));
+        for(const entry of entries.values())entry.workspace=known.get(entry.agent.workspaceId);
+      }else{
+        const workspaces=await this.control(null).workspaces(ids);this.identity();
+        for(const entry of entries.values())entry.workspace=workspaces.get(entry.agent.workspaceId);
+      }
       // Workspace-owned controls appear once; preserve real agent identities underneath.
       const anchors=new Map();
       const ordered=[...entries.values()].sort((a,b)=>Number(!!a.agent.archivedAt)-Number(!!b.agent.archivedAt)
@@ -348,10 +381,21 @@ export class PaseoHost {
       // Discard snapshots that started before a local sessions.update mutation so
       // stale pre-archive / pre-rename rows never overwrite confirmed in-memory patches.
       if(this.directoryGeneration!==generation){this.directoryAt=0;return;}
-      this.entries=entries;this.projects=projects;this.directoryAt=Date.now();
+      this.entries=entries;this.projects=projects;this.directoryAt=Date.now();this.directoryLoaded=true;
+      if(deferWorkspaces&&ids.size)this.attachWorkspaces(entries,ids);
     })();
     const work=this.directoryWork;work.started=started;
     try{await work;}finally{if(this.directoryWork===work)this.directoryWork=null;}
+  }
+  // Serialized background workspace enrichment for the current snapshot only; a mutation meanwhile keeps its patched objects.
+  attachWorkspaces(entries,ids){
+    this.workspaceWork=(this.workspaceWork??Promise.resolve()).then(async()=>{
+      if(this.entries!==entries)return;
+      const generation=this.directoryGeneration,found=await this.control(null).workspaces(ids);this.identity();
+      if(this.entries!==entries)return;
+      const fillOnly=this.directoryGeneration!==generation;
+      for(const e of entries.values()){const w=found.get(e.agent.workspaceId);if(w&&!(fillOnly&&e.workspace))e.workspace=w;}
+    }).catch(()=>{});
   }
   refreshEntryStatus(e){
     const bucket=deriveAgentStateBucket({...e.agent,status:e.agent.status==='error'?'error':e.agent.activeTurn?'running':e.agent.status,pendingPermissionCount:e.agent.pendingPermissions?.length??0});
@@ -379,11 +423,19 @@ export class PaseoHost {
     }
   }
   async target(id){
-    this.identity();if(!this.entries.has(id))await this.directory(true);
+    this.identity();if(!this.entries.has(id))await(this.recentDays?this.pin(id):this.directory(true));
     const entry=this.entries.get(id);if(!entry)throw Error('Unknown Paseo agent');
     const found=await this.client.fetchAgent(id);this.identity();
     if(found?.agent.id!==id||found.agent.workspaceId!==entry.agent.workspaceId)throw Error('Exact agent/workspace identity changed');
     entry.agent=found.agent;return entry;
+  }
+  // Opening an agent outside the recent window: fetch it by id and keep it listed across directory refreshes.
+  async pin(id){
+    const found=await this.client.fetchAgent(id);this.identity();
+    if(found?.agent?.id!==id||!found.project?.checkout?.cwd)return;
+    while(this.outside.size>=64)this.outside.delete(this.outside.keys().next().value);
+    this.outside.set(id,{agent:found.agent,project:found.project});
+    await this.directory(true);
   }
   async history(id){
     const entry=await this.target(id);let h=this.histories.get(id);
@@ -403,7 +455,7 @@ export class PaseoHost {
       if(h.page?.epoch===page.epoch && h.entries.length && !page.reset && !page.staleCursor && (h.entries.at(-1)?.seqEnd??0)+1>=(rows[0]?.seqStart??0)){
         rows=joinEntries(h.entries,rows).slice(-1000);hasOlder=h.page.hasOlder||rows.length===1000;
       }else{
-        while(hasOlder && rows.length<1000){
+        while(hasOlder && rows.length<(this.isRemoteHost?REMOTE_HISTORY_BACKFILL:1000)){
           const older=await this.client.fetchAgentTimeline(id,{projection:'canonical',direction:'before',cursor,limit:100});
           if(older.agent?.id!==id||older.epoch!==page.epoch||older.reset||older.staleCursor)throw Error('History changed while paging; retry');
           rows=joinEntries(older.entries,rows);cursor=older.startCursor;hasOlder=older.hasOlder;

@@ -1254,7 +1254,7 @@ test('paseo.rewind succeeds when idle, forces fresh snapshot on next sessions.sy
 }
 
 // F7: multi-host isolation & routed loopback servers
-import {LOCAL_FS_CAPABILITIES,BASE_CAPABILITIES} from './host-adapter.mjs';
+import {LOCAL_FS_CAPABILITIES,BASE_CAPABILITIES,directoryRecentDays} from './host-adapter.mjs';
 import {HostRegistry} from './hosts.mjs';
 import {PASEO_CLIENT_CAPABILITIES,createRoutedClient} from './sdk.mjs';
 import {createHostServer} from '../../../host/server.ts';
@@ -1282,7 +1282,7 @@ function remoteFixture(serverId='srv-devbox-boe') {
     getProjectIcon:async id=>({projectId:id,icon:null}),
     close(){},
   };
-  const host=new PaseoHost(client,directory,rows=>rows,{isRemoteHost:true,expectedServerId:serverId});
+  const host=new PaseoHost(client,directory,rows=>rows,{isRemoteHost:true,expectedServerId:serverId,recentDays:0}); // Fixed dates: no time window.
   host.connected=true;
   return {host,client,a,e,directory,close(){host.close();rmSync(directory,{recursive:true,force:true});}};
 }
@@ -1372,7 +1372,7 @@ test('primary PaseoHost dispatches paseo.hosts.list and paseo.hosts.connect via 
     baseDirectory:lf.directory,
     token:TOKEN,
     createRoutedClient:()=>({...rf.client,connect:async()=>{},setReconnectEnabled(){},subscribeConnectionStatus:()=>()=>{},subscribeRawMessages:()=>()=>{}}),
-    createAdapter:(c,dir,opts)=>new PaseoHost(c,dir,rows=>rows,opts),
+    createAdapter:(c,dir,opts)=>new PaseoHost(c,dir,rows=>rows,{...opts,recentDays:0}),
     createServer:(store,adapter)=>createHostServer({store},[],undefined,adapter),
   });
   lf.host.hostRegistry=registry;
@@ -1517,7 +1517,7 @@ test('paseo.descendants builds multi-host multi-level tree (collab.by + paseo.pa
       const target=serverId==='srv-devbox-boe'?boe.client:ai.client;
       return {...target,connect:async()=>{},setReconnectEnabled(){},subscribeConnectionStatus:()=>()=>{},subscribeRawMessages:()=>()=>{}};
     },
-    createAdapter:(c,dir,opts)=>new PaseoHost(c,dir,rows=>rows,opts),
+    createAdapter:(c,dir,opts)=>new PaseoHost(c,dir,rows=>rows,{...opts,recentDays:0}),
     createServer:(store,adapter)=>createHostServer({store},[],undefined,adapter),
   });
   registry.primaryHost=lf.host;
@@ -1590,5 +1590,97 @@ test('models.list resolves known cwd without rescanning directory, returns provi
     assert.equal(refreshed.models.claude[0].id,'claude:m-2');
     assert.equal(historyCalls,0);
   }finally{f.close();}
+});
+
+test('directoryRecentDays config: remote default 7, local full scan, explicit positive applies, 0/negative/invalid disables',()=>{
+  assert.equal(directoryRecentDays(undefined,true),7);assert.equal(directoryRecentDays(undefined,false),0);
+  assert.equal(directoryRecentDays(14,false),14);assert.equal(directoryRecentDays(3,true),3);
+  for(const v of [0,-1,'7',NaN,Infinity,true])assert.equal(directoryRecentDays(v,true),0);
+});
+
+test('windowed remote directory sorts newest-first, excludes archived, stops at cutoff, pins out-of-window agents opened by id, and coalesces unknown statuses',async()=>{
+  const rf=remoteFixture('srv-window');
+  try{
+    const host=new PaseoHost(rf.client,rf.directory,rows=>rows,{isRemoteHost:true,expectedServerId:'srv-window'});host.connected=true;
+    assert.equal(host.recentDays,7);assert.equal(host.directoryTtl,30000);
+    const day=86400000,at=d=>new Date(Date.now()-d*day).toISOString();
+    const row=(id,d)=>({...rf.e,agent:{...rf.a,id,updatedAt:at(d)}});
+    const pages=[[row('n1',0.1),row('n2',2)],[row('n3',6),row('old1',8)],[row('old2',9)]];
+    const requests=[];
+    rf.client.fetchAgentHistory=async req=>{requests.push(req);const i=req.page.cursor?Number(req.page.cursor):0;return {entries:pages[i],pageInfo:{nextCursor:i+1<pages.length?String(i+1):null}};};
+    await host.directory(true);
+    assert.equal(requests.length,2,'stops on the page whose tail is older than the cutoff');
+    assert.deepEqual(requests[0],{page:{limit:200},filter:{includeArchived:false},sort:[{key:'updated_at',direction:'desc'}]});
+    assert.deepEqual([...host.entries.keys()].sort(),['n1','n2','n3']);
+    // Fresh for 30 s: an unforced list does not refetch.
+    await host.directory();assert.equal(requests.length,2);
+    // Out-of-window / archived statuses are ignored; a new in-window unknown id invalidates once.
+    host.applyAgentStatus({payload:{agentId:'old1',info:{...rf.a,id:'old1',updatedAt:at(8)}}});assert.notEqual(host.directoryAt,0);
+    host.applyAgentStatus({payload:{agentId:'arch',info:{...rf.a,id:'arch',updatedAt:at(0),archivedAt:at(0)}}});assert.notEqual(host.directoryAt,0);
+    host.applyAgentStatus({payload:{agentId:'fresh',info:{...rf.a,id:'fresh',updatedAt:at(0)}}});assert.equal(host.directoryAt,0);
+    await host.directory();await host.directoryWork;assert.equal(requests.length,4); // SWR: refresh runs in background.
+    host.applyAgentStatus({payload:{agentId:'fresh',info:{...rf.a,id:'fresh',updatedAt:at(0)}}});assert.notEqual(host.directoryAt,0,'repeat broadcast does not reload again');
+    // Opening an out-of-window agent by id fetches it directly and keeps it listed.
+    rf.client.fetchAgent=async id=>id==='old2'?{agent:{...rf.a,id,updatedAt:at(9)},project:rf.e.project}:null;
+    const entry=await host.target('old2');assert.equal(entry.agent.id,'old2');
+    await host.directory(true);assert.equal(host.entries.has('old2'),true);
+    await assert.rejects(host.target('nope'),/Unknown Paseo agent/);
+    host.close();
+  }finally{rf.close();}
+});
+
+test('windowed remote directory serves a stale snapshot immediately and triggers exactly one background refresh',async()=>{
+  const rf=remoteFixture('srv-swr');
+  try{
+    const host=new PaseoHost(rf.client,rf.directory,rows=>rows,{isRemoteHost:true,expectedServerId:'srv-swr'});host.connected=true;
+    const fresh=new Date().toISOString();let calls=0,release;
+    rf.client.fetchAgentHistory=async()=>{calls++;if(calls===2)await new Promise(r=>{release=r;});return {entries:[{...rf.e,agent:{...rf.a,id:`a${calls}`,updatedAt:fresh}}],pageInfo:{}};};
+    await host.directory();assert.equal(calls,1);
+    host.directoryAt=Date.now()-31000; // TTL expired
+    await host.directory();await host.directory();
+    assert.equal(calls,2,'one refresh for two stale calls');assert.deepEqual([...host.entries.keys()],['a1'],'stale snapshot served while refreshing');
+    release();await host.directoryWork;assert.deepEqual([...host.entries.keys()],['a2']);
+    host.invalidate();rf.client.fetchAgentHistory=async()=>{calls++;throw Error('boom');};
+    await host.directory();await new Promise(r=>setTimeout(r,0));assert.equal(calls,3);assert.deepEqual([...host.entries.keys()],['a2'],'failure keeps snapshot');
+    host.close();
+  }finally{rf.close();}
+});
+
+test('windowed remote directory resolves before workspaces arrive and attaches them afterwards',async()=>{
+  const rf=remoteFixture('srv-ws');
+  try{
+    const host=new PaseoHost(rf.client,rf.directory,rows=>rows,{isRemoteHost:true,expectedServerId:'srv-ws'});host.connected=true;
+    rf.client.fetchAgentHistory=async()=>({entries:[{...rf.e,agent:{...rf.a,updatedAt:new Date().toISOString()}}],pageInfo:{}});
+    let release,calls=0;
+    rf.client.fetchWorkspaces=async()=>{calls++;await new Promise(r=>{release=r;});return {entries:[{id:'w-remote',name:'Remote WS',title:'Pinned title',pinnedAt:'2026-11-27T00:00:00Z',workspaceKind:'directory'}],pageInfo:{}};};
+    await host.directory(true);
+    const projectId=[...host.projects.keys()][0];
+    let row=(await host.request('sessions.list',{projectId})).result[0];
+    assert.equal(row.title,'Remote WS','falls back to project.workspaceName');assert.equal(row.pinned,false);assert.equal(calls,1);
+    release();await host.workspaceWork;
+    row=(await host.request('sessions.list',{projectId})).result[0];
+    assert.equal(row.title,'Pinned title');assert.equal(row.pinned,true);
+    // A steady-state refresh reuses the known workspace object: no flash while the next lookup is pending.
+    await host.directory(true);row=(await host.request('sessions.list',{projectId})).result[0];
+    assert.equal(row.pinned,true);assert.equal(calls,2);release();await host.workspaceWork;
+    host.close();
+  }finally{rf.close();}
+});
+
+test('remote first history load stops at the 200-row backfill cap and reports hasOlder for historyBefore paging',async()=>{
+  const rf=remoteFixture('srv-hist');
+  try{
+    const rows=(from,to)=>Array.from({length:to-from+1},(_,i)=>({seqStart:from+i,seqEnd:from+i,timestamp:'2026-11-24T00:00:00Z',item:{type:'user_message',text:`m${from+i}`}}));
+    const calls=[];
+    rf.client.fetchAgentTimeline=async(_,o)=>{calls.push(o.direction);
+      if(o.direction==='tail')return {agent:rf.a,epoch:'e1',hasOlder:true,startCursor:{epoch:'e1',seq:901},entries:rows(901,1000)};
+      const end=o.cursor.seq-1;return {agent:rf.a,epoch:'e1',hasOlder:end-100>0,startCursor:{epoch:'e1',seq:end-99},entries:rows(end-99,end)};};
+    const h=await rf.host.history(rf.a.id);
+    assert.deepEqual(calls,['tail','before','tail']);
+    assert.equal(h.entries.length,200);assert.equal(h.page.hasOlder,true);
+    assert.deepEqual(h.snapshot.session.historyWindow,{epoch:'e1',before:801});
+    const older=(await rf.host.request('sessions.historyBefore',{sessionId:rf.a.id,epoch:'e1',before:801})).result;
+    assert.equal(older.before,701);assert.equal(older.blocks.length>0,true);
+  }finally{rf.close();}
 });
 }

@@ -15,16 +15,17 @@ let token;
 try{token=readFileSync(tokenPath,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;token=randomBytes(32).toString('base64url');writeFileSync(tokenPath,token,{flag:'wx',mode:0o600});}
 if(!/^[A-Za-z0-9_-]{43}$/.test(token))throw Error('Invalid isolated host token');
 const client=createClient();
+const recentDays=readConfig().directoryRecentDays; // See README: absent -> remote 7 days, local full scan.
 const projectTimeline=rows=>projectTimelineRows({rows,mode:'projected'});
 const registry=new HostRegistry({
   originClient:client,
   baseDirectory:directory,
   token,
-  createAdapter:(routedClient,hostDir,options)=>new PaseoHost(routedClient,hostDir,projectTimeline,options),
+  createAdapter:(routedClient,hostDir,options)=>new PaseoHost(routedClient,hostDir,projectTimeline,{...options,recentDays}),
   createRoutedClient,
   createServer:(store,adapter)=>createHostServer({store},[],undefined,adapter),
 });
-const host=new PaseoHost(client,directory,projectTimeline,{hostRegistry:registry});
+const host=new PaseoHost(client,directory,projectTimeline,{hostRegistry:registry,recentDays});
 registry.primaryHost=host;
 host.allowLiveCheck=process.argv.includes('--live-create');
 const store={get environmentId(){return host.serverId;},
