@@ -28,8 +28,9 @@ const IMAGE_CACHE_MAX_ENTRIES=8;
 const PROVIDER_CACHE_TTL_MS=5*60*1000;
 const CATALOG_CACHE_TTL_MS=10*60*1000;
 const COLD_PROVIDER_TIMEOUT_MS=8000;
-// Remote first open: tail + 1 older page + tail (~3 routed trips) instead of ~11; older rows stay reachable via sessions.historyBefore.
-const REMOTE_HISTORY_BACKFILL=200;
+// Remote timelines are payload-bound (~20 KB/s through the relay): first open is one small tail page, older rows come via
+// sessions.historyBefore (40 per page), and a contiguous refresh pulls only rows after the last known seq.
+const REMOTE_HISTORY_TAIL=40,REMOTE_HISTORY_BEFORE=40,REMOTE_HISTORY_AFTER=40;
 const DIRECTORY_TTL_MS=2500,REMOTE_DIRECTORY_TTL_MS=30000,DAY_MS=86400000;
 // prototype.json `directoryRecentDays`: absent -> remote hosts 7 days, local host full scan; a positive number -> that window on every host;
 // 0, negative or non-numeric -> full scan everywhere. A windowed directory lists only unarchived agents updated within the window.
@@ -437,16 +438,41 @@ export class PaseoHost {
     this.outside.set(id,{agent:found.agent,project:found.project});
     await this.directory(true);
   }
+  async remoteHistory(id,h){
+    const fetch=async o=>{const page=await this.client.fetchAgentTimeline(id,{projection:'canonical',...o});if(page.agent?.id!==id)throw Error('Timeline agent identity mismatch');return page;};
+    if(h.page&&h.entries.length&&!h.reload){
+      // `after` is exclusive of cursor.seq; endCursor advances only through contiguous source rows; a grown row keeps its seqStart.
+      let rows=h.entries,end=h.page.endCursor?.seq??h.entries.at(-1).seqEnd,last=null,ok=true;
+      for(let i=0;i<25;i++){
+        const next=await fetch({direction:'after',cursor:{epoch:h.page.epoch,seq:end},limit:REMOTE_HISTORY_AFTER});
+        if(next.epoch!==h.page.epoch||next.reset||next.staleCursor||next.gap){ok=false;break;}
+        rows=joinEntries(rows,next.entries);last=next;if(next.endCursor)end=next.endCursor.seq;
+        if(!next.hasNewer||!next.entries.length)break;
+      }
+      if(ok){
+        const kept=rows.slice(-1000);
+        h.page={...h.page,...(last?{window:last.window}:{}),endCursor:{epoch:h.page.epoch,seq:end},hasOlder:h.page.hasOlder||kept.length<rows.length};
+        if(kept.length!==h.entries.length||last?.entries.length)h.entries=kept;return;
+      }
+    }
+    h.reload=false;
+    const page=await fetch({direction:'tail',limit:REMOTE_HISTORY_TAIL});
+    h.entries=page.entries.slice(-1000);h.page=page;
+  }
   async history(id){
     const entry=await this.target(id);let h=this.histories.get(id);
     if(!h){
       while(this.histories.size>=16){const [key,old]=this.histories.entries().next().value;old.subscription?.();this.histories.delete(key);}
       h={dirty:true,entries:[],generation:0};this.histories.set(id,h);
-      h.subscription=this.client.subscribeAgentTimeline(id,()=>{h.dirty=true;h.generation++;});await h.subscription.ready;
+      // Replacements rewrite earlier rows and restores may hide a gap: only plain stream updates may refresh incrementally.
+      h.subscription=this.client.subscribeAgentTimeline(id,message=>{h.dirty=true;h.generation++;if(this.isRemoteHost&&message?.type!=='agent_stream')h.reload=true;});
+      // Remote: fetch the tail while the subscription is set up; once live, one `after` refresh closes any gap.
+      if(this.isRemoteHost)h.subscription.ready.then(()=>{h.dirty=true;h.generation++;},()=>{});else await h.subscription.ready;
     }
     this.histories.delete(id);this.histories.set(id,h);
     const agentChanged=JSON.stringify(h.agent)!==JSON.stringify(entry.agent)||h.snapshot?.session.title!==summary(entry,entry.projectId).title;
-    if(h.dirty||!h.page){
+    if(this.isRemoteHost&&(h.dirty||!h.page)){const generation=h.generation;await this.remoteHistory(id,h);h.dirty=h.generation!==generation;}
+    else if(h.dirty||!h.page){
       const generation=h.generation;
       // Re-fetch explicitly after reconnect: SDK subscription restoration misses gaps.
       let page=await this.client.fetchAgentTimeline(id,{projection:'canonical',direction:'tail',limit:100});
@@ -455,7 +481,7 @@ export class PaseoHost {
       if(h.page?.epoch===page.epoch && h.entries.length && !page.reset && !page.staleCursor && (h.entries.at(-1)?.seqEnd??0)+1>=(rows[0]?.seqStart??0)){
         rows=joinEntries(h.entries,rows).slice(-1000);hasOlder=h.page.hasOlder||rows.length===1000;
       }else{
-        while(hasOlder && rows.length<(this.isRemoteHost?REMOTE_HISTORY_BACKFILL:1000)){
+        while(hasOlder && rows.length<1000){
           const older=await this.client.fetchAgentTimeline(id,{projection:'canonical',direction:'before',cursor,limit:100});
           if(older.agent?.id!==id||older.epoch!==page.epoch||older.reset||older.staleCursor)throw Error('History changed while paging; retry');
           rows=joinEntries(older.entries,rows);cursor=older.startCursor;hasOlder=older.hasOlder;
@@ -888,7 +914,7 @@ export class PaseoHost {
     if(method==='sessions.historyBefore') {
       if(!Number.isSafeInteger(p.before)||p.before<0)throw Error('Invalid history cursor');
       if(typeof p.epoch!=='string'||!p.epoch)throw Error('Invalid history epoch');
-      const limit=Math.min(100,Math.max(1,Number.isFinite(p.limit)?Math.trunc(p.limit):100)),entry=await this.target(p.sessionId),id=entry.agent.id;
+      const limit=Math.min(this.isRemoteHost?REMOTE_HISTORY_BEFORE:100,Math.max(1,Number.isFinite(p.limit)?Math.trunc(p.limit):100)),entry=await this.target(p.sessionId),id=entry.agent.id;
       const page=await this.client.fetchAgentTimeline(id,{projection:'canonical',direction:'before',cursor:{epoch:p.epoch,seq:p.before},limit});this.identity();
       if(page.agent?.id!==id||page.epoch!==p.epoch||page.reset||page.staleCursor)throw Error('Paseo 历史已变化，请重新同步 (history changed)');
       // Read-only: no permission blocks, no turn duration for a prompt whose turn may continue past the page, and no cached window is touched.

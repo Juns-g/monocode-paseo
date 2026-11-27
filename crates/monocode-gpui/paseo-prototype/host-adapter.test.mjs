@@ -1667,20 +1667,46 @@ test('windowed remote directory resolves before workspaces arrive and attaches t
   }finally{rf.close();}
 });
 
-test('remote first history load stops at the 200-row backfill cap and reports hasOlder for historyBefore paging',async()=>{
+test('remote first history load is one small tail page that reports hasOlder, and historyBefore pages 40 rows',async()=>{
   const rf=remoteFixture('srv-hist');
   try{
     const rows=(from,to)=>Array.from({length:to-from+1},(_,i)=>({seqStart:from+i,seqEnd:from+i,timestamp:'2026-11-24T00:00:00Z',item:{type:'user_message',text:`m${from+i}`}}));
     const calls=[];
-    rf.client.fetchAgentTimeline=async(_,o)=>{calls.push(o.direction);
-      if(o.direction==='tail')return {agent:rf.a,epoch:'e1',hasOlder:true,startCursor:{epoch:'e1',seq:901},entries:rows(901,1000)};
-      const end=o.cursor.seq-1;return {agent:rf.a,epoch:'e1',hasOlder:end-100>0,startCursor:{epoch:'e1',seq:end-99},entries:rows(end-99,end)};};
+    rf.client.fetchAgentTimeline=async(_,o)=>{calls.push([o.direction,o.limit]);
+      if(o.direction==='tail')return {agent:rf.a,epoch:'e1',hasOlder:true,startCursor:{epoch:'e1',seq:1000-o.limit+1},endCursor:{epoch:'e1',seq:1000},entries:rows(1000-o.limit+1,1000)};
+      const end=o.cursor.seq-1;return {agent:rf.a,epoch:'e1',hasOlder:end-o.limit>0,startCursor:{epoch:'e1',seq:end-o.limit+1},entries:rows(end-o.limit+1,end)};};
     const h=await rf.host.history(rf.a.id);
-    assert.deepEqual(calls,['tail','before','tail']);
-    assert.equal(h.entries.length,200);assert.equal(h.page.hasOlder,true);
-    assert.deepEqual(h.snapshot.session.historyWindow,{epoch:'e1',before:801});
-    const older=(await rf.host.request('sessions.historyBefore',{sessionId:rf.a.id,epoch:'e1',before:801})).result;
-    assert.equal(older.before,701);assert.equal(older.blocks.length>0,true);
+    assert.deepEqual(calls,[['tail',40]]);
+    assert.equal(h.entries.length,40);assert.equal(h.page.hasOlder,true);
+    assert.deepEqual(h.snapshot.session.historyWindow,{epoch:'e1',before:961});
+    const older=(await rf.host.request('sessions.historyBefore',{sessionId:rf.a.id,epoch:'e1',before:961,limit:100})).result;
+    assert.deepEqual(calls.at(-1),['before',40]);assert.equal(older.before,921);assert.equal(older.blocks.length>0,true);
+  }finally{rf.close();}
+});
+
+test('remote contiguous history refresh pulls only rows after the last seq, loops on hasNewer, and reloads the tail on replacement',async()=>{
+  const rf=remoteFixture('srv-after');
+  try{
+    const row=(seq,text=`m${seq}`)=>({seqStart:seq,seqEnd:seq,timestamp:'2026-11-24T00:00:00Z',item:{type:'assistant_message',text}});
+    const range=(a,b)=>Array.from({length:b-a+1},(_,i)=>row(a+i));
+    let head=100,grown=null,onMessage;const calls=[];
+    rf.client.subscribeAgentTimeline=(_,cb)=>{onMessage=cb;return Object.assign(()=>{},{ready:Promise.resolve()});};
+    rf.client.fetchAgentTimeline=async(_,o)=>{calls.push([o.direction,o.cursor?.seq??null,o.limit]);
+      if(o.direction==='tail')return {agent:rf.a,epoch:'e1',hasOlder:true,endCursor:{epoch:'e1',seq:head},entries:range(head-o.limit+1,head)};
+      // 'after' is exclusive of cursor.seq; a grown last row comes back whole with the same seqStart.
+      const from=o.cursor.seq+1,to=Math.min(head,o.cursor.seq+o.limit),entries=[...(grown&&o.cursor.seq===100?[grown]:[]),...(from<=to?range(from,to):[])];
+      return {agent:rf.a,epoch:'e1',reset:false,staleCursor:false,gap:false,hasNewer:to<head,endCursor:entries.length?{epoch:'e1',seq:Math.max(o.cursor.seq,to)}:null,entries};};
+    let h=await rf.host.history(rf.a.id);assert.deepEqual(calls,[['tail',null,40]]);
+    await new Promise(r=>setTimeout(r,0)); // subscription live -> one gap-closing refresh
+    h=await rf.host.history(rf.a.id);assert.deepEqual(calls.at(-1),['after',100,40]);assert.equal(h.entries.length,40);
+    head=150;grown=row(100,'m100 grown');onMessage({type:'agent_stream'});
+    h=await rf.host.history(rf.a.id);
+    assert.deepEqual(calls.slice(-2),[['after',100,40],['after',140,40]]);
+    assert.equal(h.entries.length,90);assert.equal(h.entries.at(-1).seqStart,150);
+    assert.equal(h.entries.find(e=>e.seqStart===100).item.text,'m100 grown');
+    assert.equal(h.snapshot.session.historyWindow.before,61);
+    onMessage({type:'agent.timeline.replacement'});
+    h=await rf.host.history(rf.a.id);assert.deepEqual(calls.at(-1),['tail',null,40]);assert.equal(h.entries.length,40);
   }finally{rf.close();}
 });
 }
