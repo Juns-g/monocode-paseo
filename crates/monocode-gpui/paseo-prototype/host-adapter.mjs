@@ -31,6 +31,10 @@ const COLD_PROVIDER_TIMEOUT_MS=8000;
 // Remote timelines are payload-bound (~20 KB/s through the relay): first open is one small tail page, older rows come via
 // sessions.historyBefore (40 per page), and a contiguous refresh pulls only rows after the last known seq.
 const REMOTE_HISTORY_TAIL=40,REMOTE_HISTORY_BEFORE=40,REMOTE_HISTORY_AFTER=40;
+// While the daemon link is down these answer from the last directory snapshot instead of failing (the GUI's startup
+// and host switcher need them; the remote host UI must not be blocked by a stopped local daemon).
+const OFFLINE_METHODS=new Set(['environment.describe','projects.list','sessions.list','projects.open','paseo.projectIcons','paseo.workspaces','paseo.hosts.list','paseo.hosts.connect']);
+const SNAPSHOT_SAVE_MS=5*60*1000;
 const DIRECTORY_TTL_MS=2500,REMOTE_DIRECTORY_TTL_MS=30000,DAY_MS=86400000;
 // prototype.json `directoryRecentDays`: absent -> remote hosts 7 days, local host full scan; a positive number -> that window on every host;
 // 0, negative or non-numeric -> full scan everywhere. A windowed directory lists only unarchived agents updated within the window.
@@ -192,6 +196,8 @@ export class PaseoHost {
     this.recentDays=directoryRecentDays(options.recentDays,this.isRemoteHost);this.directoryTtl=this.isRemoteHost?REMOTE_DIRECTORY_TTL_MS:DIRECTORY_TTL_MS;
     // Windowed hosts: agents opened by id outside the window stay listed; unknown status ids invalidate at most once.
     this.outside=new Map();this.missing=new Set();
+    // Local host only: last directory persisted so a restart with the daemon down still lists projects/sessions (stale).
+    this.snapshotPath=options.persistDirectory===true?join(directory,'paseo-directory-snapshot.json'):null;this.snapshotSavedAt=0;this.snapshotTried=false;
     this.descendantRegistry=options.descendantRegistry??this.hostRegistry??null;
     this.descendantSummaryCache=new Map();
     this.serverId=options.expectedServerId??client.getLastServerInfoMessage()?.serverId??null;
@@ -279,7 +285,25 @@ export class PaseoHost {
     if(h){h.dirty=true;h.generation=(h.generation??0)+1;}
     if(archivedChanged||titleChanged)this.directoryGeneration++;
   }
+  // Stale directory while disconnected: in-memory snapshot, else (once) the persisted one for the same serverId.
+  offlineDirectory(){
+    if(this.directoryLoaded)return true;
+    if(!this.snapshotPath||this.snapshotTried||!this.serverId)return false;
+    this.snapshotTried=true;
+    try{
+      const saved=JSON.parse(readFileSync(this.snapshotPath,'utf8'));
+      if(saved.serverId!==this.serverId||!Array.isArray(saved.projects)||!Array.isArray(saved.entries))return false;
+      this.projects=new Map(saved.projects.map(p=>[p.id,p]));this.entries=new Map(saved.entries.map(e=>[e.agent.id,e]));
+      this.directoryLoaded=true;return true;
+    }catch{return false;}
+  }
+  saveDirectorySnapshot(){
+    if(!this.snapshotPath||Date.now()-this.snapshotSavedAt<SNAPSHOT_SAVE_MS)return;
+    this.snapshotSavedAt=Date.now();
+    try{const temp=this.snapshotPath+'.tmp';writeFileSync(temp,JSON.stringify({serverId:this.serverId,at:Date.now(),projects:[...this.projects.values()],entries:[...this.entries.values()]}),{mode:0o600});renameSync(temp,this.snapshotPath);}catch{}
+  }
   async directory(force=false){
+    if(!this.connected&&this.offlineDirectory())return;
     this.identity();if(!force && Date.now()-this.directoryAt<this.directoryTtl)return;
     // Windowed remote: a stale (expired or invalidated) snapshot is served at once while one background refresh runs; failures keep it.
     if(!force&&this.isRemoteHost&&this.recentDays&&this.directoryLoaded){if(!this.directoryWork)this.directory(true).catch(()=>{});return;}
@@ -382,7 +406,7 @@ export class PaseoHost {
       // Discard snapshots that started before a local sessions.update mutation so
       // stale pre-archive / pre-rename rows never overwrite confirmed in-memory patches.
       if(this.directoryGeneration!==generation){this.directoryAt=0;return;}
-      this.entries=entries;this.projects=projects;this.directoryAt=Date.now();this.directoryLoaded=true;
+      this.entries=entries;this.projects=projects;this.directoryAt=Date.now();this.directoryLoaded=true;this.saveDirectorySnapshot();
       if(deferWorkspaces&&ids.size)this.attachWorkspaces(entries,ids);
     })();
     const work=this.directoryWork;work.started=started;
@@ -811,7 +835,7 @@ export class PaseoHost {
     return {mimeType:cached.mimeType,data:cached.bytes.subarray(offset,end).toString('base64'),offset:end,size};
   }
   async request(method,p){
-    this.identity();
+    if(this.connected||!this.serverId||!OFFLINE_METHODS.has(method))this.identity();
     if(method==='attachments.upload')return {result:this.attachments.upload(p)};
     if(method==='attachments.read')return {result:this.attachments.read(p)};
     if(method==='paseo.readImage')return {result:await this.readImage(p)};
@@ -842,7 +866,7 @@ export class PaseoHost {
       return {result:await this.hostRegistry.connect(p)};
     }
     if(method==='environment.describe')return {result:{protocolVersion:1,environmentId:this.serverId,name:`Paseo ${this.client.getLastServerInfoMessage()?.version??''}`,
-      platform:process.platform,providers:[...new Set((await this.providers()).map(harness))],capabilities:this.capabilities()}};
+      platform:process.platform,providers:[...new Set((this.connected?await this.providers():this.providerCache?.rows??[]).map(harness))],capabilities:this.capabilities()}};
     if(['projects.list','sessions.list','projects.open'].includes(method)){
       await this.directory();
       if(method==='projects.list'){
@@ -894,7 +918,7 @@ export class PaseoHost {
       await Promise.all([...this.projects.values()].map(async p=>{
         const entry=[...this.entries.values()].find(e=>e.projectId===p.id),id=entry?.project?.projectKey;
         if(!id)return;
-        if(!this.icons.has(id)){
+        if(!this.icons.has(id)&&this.connected){
           try{const value=await this.client.getProjectIcon(id);if(value.projectId===id&&!value.error)this.icons.set(id,value.icon??null);}catch{this.icons.set(id,null);}
         }
         icons[p.id]=this.icons.get(id)??null;

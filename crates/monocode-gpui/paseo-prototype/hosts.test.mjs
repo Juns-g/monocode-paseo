@@ -254,3 +254,112 @@ test('HostRegistry.connect aborts and tears down route on remote serverId mismat
     rmSync(dir, {recursive: true, force: true});
   }
 });
+
+test('direct transport: hosts.json directory and identity-pinned direct links work with the origin daemon down and never expose the saved connection', async () => {
+  const {writeFileSync} = await import('node:fs');
+  const {savedHostsReader, hostTransport} = await import('./hosts.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'paseo-hosts-direct-'));
+  const SECRET = 'https://app.paseo.sh/#offer=SECRET-OFFER';
+  const hostsPath = join(dir, 'hosts.json');
+  const row = (serverId, label, extra = {}) => ({registrationId: `hst-${label}`, serverId, label, enabled: true, status: 'online',
+    targetDescription: `relay://relay.paseo.sh:443/${serverId}`, lastOnlineAt: '2026-11-28T00:00:00Z', nextRetryAt: null, error: null,
+    connection: `${SECRET}-${label}`, ...extra});
+  writeFileSync(hostsPath, JSON.stringify([row('srv-byte', 'Byte'), row('srv-impostor', 'Impostor')]), {mode: 0o600});
+  // Origin daemon is down: no hello, every origin RPC fails.
+  const origin = {
+    openedRoutes: [],
+    getLastServerInfoMessage: () => null,
+    listHosts: async () => { throw Error('origin down'); },
+    openHostRoute: async () => { origin.openedRoutes.push(1); throw Error('origin down'); },
+  };
+  const made = [];
+  const registry = new HostRegistry({
+    originClient: origin, baseDirectory: dir, token: TOKEN, localServerId: 'srv-local',
+    readSavedHosts: savedHostsReader(hostsPath),
+    createDirectClient: ({connection, serverId}) => {
+      const client = {connection, closed: false, status: null,
+        connect: async () => {}, close() { client.closed = true; }, setReconnectEnabled() {},
+        getLastServerInfoMessage: () => ({serverId: serverId === 'srv-impostor' ? 'srv-someone-else' : serverId, version: '0.18.0'}),
+        subscribeConnectionStatus: cb => { client.status = cb; return () => {}; },
+        subscribeRawMessages: () => () => {}};
+      made.push(client);
+      return client;
+    },
+    createRoutedClient: () => { throw Error('routed path must not be used'); },
+    createAdapter: (client, _hostDir, options) => ({serverId: options.expectedServerId, isRemoteHost: true, connected: false,
+      invalidate() {}, async directory() {}, async request(method) { return {result: {method}}; }, close() { client.close(); }}),
+    createServer: makeFakeHttpServer,
+  });
+  try {
+    assert.equal(hostTransport(undefined), 'auto');assert.equal(hostTransport('direct'), 'direct');assert.equal(hostTransport('bogus'), 'auto');
+    const before = await registry.list();
+    assert.equal(before.supported, true);
+    assert.equal(before.self.serverId, 'srv-local');
+    assert.deepEqual(before.hosts.map(h => [h.serverId, h.status, h.connected]), [['srv-byte', 'online', false], ['srv-impostor', 'online', false]]);
+    assert.equal(JSON.stringify(before).includes('SECRET'), false, 'connection never listed');
+    assert.equal('connection' in before.hosts[0], false);
+
+    const linked = await registry.connect('srv-byte');
+    assert.match(linked.endpoint, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.equal(linked.transport, 'direct');
+    assert.equal(JSON.stringify(linked).includes('SECRET'), false);
+    assert.equal(made[0].connection, `${SECRET}-Byte`);
+    assert.equal(origin.openedRoutes.length, 0, 'no origin route');
+    let listed = await registry.list();
+    assert.deepEqual([listed.hosts[0].status, listed.hosts[0].connected, listed.hosts[0].connectedEndpoint], ['online', true, linked.endpoint]);
+
+    // A dropped direct link reconnects by itself: shown as connecting, endpoint kept, no second client.
+    made[0].status({status: 'connecting'});
+    listed = await registry.list();
+    assert.deepEqual([listed.hosts[0].status, listed.hosts[0].connected], ['connecting', false]);
+    const again = await registry.connect('srv-byte');
+    assert.equal(again.endpoint, linked.endpoint);assert.equal(again.status, 'connecting');assert.equal(made.length, 1);
+    made[0].status({status: 'connected'});
+
+    // Identity pin: a saved connection that reaches another daemon is refused and torn down.
+    await assert.rejects(registry.connect('srv-impostor'), /identity mismatch/);
+    assert.equal(made[1].closed, true);
+    listed = await registry.list();
+    assert.equal(listed.hosts[1].status, 'offline');assert.equal(listed.hosts[1].connected, false);
+    assert.equal(registry.routed.has('srv-impostor'), false);
+    assert.equal(JSON.stringify(listed).includes('SECRET'), false);
+
+    // hosts.json is re-read when it changes (mtime/size).
+    writeFileSync(hostsPath, JSON.stringify([row('srv-byte', 'Byte'), row('srv-new', 'Newbox', {enabled: false})]), {mode: 0o600});
+    listed = await registry.list();
+    assert.deepEqual(listed.hosts.map(h => [h.serverId, h.status]), [['srv-byte', 'online'], ['srv-new', 'disabled']]);
+  } finally {
+    registry.close();
+    rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('direct transport: connect errors that quote the saved connection are redacted before list/RPC output', async () => {
+  const {writeFileSync} = await import('node:fs');
+  const {savedHostsReader, redactConnection} = await import('./hosts.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'paseo-hosts-redact-'));
+  const connection = 'https://app.paseo.sh/#offer=LEAKYSECRET';
+  const hostsPath = join(dir, 'hosts.json');
+  writeFileSync(hostsPath, JSON.stringify([{registrationId: 'hst-l', serverId: 'srv-leaky', label: 'Leaky', enabled: true, status: 'online', connection}]));
+  const registry = new HostRegistry({
+    originClient: {getLastServerInfoMessage: () => null, listHosts: async () => { throw Error('down'); }},
+    baseDirectory: dir, token: TOKEN, localServerId: 'srv-local', readSavedHosts: savedHostsReader(hostsPath),
+    createDirectClient: () => ({connect: async () => { throw Error(`Invalid URL: ${connection}`); }, close() {},
+      getLastServerInfoMessage: () => null}),
+    createRoutedClient: () => { throw Error('routed path must not be used'); },
+    createAdapter: (client) => ({serverId: 'srv-leaky', isRemoteHost: true, invalidate() {}, async directory() {}, close() { client.close(); }}),
+    createServer: makeFakeHttpServer,
+  });
+  try {
+    assert.equal(redactConnection('x wss://relay/?offer=abc&y', null), 'x wss://relay/?offer=<redacted>&y');
+    const error = await registry.connect('srv-leaky').catch(e => e);
+    assert.equal(error.message, 'Invalid URL: <connection>');
+    assert.equal(String(error.stack).includes('LEAKYSECRET'), false);
+    const listed = await registry.list();
+    assert.equal(listed.hosts[0].status, 'offline');
+    assert.equal(JSON.stringify(listed).includes('LEAKYSECRET'), false);
+  } finally {
+    registry.close();
+    rmSync(dir, {recursive: true, force: true});
+  }
+});

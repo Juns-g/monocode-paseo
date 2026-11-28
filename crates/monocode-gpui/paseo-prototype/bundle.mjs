@@ -14,10 +14,13 @@ const plugins=[{name:'native-only-catalog-imports',setup(build){
  build.onLoad({filter:/.*/,namespace:'native-only'},()=>({contents:'const unavailable=()=>{throw Error("Provider settings are managed by Paseo");}; export const invoke=unavailable,listen=unavailable,open=unavailable,useEffect=unavailable,useState=unavailable;'}));
 }},{name:'current-paseo-source',setup(build){
 build.onResolve({filter:/^@getpaseo\/protocol\/validation\/ws-outbound$/},()=>({path:join(here,'validate.mjs')}));
-  build.onResolve({filter:/daemon-client-relay-e2ee-transport/},()=>({path:join(here,'no-relay.mjs')}));
-  build.onResolve({filter:/^@getpaseo\/(protocol|relay)\//},args=>{
-   const match=args.path.match(/^@getpaseo\/(protocol|relay)\/(.+)$/);
-   const base=join(paseo,'packages',match[1],'src',match[2]);
+  // Relay E2EE transport is bundled for direct remote host links (remoteHostTransport auto/direct).
+  // Real @noble when the Paseo checkout has it installed; otherwise the node:crypto stand-in (same API subset).
+  const relayRequire=createRequire(join(paseo,'packages','relay','package.json'));
+  build.onResolve({filter:/^@noble\/(hashes|curves|ciphers)\//},args=>{try{return {path:relayRequire.resolve(args.path)};}catch{return {path:join(here,'noble-shim.mjs')};}});
+  build.onResolve({filter:/^@getpaseo\/(protocol|relay)(\/|$)/},args=>{
+   const match=args.path.match(/^@getpaseo\/(protocol|relay)(?:\/(.+))?$/);
+   const base=join(paseo,'packages',match[1],'src',match[2]??'index');
    for(const path of [base+'.ts',join(base,'index.ts')])if(existsSync(path))return {path};
   });
 }}];
